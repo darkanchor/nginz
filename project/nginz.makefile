@@ -3,7 +3,15 @@
 all: ./submodules/nginx/objs/nginz.c
 
 ./submodules/nginx/objs/ngx_modules.c:
-	cd submodules/nginx && ./auto/configure --with-http_ssl_module --with-http_xslt_module --with-debug
+	cd submodules/nginx && ./auto/configure \
+		--with-compat \
+		--with-file-aio \
+		--with-threads \
+		--with-http_ssl_module \
+		--with-http_xslt_module \
+		--with-http_v2_module \
+		--with-http_v3_module \
+		--with-debug
 	cd submodules/njs && ./configure
 
 copy: ./submodules/nginx/src/core/nginx.c ./submodules/nginx/objs/ngx_modules.c

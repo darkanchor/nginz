@@ -92,7 +92,7 @@ pub inline fn ngx_http_conf_debug(cf: [*c]ngx_conf_t, fmt: [*c]const u8, args: a
 const ngx_time_init = ngx.ngx_time_init;
 const ngx_log_init = ngx.ngx_log_init;
 test "log" {
-    try expectEqual(@sizeOf(ngx_log_t), 80);
+    try expectEqual(@sizeOf(ngx_log_t), 120);
     const log = ngx_log_init(core.c_str(""), core.c_str(""));
     try expectEqual(log.*.log_level, NGX_LOG_NOTICE);
 

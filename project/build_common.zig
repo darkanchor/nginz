@@ -19,13 +19,15 @@ pub const NGX_INCLUDE_PATH = [_][]const u8{
     "submodules/nginx/src/http",
     "submodules/nginx/src/event",
     "submodules/nginx/src/os/unix",
+    "submodules/nginx/src/http/v2",
+    "submodules/nginx/src/http/v3",
+    "submodules/nginx/src/event/quic",
     "submodules/nginx/src/http/modules",
     "submodules/nginx/src/event/modules",
 };
 
 const EXCLUDES = [_][]const u8{
-    "v2",
-    "v3",
+    "bpf",
     "perl",
     "test",
     "nginx.c",
@@ -34,13 +36,8 @@ const EXCLUDES = [_][]const u8{
     "njs_regex.c",
     "njs_lvlhsh.c",
     "njs_addr2line.c",
-    "ngx_thread_pool.c",
     "njs_lexer_keyword.c",
-    "ngx_http_dav_module.c",
-    "ngx_http_grpc_module.c",
     "ngx_http_geoip_module.c",
-    "ngx_http_realip_module.c",
-    "ngx_http_proxy_v2_module.c",
     "ngx_http_stub_status_module.c",
     "ngx_http_degradation_module.c",
 };

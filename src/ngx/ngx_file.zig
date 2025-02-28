@@ -61,6 +61,6 @@ pub fn ngz_open_file(path: ngx_str_t, lg: [*c]ngx_log_t, pool: [*c]ngx_pool_t) !
 }
 
 test "file" {
-    try expectEqual(@sizeOf(ngx_file_t), 200);
-    try expectEqual(@sizeOf(ngx_temp_file_t), 248);
+    try expectEqual(@sizeOf(ngx_file_t), 232);
+    try expectEqual(@sizeOf(ngx_temp_file_t), 280);
 }
