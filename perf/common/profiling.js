@@ -1,6 +1,7 @@
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { spawn } from "bun";
+import { execSync } from "child_process";
 import os from "os";
 import { commandExists } from "./system.js";
 
@@ -25,6 +26,30 @@ function snapshotPid(pid) {
     stat,
     limits,
   };
+}
+
+/** Resolve a parent PID to all descendant PIDs (children, grandchildren, etc). */
+function resolvePidTree(parentPid) {
+  const result = [parentPid];
+  try {
+    const taskDir = `/proc/${parentPid}/task`;
+    if (existsSync(taskDir)) {
+      for (const tid of readdirSync(taskDir)) {
+        const childrenPath = `/proc/${parentPid}/task/${tid}/children`;
+        const children = readFileMaybe(childrenPath).trim();
+        if (children) {
+          for (const childPid of children.split(/\s+/)) {
+            const cpid = parseInt(childPid, 10);
+            if (cpid > 0) {
+              result.push(...resolvePidTree(cpid));
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+  // Deduplicate
+  return [...new Set(result)];
 }
 
 function snapshotSystem() {
@@ -78,6 +103,13 @@ export function writeSnapshotSummary(profilingDir, summary) {
   return summaryPath;
 }
 
+/**
+ * Run `perf stat -p <pids>` via a shell wrapper so signal delivery is
+ * reliable across process trees.  Bun's `proc.kill()` does not reliably
+ * deliver SIGINT to perf's child `sleep` process, but the shell's `kill`
+ * builtin handles process-group signalling correctly.
+ */
+
 export async function startProfiling({ mode, pids, profilingDir }) {
   const normalized = normalizeProfileMode(mode);
   const session = {
@@ -92,21 +124,32 @@ export async function startProfiling({ mode, pids, profilingDir }) {
     },
     perfStatPath: join(profilingDir, "perf-stat.txt"),
     processRef: null,
+    _fifoPath: null,
   };
 
   if (normalized.effective === "perf-stat" && session.pids.length > 0) {
+    // Resolve all child PIDs (nginx workers are children of the master)
+    const allPids = [];
+    for (const pid of session.pids) {
+      allPids.push(...resolvePidTree(pid));
+    }
+    const uniquePids = [...new Set(allPids)];
+
+    const fifoPath = session.perfStatPath + ".fifo";
+    session._fifoPath = fifoPath;
+
+    // Create FIFO before spawning
+    try { execSync(`rm -f "${fifoPath}" && mkfifo "${fifoPath}"`); } catch {}
+
+    // perf stat monitors all resolved pids until the FIFO receives data
     session.processRef = spawn([
-      "perf",
-      "stat",
+      "perf", "stat",
       "-x,",
-      "-e",
-      "task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults",
-      "-p",
-      session.pids.join(","),
-      "-o",
-      session.perfStatPath,
-      "sleep",
-      "1000000",
+      "-e", "task-clock,cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults",
+      "-p", uniquePids.join(","),
+      "-o", session.perfStatPath,
+      "--",
+      "sh", "-c", `cat "${fifoPath}" >/dev/null`,
     ], {
       stdout: "ignore",
       stderr: "ignore",
@@ -119,13 +162,17 @@ export async function startProfiling({ mode, pids, profilingDir }) {
 }
 
 export async function stopProfiling(session, profilingDir) {
-  if (session.processRef) {
+  if (session.processRef && session._fifoPath) {
+    // Write to FIFO to unblock perf stat's command
+    try { writeFileSync(session._fifoPath, "x"); } catch {}
+    // Clean up FIFO
+    try { execSync(`rm -f "${session._fifoPath}"`); } catch {}
+    // Wait briefly for perf to flush output
+    await new Promise(r => setTimeout(r, 500));
+    try { session.processRef.kill("SIGKILL"); } catch {}
+  } else if (session.processRef) {
     session.processRef.kill("SIGINT");
-    try {
-      await session.processRef.exited;
-    } catch {
-      // ignore
-    }
+    try { await session.processRef.exited; } catch {}
   }
 
   const summary = {

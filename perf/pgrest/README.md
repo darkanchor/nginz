@@ -26,6 +26,57 @@ output/<run-id>/
   runtime/              # preserved only with --keep-runtime
 ```
 
+## Profiling modes
+
+### snapshot (default)
+
+Captures `/proc`-based process and system snapshots before and after the timed
+section (PID status, meminfo, loadavg, cmdline).  Zero overhead, always safe.
+
+### perf-stat
+
+Uses Linux `perf stat` to collect hardware and software performance counters for
+the nginz worker processes during the timed section.  Requires `perf` to be
+installed.
+
+```bash
+bun perf/pgrest/benchmark/run.js --profile=perf-stat --scenario=medium-page --service=pgrest
+```
+
+The output file `profiling/perf-stat.txt` contains CSV-formatted counter values.
+Key counters and what they tell you:
+
+| Counter | What it measures | Good sign | Bad sign |
+|---------|-----------------|-----------|----------|
+| `task-clock` | CPU time consumed | — | — |
+| `instructions` | Instructions executed | — | — |
+| `cycles` | CPU cycles | IPC > 1.0 | IPC < 0.5 |
+| `branches` | Branch instructions | — | — |
+| `branch-misses` | Mispredicted branches | < 5% miss rate | > 10% miss rate |
+| `cache-references` | Memory accesses | — | — |
+| `cache-misses` | Cache misses | < 5% miss rate | > 20% miss rate |
+| `context-switches` | Voluntary + involuntary switches | 0 | > 0 per request |
+| `cpu-migrations` | Core migrations | 0 | > 0 per request |
+| `page-faults` | Minor + major faults | < 1 per request | > 10 per request |
+
+**Interpreting results**:
+- `context-switches = 0` and `cpu-migrations = 0` confirm the nginx worker is
+  never descheduled — our non-blocking pooled path is working as designed.
+- `branch-misses < 5%` shows predictable control flow — the JSON formatter's
+  fast-path branching and no-escape detection are well-predicted.
+- `cache-misses < 15%` suggests reasonable memory locality.
+- IPC (instructions / cycles) above 1.0 indicates efficient CPU utilization.
+
+**NMI watchdog**: Hardware counters may show `<not counted>` if the NMI watchdog
+is enabled.  Disable it temporarily (requires root):
+```bash
+echo 0 | sudo tee /proc/sys/kernel/nmi_watchdog
+# ... run benchmark ...
+echo 1 | sudo tee /proc/sys/kernel/nmi_watchdog
+```
+The runner attempts this automatically but will continue with software counters
+if permission is denied.
+
 ## Usage
 
 ```bash
