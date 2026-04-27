@@ -2231,8 +2231,10 @@ describe("pgrest module", () => {
 
       // RESET ROLE must be the first query so any role set by a previous
       // request on the same pooled connection is always cleared.
+      // The combined setup query packs RESET ROLE, SET request.jwt, and SET
+      // ROLE into a single multi-statement query to reduce round-trips.
       const log = pgMock.getQueryLog();
-      expect(log[0]).toBe("RESET ROLE");
+      expect(log[0]).toStartWith("RESET ROLE");
       expect(pgMock.getResetRoleCount()).toBeGreaterThanOrEqual(1);
     });
 

@@ -1818,34 +1818,14 @@ const JwtSetupResult = enum {
 
 /// Sets up the per-request session isolation chain for the pooled path.
 ///
-/// Always queues at least two queries before the caller's main query:
-///   1. RESET ROLE   – erases any role left by a previous request on this connection
-///   2. SET request.jwt or clear it – isolates the JWT session variable
-///   3. SET ROLE (conditional) – applies the role for this request
+/// Uses a single combined multi-statement query (RESET ROLE; SET request.jwt;
+/// SET ROLE) to avoid 2–3 sequential round-trips per request.
 ///
-/// ctx.query is set to RESET ROLE (the first query to send).  Callers must
-/// append their main queries via queue_followup_query instead of using
-/// set_active_query + the old "has_setup_queries / promote" dance.
+/// ctx.query is set to the combined setup query.  Callers must append their
+/// main queries via queue_followup_query.
 fn queue_jwt_setup_queries(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) JwtSetupResult {
     const r = ctx.*.request orelse return .failed;
     const jwt_token = extract_jwt_token(r);
-
-    // 1. RESET ROLE is always first — it erases any role left by a previous
-    //    request that ran on the same pooled connection.
-    var reset_buf: [32]u8 = undefined;
-    const reset_len = pgrest_auth.build_reset_role_query(&reset_buf) orelse return .failed;
-    if (!set_active_query(ctx, reset_buf[0..reset_len])) return .failed;
-
-    // 2. Set or clear request.jwt so downstream PG functions always see the
-    //    correct value for this request, never the previous request's token.
-    var jwt_buf: [MAX_QUERY_SIZE]u8 = undefined;
-    if (jwt_token) |token| {
-        const jwt_len = pgrest_auth.build_set_postgresql_jwt_claim_query(token, &jwt_buf) orelse return .failed;
-        if (!queue_followup_query(ctx, jwt_buf[0..jwt_len])) return .failed;
-    } else {
-        const clear_len = pgrest_auth.build_clear_jwt_query(&jwt_buf) orelse return .failed;
-        if (!queue_followup_query(ctx, jwt_buf[0..clear_len])) return .failed;
-    }
 
     const secret = if (loc_conf.*.jwt_secret.len > 0 and loc_conf.*.jwt_secret.data != core.nullptr(u8))
         core.slicify(u8, loc_conf.*.jwt_secret.data, loc_conf.*.jwt_secret.len)
@@ -1860,7 +1840,8 @@ fn queue_jwt_setup_queries(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t)
     else
         "role";
 
-    // 3. Validate JWT and determine which role to apply.
+    // Validate JWT and determine which role to apply (before building the
+    // combined query, so the result can be embedded inline).
     var role_to_set: ?[]const u8 = null;
     if (jwt_token) |token| {
         if (secret.len > 0) {
@@ -1879,11 +1860,11 @@ fn queue_jwt_setup_queries(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t)
         role_to_set = anon_role;
     }
 
-    if (role_to_set) |role| {
-        var role_query: [MAX_QUERY_SIZE]u8 = undefined;
-        const role_query_len = pgrest_auth.build_set_postgresql_role_query(role, &role_query) orelse return .failed;
-        if (!queue_followup_query(ctx, role_query[0..role_query_len])) return .failed;
-    }
+    // Build a single combined multi-statement query instead of enqueueing
+    // separate RESET ROLE, SET request.jwt, and SET ROLE commands.
+    var combined_buf: [MAX_QUERY_SIZE]u8 = undefined;
+    const combined_len = pgrest_auth.build_combined_jwt_setup_query(&combined_buf, jwt_token, role_to_set) orelse return .failed;
+    if (!set_active_query(ctx, combined_buf[0..combined_len])) return .failed;
 
     return .ok;
 }

@@ -229,11 +229,76 @@ export class PostgresMock {
   }
 
   handleQuery(socket, query, sendReady = true) {
-    const upperQuery = query.toUpperCase().trim();
     const rfq = () => { if (sendReady) socket.write(Buffer.from([0x5a, 0, 0, 0, 5, 0x49])); };
 
     // Log all queries for debugging
     this.queryLog.push(query);
+
+    // Check if this is a multi-statement query (semicolon-separated).
+    // Real PostgreSQL processes each statement in order, sending a
+    // CommandComplete for each non-result-bearing statement before the
+    // final ReadyForQuery.
+    const statements = query.split(";").map(s => s.trim()).filter(s => s.length > 0);
+    if (statements.length > 1) {
+      const allSetup = statements.every(s =>
+        /^(RESET|SET)\s/i.test(s)
+      );
+      if (allSetup) {
+        // Process each sub-statement: track state, send CommandComplete.
+        for (const stmt of statements) {
+          this.trackSetupStatement(stmt);
+          const tag = /^RESET/i.test(stmt) ? "RESET" : "SET";
+          this.sendCommandComplete(socket, tag);
+        }
+        rfq();
+        return;
+      }
+      // Multi-statement with data queries: process only the first non-SET/RESET
+      // statement for now (full multi-statement data support is not needed by
+      // current benchmarks).
+      for (const stmt of statements) {
+        if (/^(RESET|SET)\s/i.test(stmt)) {
+          this.trackSetupStatement(stmt);
+          const tag = /^RESET/i.test(stmt) ? "RESET" : "SET";
+          this.sendCommandComplete(socket, tag);
+        } else {
+          // Delegate to single-query handler (don't let it send ReadyForQuery
+          // because we own that here).
+          this.handleSingleQuery(socket, stmt, false);
+          rfq();
+          return;
+        }
+      }
+      rfq();
+      return;
+    }
+
+    this.handleSingleQuery(socket, query, sendReady);
+  }
+
+  // Track state changes from a single SET or RESET sub-statement (no I/O).
+  trackSetupStatement(stmt) {
+    if (/^RESET\s+ROLE\s*$/i.test(stmt)) {
+      this.resetRoleCount += 1;
+      this.lastSetRole = null;
+      return;
+    }
+    const roleMatch = stmt.match(/SET\s+ROLE\s+'([^']+)'/i);
+    if (roleMatch) {
+      this.lastSetRole = roleMatch[1];
+      return;
+    }
+    const jwtMatch = stmt.match(/SET\s+request\.jwt\s+TO\s+'([^']*)'/i);
+    if (jwtMatch) {
+      this.lastSetJwt = jwtMatch[1];
+      return;
+    }
+  }
+
+  // Handle a single-statement query (the old handleQuery logic).
+  handleSingleQuery(socket, query, sendReady = true) {
+    const upperQuery = query.toUpperCase().trim();
+    const rfq = () => { if (sendReady) socket.write(Buffer.from([0x5a, 0, 0, 0, 5, 0x49])); };
 
     // Track RESET ROLE commands (always first in every request's query chain)
     if (/^RESET\s+ROLE\s*$/i.test(query.trim())) {

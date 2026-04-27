@@ -248,6 +248,78 @@ pub fn build_set_postgresql_jwt_claim_query(jwt_token: []const u8, query_buf: []
     return pos;
 }
 
+/// Build a combined multi-statement query for the JWT/role setup phase.
+/// The result is RESET ROLE; SET request.jwt TO '<token or empty>'; [SET ROLE '<role>';]
+/// This replaces up to three sequential round-trips with a single query.
+pub fn build_combined_jwt_setup_query(query_buf: []u8, jwt_token: ?[]const u8, role_to_set: ?[]const u8) ?usize {
+    var pos: usize = 0;
+
+    // RESET ROLE;
+    const reset = "RESET ROLE; ";
+    if (reset.len > query_buf.len - pos) return null;
+    @memcpy(query_buf[pos..][0..reset.len], reset);
+    pos += reset.len;
+
+    // SET request.jwt TO '...';
+    const jwt_prefix = "SET request.jwt TO '";
+    if (jwt_prefix.len > query_buf.len - pos) return null;
+    @memcpy(query_buf[pos..][0..jwt_prefix.len], jwt_prefix);
+    pos += jwt_prefix.len;
+
+    if (jwt_token) |token| {
+        for (token) |c| {
+            if (pos >= query_buf.len - 3) return null;
+            if (c == '\'') {
+                query_buf[pos] = '\'';
+                pos += 1;
+                query_buf[pos] = '\'';
+                pos += 1;
+            } else {
+                query_buf[pos] = c;
+                pos += 1;
+            }
+        }
+    }
+
+    if (pos >= query_buf.len - 3) return null;
+    query_buf[pos] = '\'';
+    pos += 1;
+    query_buf[pos] = ';';
+    pos += 1;
+    query_buf[pos] = ' ';
+    pos += 1;
+
+    // SET ROLE '...'; (conditional)
+    if (role_to_set) |role| {
+        const role_prefix = "SET ROLE '";
+        if (role_prefix.len > query_buf.len - pos) return null;
+        @memcpy(query_buf[pos..][0..role_prefix.len], role_prefix);
+        pos += role_prefix.len;
+
+        for (role) |c| {
+            if (pos >= query_buf.len - 3) return null;
+            if (c == '\'') {
+                query_buf[pos] = '\'';
+                pos += 1;
+                query_buf[pos] = '\'';
+                pos += 1;
+            } else {
+                query_buf[pos] = c;
+                pos += 1;
+            }
+        }
+
+        if (pos >= query_buf.len - 2) return null;
+        query_buf[pos] = '\'';
+        pos += 1;
+        query_buf[pos] = ';';
+        pos += 1;
+    }
+
+    query_buf[pos] = 0;
+    return pos;
+}
+
 pub fn build_set_postgresql_role_query(role: []const u8, query_buf: []u8) ?usize {
     if (role.len == 0) return null;
 
@@ -276,6 +348,39 @@ pub fn build_set_postgresql_role_query(role: []const u8, query_buf: []u8) ?usize
     pos += 1;
     query_buf[pos] = 0;
     return pos;
+}
+
+test "build_combined_jwt_setup_query without token or role" {
+    var buf: [256]u8 = undefined;
+    const len = build_combined_jwt_setup_query(&buf, null, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("RESET ROLE; SET request.jwt TO ''; ", buf[0..len]);
+    try std.testing.expectEqual(@as(u8, 0), buf[len]);
+}
+
+test "build_combined_jwt_setup_query with token but no role" {
+    var buf: [256]u8 = undefined;
+    const len = build_combined_jwt_setup_query(&buf, "abc.def.ghi", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("RESET ROLE; SET request.jwt TO 'abc.def.ghi'; ", buf[0..len]);
+    try std.testing.expectEqual(@as(u8, 0), buf[len]);
+}
+
+test "build_combined_jwt_setup_query with token and role" {
+    var buf: [256]u8 = undefined;
+    const len = build_combined_jwt_setup_query(&buf, "abc.def.ghi", "admin") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("RESET ROLE; SET request.jwt TO 'abc.def.ghi'; SET ROLE 'admin';", buf[0..len]);
+    try std.testing.expectEqual(@as(u8, 0), buf[len]);
+}
+
+test "build_combined_jwt_setup_query escapes single quotes" {
+    var buf: [256]u8 = undefined;
+    const len = build_combined_jwt_setup_query(&buf, "it's", "d'min") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("RESET ROLE; SET request.jwt TO 'it''s'; SET ROLE 'd''min';", buf[0..len]);
+    try std.testing.expectEqual(@as(u8, 0), buf[len]);
+}
+
+test "build_combined_jwt_setup_query fails on undersized buffer" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), build_combined_jwt_setup_query(&buf, "abc.def.ghi", "admin"));
 }
 
 test "build_reset_role_query produces RESET ROLE" {
