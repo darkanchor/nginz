@@ -884,6 +884,16 @@ Progress note:
 - 📁 Artifact: `perf/pgrest/benchmark/output/2026-04-27T13-25-19.789Z-pgrest-releasesmall/`
 - 📁 Notes: `perf/pgrest/notes/2026-04-27-p3-combined-setup-query.md`
 - ℹ️ Connection cap was intentionally left at 16; tuning it further is not needed since the round-trip reduction already delivered a 51% throughput gain without changing pool policy. The linear slot scan was not touched — profiling confirmed round-trip count, not scan overhead, was the dominant factor.
+
+- ✅ **P3 follow-up: early connection release** — moved `release_pooled_ctx()` to execute immediately after JSON formatting (before `finalize_response_send`) so another request can start using the connection while the current response is sent.
+- 📊 **c=16 result**: 701 → **905 rps (+29%)**, p95 171ms → **60ms (-65%)**, p99 175ms → **120ms (-31%)**. Connection scarcity at c=16 (all 16 connections busy) makes overlap valuable.
+- 📊 c=8 tradeoff: 990 → 932 rps (-6%, avg of 3 runs). Bookkeeping overhead dominates when 8 connections are idle — no request is waiting, so early release adds cost without benefit.
+- 📁 Notes: `perf/pgrest/notes/2026-04-27-p3-early-connection-release.md`
+
+- 📊 **pgrest vs PostgREST full comparison (medium-page)**: c=1: **2.06x** (374 vs 182 rps), c=8: **1.46x** (932 vs 640 rps), c=16: **1.14x** (905 vs 794 rps). pgrest wins at every concurrency but the ratio compresses as CPU saturates.
+- 📁 PostgREST c=16 artifact: `perf/pgrest/benchmark/output/2026-04-27T14-00-52.603Z-pgrest-releasesmall/`
+- ℹ️ Net effect is positive (+204 rps at c=16 vs -58 rps at c=8); kept because production deployments typically run with fewer connections than peak concurrency.
+
 ### Perf Batch P4: Structural large-response improvements
 
 - [ ] Evaluate whether incremental/streaming JSON response generation is worth the complexity for large-result workloads.

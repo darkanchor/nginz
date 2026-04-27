@@ -9044,6 +9044,12 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         },
     };
 
+    // Release the PG connection before sending the HTTP response.
+    // We've already formatted the result into the nginx buffer and no
+    // longer need the connection.  Releasing early lets another request
+    // start using the connection while we send the response body.
+    release_pooled_ctx(ctx, false);
+
     const rc = finalize_response_send(
         r,
         response_body_buf,
@@ -9057,7 +9063,6 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         ctx.*.write_send_body,
     );
     ctx.*.request = null;
-    release_pooled_ctx(ctx, false);
     http.ngx_http_finalize_request(r, rc);
 }
 
