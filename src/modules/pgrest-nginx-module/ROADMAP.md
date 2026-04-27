@@ -829,12 +829,14 @@ Progress note:
 - [x] Cache per-column metadata that is currently re-read inside the row loop where correctness allows.
 - [x] Add a fast path for values that do not need JSON escaping instead of always paying the full character-by-character escape path.
 - [x] Reduce inner-loop branching and repeated bounds bookkeeping in `format_result_as_json_with_options` / `format_row_as_json_object_impl` without changing output semantics.
-- [ ] Add focused tests for escaping, stripped-nulls behavior, mixed scalar/text rows, and wide-row stability.
+- [x] Add focused tests for escaping, stripped-nulls behavior, mixed scalar/text rows, and wide-row stability.
 - [ ] Re-run the P0 benchmark matrix and record the delta before starting the next perf batch.
 
 Progress note:
 
 - ✅ Landed length-aware value handling, cached column metadata, and a no-escape fast path on the JSON row formatter.
+- ✅ Added 11 Zig unit tests covering `needs_json_escape` (safe/unsafe strings), `append_json_quoted_string` (quotes, backslashes, newlines, tabs, combined, no-escape fast path), and `estimated_json_string_size` (plain and escaped).
+- ✅ Added 4 JS container integration tests: special JSON character round-trip (quotes, backslashes, newlines, tabs), mixed text/integer types, wide-row (10-column) stability, and nulls=stripped removing null fields.
 
 ### Perf Batch P2: Response-copy and buffering reduction
 

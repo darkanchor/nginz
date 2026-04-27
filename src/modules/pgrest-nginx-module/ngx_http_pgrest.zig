@@ -9553,3 +9553,95 @@ test "estimate_response_buffer_size keeps non-json formats conservative" {
     try expectEqual(@as(usize, MAX_JSON_SIZE), estimate_response_buffer_size(null, 0, 0, csv_opts, &.{}, &.{}, 0));
     try expectEqual(@as(usize, MAX_JSON_SIZE), estimate_response_buffer_size(null, 0, 0, xml_opts, &.{}, &.{}, 0));
 }
+
+// ── P1: JSON escaping correctness ──────────────────────────────────────
+
+test "needs_json_escape returns false for safe strings" {
+    try expect(!needs_json_escape(""));
+    try expect(!needs_json_escape("hello"));
+    try expect(!needs_json_escape("abc123"));
+    try expect(!needs_json_escape("simple text"));
+    try expect(!needs_json_escape("unicode: é"));
+}
+
+test "needs_json_escape returns true for strings with special chars" {
+    try expect(needs_json_escape("he\"llo"));
+    try expect(needs_json_escape("C:\\path"));
+    try expect(needs_json_escape("line1\nline2"));
+    try expect(needs_json_escape("col1\rcol2"));
+    try expect(needs_json_escape("col1\tcol2"));
+    try expect(needs_json_escape("a\"b\\c"));
+}
+
+test "append_json_quoted_string wraps simple values" {
+    var test_buf: [64]u8 = undefined;
+    try expectEqual(@as(usize, 2), append_json_quoted_string(&test_buf, 0, ""));
+    try expect(std.mem.eql(u8, test_buf[0..2], "\"\""));
+
+    try expectEqual(@as(usize, 7), append_json_quoted_string(&test_buf, 0, "hello"));
+    try expect(std.mem.eql(u8, test_buf[0..7], "\"hello\""));
+
+    try expectEqual(@as(usize, 5), append_json_quoted_string(&test_buf, 0, "abc"));
+    try expect(std.mem.eql(u8, test_buf[0..5], "\"abc\""));
+}
+
+test "append_json_quoted_string escapes double quote" {
+    var test_buf: [64]u8 = undefined;
+    const len = append_json_quoted_string(&test_buf, 0, "a\"b");
+    try expectEqual(@as(usize, 6), len);
+    try expect(std.mem.eql(u8, test_buf[0..6], "\"a\\\"b\""));
+}
+
+test "append_json_quoted_string escapes backslash" {
+    var test_buf: [64]u8 = undefined;
+    const len = append_json_quoted_string(&test_buf, 0, "a\\b");
+    try expectEqual(@as(usize, 6), len);
+    try expect(std.mem.eql(u8, test_buf[0..6], "\"a\\\\b\""));
+}
+
+test "append_json_quoted_string escapes newline" {
+    var test_buf: [64]u8 = undefined;
+    const len = append_json_quoted_string(&test_buf, 0, "a\nb");
+    try expectEqual(@as(usize, 6), len);
+    try expect(std.mem.eql(u8, test_buf[0..6], "\"a\\nb\""));
+}
+
+test "append_json_quoted_string escapes carriage return" {
+    var test_buf: [64]u8 = undefined;
+    const len = append_json_quoted_string(&test_buf, 0, "a\rb");
+    try expectEqual(@as(usize, 6), len);
+    try expect(std.mem.eql(u8, test_buf[0..6], "\"a\\rb\""));
+}
+
+test "append_json_quoted_string escapes tab" {
+    var test_buf: [64]u8 = undefined;
+    const len = append_json_quoted_string(&test_buf, 0, "a\tb");
+    try expectEqual(@as(usize, 6), len);
+    try expect(std.mem.eql(u8, test_buf[0..6], "\"a\\tb\""));
+}
+
+test "append_json_quoted_string handles multiple escape sequences" {
+    var test_buf: [64]u8 = undefined;
+    const len = append_json_quoted_string(&test_buf, 0, "a\"b\\c\nd\te");
+    try expectEqual(@as(usize, 15), len);
+    try expect(std.mem.eql(u8, test_buf[0..15], "\"a\\\"b\\\\c\\nd\\te\""));
+}
+
+test "append_json_quoted_string uses no-escape fast path" {
+    var test_buf: [64]u8 = undefined;
+    @memset(&test_buf, 0xAA);
+    const len = append_json_quoted_string(&test_buf, 0, "plain-text");
+    try expectEqual(@as(usize, 12), len);
+    try expect(std.mem.eql(u8, test_buf[0..12], "\"plain-text\""));
+}
+
+test "estimated_json_string_size no-escape path" {
+    try expectEqual(@as(usize, 7), estimated_json_string_size("hello"));
+    try expectEqual(@as(usize, 2), estimated_json_string_size(""));
+}
+
+test "estimated_json_string_size with escapes" {
+    try expectEqual(@as(usize, 6), estimated_json_string_size("a\"b"));
+    try expectEqual(@as(usize, 6), estimated_json_string_size("a\\b"));
+    try expectEqual(@as(usize, 9), estimated_json_string_size("a\nb\tc"));
+}

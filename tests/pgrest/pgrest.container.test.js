@@ -197,6 +197,16 @@ CREATE TABLE readonly_docs (
     title TEXT NOT NULL
 );
 GRANT SELECT ON TABLE readonly_docs TO ${PG_USER};
+
+-- Wide table for JSON formatting stability test (10+ columns)
+CREATE TABLE json_stress (
+    id   SERIAL PRIMARY KEY,
+    col1 TEXT, col2 TEXT, col3 TEXT, col4 TEXT, col5 TEXT,
+    col6 INTEGER, col7 INTEGER, col8 INTEGER, col9 INTEGER, col10 INTEGER
+);
+INSERT INTO json_stress (col1, col2, col3, col4, col5, col6, col7, col8, col9, col10) VALUES
+    ('plain', E'escaped"quote', E'back\\\\slash', E'new\\nline', E'tab\\tchar', 1, 2, 3, 4, 5);
+GRANT SELECT ON TABLE json_stress TO ${PG_USER};
 `;
 
 // ---------------------------------------------------------------------------
@@ -1327,6 +1337,68 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
       headers: { "Accept-Profile": "private" },
     });
     expect(badRes.status).toBe(406);
+  });
+
+  // ── P1: JSON formatting correctness ───────────────────────────────
+
+  test("special JSON characters in values survive round-trip", async () => {
+    const res = await fetch(`${TEST_URL}/api/json_stress?id=eq.1`, {
+      headers: { Accept: "application/json" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].col1).toBe("plain");
+    expect(body[0].col2).toBe('escaped"quote');
+    expect(body[0].col3).toBe("back\\slash");
+    expect(body[0].col4).toBe("new\nline");
+    expect(body[0].col5).toBe("tab\tchar");
+  });
+
+  test("mixed text/integer types in same row — all are JSON strings", async () => {
+    const res = await fetch(`${TEST_URL}/api/json_stress?id=eq.1`, {
+      headers: { Accept: "application/json" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // pgrest returns all PG values as JSON strings (libpq text protocol)
+    expect(typeof body[0].col1).toBe("string");
+    expect(typeof body[0].col2).toBe("string");
+    expect(typeof body[0].col6).toBe("string");
+    expect(typeof body[0].col7).toBe("string");
+    // Numeric-looking strings parse as integers
+    expect(parseInt(body[0].col6)).toBe(1);
+    expect(parseInt(body[0].col10)).toBe(5);
+  });
+
+  test("wide row (10 columns) returns all fields", async () => {
+    const res = await fetch(`${TEST_URL}/api/json_stress?id=eq.1`, {
+      headers: { Accept: "application/json" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const row = body[0];
+    const keys = Object.keys(row);
+    expect(keys.length).toBeGreaterThanOrEqual(10);
+    // Verify a few columns span the full range
+    expect(row).toHaveProperty("col1");
+    expect(row).toHaveProperty("col5");
+    expect(row).toHaveProperty("col10");
+  });
+
+  test("nulls=stripped removes null fields", async () => {
+    const res = await fetch(`${TEST_URL}/api/users?select=name,bio&limit=5`, {
+      headers: { Accept: "application/json; nulls=stripped" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Carol (id=3) has null bio — should not have the key at all
+    const carol = body.find(r => r.name === "Carol White");
+    expect(carol).toBeDefined();
+    expect(carol).not.toHaveProperty("bio");
+    // Alice has bio — should still be present
+    const alice = body.find(r => r.name === "Alice Smith");
+    expect(alice).toBeDefined();
+    expect(alice).toHaveProperty("bio");
   });
 
 });
