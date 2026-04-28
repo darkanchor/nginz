@@ -4,11 +4,11 @@ Simple Redis client using RESP protocol with non-blocking upstream I/O.
 
 ### Status
 
-**Implemented** - GET, SET, DEL, INCR, EXPIRE, MGET commands
+**Implemented** - GET, SET, DEL, INCR, DECR, EXPIRE, MGET, EXISTS, TTL, PING, STRLEN, HGET, HSET, HDEL commands
 
 ### Features
 
-- **Multiple Commands**: GET, SET, DEL, INCR, EXPIRE, MGET
+- **14 Commands**: GET, SET, DEL, INCR, DECR, EXPIRE, MGET, EXISTS, TTL, PING, STRLEN, HGET, HSET, HDEL
 - **Non-blocking I/O**: Uses nginx upstream module for async operations
 - **URI-based Keys**: Use request URI path as Redis key
 - **Static Keys**: Configure fixed key via directive
@@ -42,7 +42,7 @@ redis_key mykey;
 
 #### redis_command
 
-*syntax:* `redis_command <get|set|del|incr|expire|mget>;`
+*syntax:* `redis_command <get|set|del|incr|decr|expire|mget|exists|ttl|ping|strlen|hget|hset|hdel>;`
 *context:* `location`
 *default:* `get`
 
@@ -51,6 +51,7 @@ Set the Redis command to execute. Default is `get`.
 ```nginx
 redis_command set;
 redis_command incr;
+redis_command hget;
 ```
 
 ### Usage
@@ -107,20 +108,84 @@ http {
             redis_pass 127.0.0.1:6379;
             redis_command mget;
         }
+
+        # DECR - Decrement counter
+        # POST /decr/counter -> Redis DECR "decr/counter"
+        location /decr/ {
+            redis_pass 127.0.0.1:6379;
+            redis_command decr;
+        }
+
+        # EXISTS - Check if key exists
+        # GET /exists/mykey -> Redis EXISTS "exists/mykey"
+        location /exists/ {
+            redis_pass 127.0.0.1:6379;
+            redis_command exists;
+        }
+
+        # TTL - Get time-to-live
+        # GET /ttl/mykey -> Redis TTL "ttl/mykey"
+        location /ttl/ {
+            redis_pass 127.0.0.1:6379;
+            redis_command ttl;
+        }
+
+        # PING - Health check
+        # GET /ping -> Redis PING
+        location /ping {
+            redis_pass 127.0.0.1:6379;
+            redis_command ping;
+        }
+
+        # STRLEN - String length
+        # GET /strlen/mykey -> Redis STRLEN "strlen/mykey"
+        location /strlen/ {
+            redis_pass 127.0.0.1:6379;
+            redis_command strlen;
+        }
+
+        # HGET - Get hash field
+        # GET /hget/myhash?field=name -> Redis HGET "hget/myhash" name
+        location /hget/ {
+            redis_pass 127.0.0.1:6379;
+            redis_command hget;
+        }
+
+        # HSET - Set hash field
+        # POST /hset/myhash?field=name with body "Alice" -> Redis HSET "hset/myhash" name Alice
+        location /hset/ {
+            redis_pass 127.0.0.1:6379;
+            redis_command hset;
+        }
+
+        # HDEL - Delete hash field
+        # POST /hdel/myhash?field=name -> Redis HDEL "hdel/myhash" name
+        location /hdel/ {
+            redis_pass 127.0.0.1:6379;
+            redis_command hdel;
+        }
     }
 }
 ```
 
 ### HTTP Methods
 
-| Command | HTTP Methods | Request Body |
-|---------|-------------|--------------|
-| GET     | GET         | -            |
-| SET     | POST        | Value to set |
-| DEL     | POST, DELETE| -            |
-| INCR    | POST        | -            |
-| EXPIRE  | POST        | TTL seconds (optional, default 60) |
-| MGET    | GET         | - (keys in query string) |
+| Command | HTTP Methods | Request Body | Query Params |
+|---------|-------------|--------------|-------------|
+| GET     | GET         | -            | - |
+| SET     | POST        | Value to set | - |
+| DEL     | POST, DELETE| -            | - |
+| INCR    | POST        | -            | - |
+| DECR    | POST        | -            | - |
+| EXPIRE  | POST        | TTL seconds (optional, default 60) | - |
+| MGET    | GET         | -            | keys=key1,key2,... |
+| EXISTS  | GET         | -            | - |
+| TTL     | GET         | -            | - |
+| PING    | GET         | -            | - |
+| STRLEN  | GET         | -            | - |
+| HGET    | GET         | -            | field=<field> |
+| HSET    | POST        | Value to set | field=<field> |
+| HDEL    | POST, DELETE| -            | field=<field> |
 
 ### Response Format
 
@@ -149,6 +214,11 @@ http {
 {"value":42}
 ```
 
+**DECR (returns new value):**
+```json
+{"value":9}
+```
+
 **EXPIRE (returns 1 if key exists, 0 if not):**
 ```json
 {"value":1}
@@ -157,6 +227,41 @@ http {
 **MGET (returns array of values):**
 ```json
 {"values":["value1","value2",null]}
+```
+
+**EXISTS (returns 1 if key exists, 0 if not):**
+```json
+{"value":1}
+```
+
+**TTL (returns TTL in seconds, -1 if no expiry, -2 if key not found):**
+```json
+{"value":300}
+```
+
+**PING (health check):**
+```json
+{"ok":true}
+```
+
+**STRLEN (returns string length, 0 if key not found):**
+```json
+{"value":5}
+```
+
+**HGET (returns hash field value):**
+```json
+{"value":"Alice"}
+```
+
+**HSET (returns 1 if field is new, 0 if updated):**
+```json
+{"value":1}
+```
+
+**HDEL (returns 1 if field was deleted, 0 if not found):**
+```json
+{"value":1}
 ```
 
 **Error response:**
@@ -177,6 +282,24 @@ The leading slash is stripped from the URI to form the key.
 - **No Authentication**: Redis AUTH not supported
 - **No Pipelining**: Single command per connection
 - **MGET Max Keys**: Limited to 16 keys per request
+
+### Testing
+
+**Unit tests** (`redis.test.js`) use a mock Redis server (`tests/mocks/redis.js`) to test all module operations without external dependencies. Run with:
+
+```bash
+bun test tests/redis/redis.test.js
+```
+
+**Container tests** (`redis.container.test.js`) run against a real Redis instance for integration testing. Requires a running Redis Docker container:
+
+```bash
+# Start Redis container (one-time setup)
+sudo docker run -d --name redis-nginz-test -p 6379:6379 redis:8.6.2-trixie
+
+# Run container tests
+bun test tests/redis/redis.container.test.js
+```
 
 ### Future Enhancements
 

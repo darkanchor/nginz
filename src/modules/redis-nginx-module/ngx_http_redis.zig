@@ -40,6 +40,14 @@ const RedisCommand = enum(c_int) {
     incr = 3, // INCR key
     expire = 4, // EXPIRE key seconds
     mget = 5, // MGET key1 key2 ...
+    decr = 6, // DECR key
+    exists = 7, // EXISTS key
+    ttl = 8, // TTL key
+    ping = 9, // PING
+    strlen = 10, // STRLEN key
+    hget = 11, // HGET key field
+    hset = 12, // HSET key field value
+    hdel = 13, // HDEL key field
 };
 
 // Redis RESP parsing state
@@ -66,7 +74,8 @@ const redis_request_ctx = extern struct {
     lccf: [*c]redis_loc_conf,
     res: [*c]ngx_chain_t,
     key: ngx_str_t,
-    value: ngx_str_t, // For SET: value to store; For EXPIRE: TTL as string
+    value: ngx_str_t, // For SET/HSET: value to store; For EXPIRE: TTL as string
+    field: ngx_str_t, // For HGET/HSET/HDEL: hash field name
     command: RedisCommand, // Command for this request
     state: RespState,
     data_len: isize, // Expected length from RESP (-1 for nil)
@@ -212,10 +221,26 @@ fn ngx_conf_set_redis_command(
                 lccf.*.command = .del;
             } else if (std.mem.eql(u8, s, "incr")) {
                 lccf.*.command = .incr;
+            } else if (std.mem.eql(u8, s, "decr")) {
+                lccf.*.command = .decr;
             } else if (std.mem.eql(u8, s, "expire")) {
                 lccf.*.command = .expire;
             } else if (std.mem.eql(u8, s, "mget")) {
                 lccf.*.command = .mget;
+            } else if (std.mem.eql(u8, s, "exists")) {
+                lccf.*.command = .exists;
+            } else if (std.mem.eql(u8, s, "ttl")) {
+                lccf.*.command = .ttl;
+            } else if (std.mem.eql(u8, s, "ping")) {
+                lccf.*.command = .ping;
+            } else if (std.mem.eql(u8, s, "strlen")) {
+                lccf.*.command = .strlen;
+            } else if (std.mem.eql(u8, s, "hget")) {
+                lccf.*.command = .hget;
+            } else if (std.mem.eql(u8, s, "hset")) {
+                lccf.*.command = .hset;
+            } else if (std.mem.eql(u8, s, "hdel")) {
+                lccf.*.command = .hdel;
             } else {
                 return conf.NGX_CONF_ERROR;
             }
@@ -414,6 +439,91 @@ fn build_mget_command(keys: []const ngx_str_t, count: usize, pool: [*c]ngx_pool_
     return RedisError.OutOfMemory;
 }
 
+// Helper: build a 2-arg RESP command (*2\r\n$<cmdlen>\r\n<cmd>\r\n$<keylen>\r\n<key>\r\n)
+fn build_two_arg_command(comptime cmd: []const u8, key: ngx_str_t, pool: [*c]ngx_pool_t) !ngx_str_t {
+    const max_size = 64 + cmd.len + key.len;
+    if (core.castPtr(u8, core.ngx_pnalloc(pool, max_size))) |data| {
+        var pos: usize = 0;
+
+        // *2\r\n$<cmdlen>\r\n<cmd>\r\n
+        const prefix = "*2\r\n$";
+        @memcpy(data[pos..][0..prefix.len], prefix);
+        pos += prefix.len;
+        pos += write_decimal(core.slicify(u8, data + pos, 20), cmd.len);
+        data[pos] = '\r';
+        pos += 1;
+        data[pos] = '\n';
+        pos += 1;
+        @memcpy(data[pos..][0..cmd.len], cmd);
+        pos += cmd.len;
+        data[pos] = '\r';
+        pos += 1;
+        data[pos] = '\n';
+        pos += 1;
+
+        // write_bulk_string handles $<len>\r\n<data>\r\n
+        write_bulk_string(data, &pos, key);
+        return ngx_str_t{ .data = data, .len = pos };
+    }
+    return RedisError.OutOfMemory;
+}
+
+// Build RESP PING command: *1\r\n$4\r\nPING\r\n
+fn build_ping_command(pool: [*c]ngx_pool_t) !ngx_str_t {
+    const ping_cmd = "*1\r\n$4\r\nPING\r\n";
+    if (core.castPtr(u8, core.ngx_pnalloc(pool, ping_cmd.len))) |data| {
+        @memcpy(core.slicify(u8, data, ping_cmd.len), ping_cmd);
+        return ngx_str_t{ .data = data, .len = ping_cmd.len };
+    }
+    return RedisError.OutOfMemory;
+}
+
+// Build RESP HGET command: *3\r\n$4\r\nHGET\r\n$<keylen>\r\n<key>\r\n$<fieldlen>\r\n<field>\r\n
+fn build_hget_command(key: ngx_str_t, field: ngx_str_t, pool: [*c]ngx_pool_t) !ngx_str_t {
+    const max_size = 64 + key.len + field.len;
+    if (core.castPtr(u8, core.ngx_pnalloc(pool, max_size))) |data| {
+        var pos: usize = 0;
+        const header = "*3\r\n$4\r\nHGET\r\n";
+        @memcpy(data[pos..][0..header.len], header);
+        pos += header.len;
+        write_bulk_string(data, &pos, key);
+        write_bulk_string(data, &pos, field);
+        return ngx_str_t{ .data = data, .len = pos };
+    }
+    return RedisError.OutOfMemory;
+}
+
+// Build RESP HSET command: *4\r\n$4\r\nHSET\r\n$<keylen>\r\n<key>\r\n$<fieldlen>\r\n<field>\r\n$<vallen>\r\n<val>\r\n
+fn build_hset_command(key: ngx_str_t, field: ngx_str_t, value: ngx_str_t, pool: [*c]ngx_pool_t) !ngx_str_t {
+    const max_size = 64 + key.len + field.len + value.len;
+    if (core.castPtr(u8, core.ngx_pnalloc(pool, max_size))) |data| {
+        var pos: usize = 0;
+        const header = "*4\r\n$4\r\nHSET\r\n";
+        @memcpy(data[pos..][0..header.len], header);
+        pos += header.len;
+        write_bulk_string(data, &pos, key);
+        write_bulk_string(data, &pos, field);
+        write_bulk_string(data, &pos, value);
+        return ngx_str_t{ .data = data, .len = pos };
+    }
+    return RedisError.OutOfMemory;
+}
+
+// Build RESP HDEL command: *3\r\n$4\r\nHDEL\r\n$<keylen>\r\n<key>\r\n$<fieldlen>\r\n<field>\r\n
+fn build_hdel_command(key: ngx_str_t, field: ngx_str_t, pool: [*c]ngx_pool_t) !ngx_str_t {
+    const max_size = 64 + key.len + field.len;
+    if (core.castPtr(u8, core.ngx_pnalloc(pool, max_size))) |data| {
+        var pos: usize = 0;
+        const header = "*3\r\n$4\r\nHDEL\r\n";
+        @memcpy(data[pos..][0..header.len], header);
+        pos += header.len;
+        write_bulk_string(data, &pos, key);
+        write_bulk_string(data, &pos, field);
+        return ngx_str_t{ .data = data, .len = pos };
+    }
+    return RedisError.OutOfMemory;
+}
+
 // Get key to query
 fn get_redis_key(r: [*c]ngx_http_request_t, lccf: [*c]redis_loc_conf) ngx_str_t {
     if (lccf.*.key.len > 0) {
@@ -442,8 +552,16 @@ fn ngx_http_redis_upstream_create_request(
             .set => build_set_command(rctx.*.key, rctx.*.value, r.*.pool),
             .del => build_del_command(rctx.*.key, r.*.pool),
             .incr => build_incr_command(rctx.*.key, r.*.pool),
+            .decr => build_two_arg_command("DECR", rctx.*.key, r.*.pool),
             .expire => build_expire_command(rctx.*.key, rctx.*.value, r.*.pool),
             .mget => build_mget_command(&rctx[0].mget_keys, rctx.*.mget_count, r.*.pool),
+            .exists => build_two_arg_command("EXISTS", rctx.*.key, r.*.pool),
+            .ttl => build_two_arg_command("TTL", rctx.*.key, r.*.pool),
+            .ping => build_ping_command(r.*.pool),
+            .strlen => build_two_arg_command("STRLEN", rctx.*.key, r.*.pool),
+            .hget => build_hget_command(rctx.*.key, rctx.*.field, r.*.pool),
+            .hset => build_hset_command(rctx.*.key, rctx.*.field, rctx.*.value, r.*.pool),
+            .hdel => build_hdel_command(rctx.*.key, rctx.*.field, r.*.pool),
         } catch return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
 
         var chain = NChain.init(r.*.pool);
@@ -528,8 +646,12 @@ fn build_json_response(rctx: [*c]redis_request_ctx, pool: [*c]ngx_pool_t) ?ngx_s
         @memcpy(json_buf[0..null_json.len], null_json);
         json_len = null_json.len;
     } else if (rctx.*.data.len > 0) {
-        // Has data - check if integer command (INCR, DEL, EXPIRE return integers)
-        if (rctx.*.command == .incr or rctx.*.command == .del or rctx.*.command == .expire) {
+        // Has data - check if integer command
+        const is_int_cmd = switch (rctx.*.command) {
+            .incr, .decr, .del, .expire, .exists, .ttl, .strlen, .hset, .hdel => true,
+            else => false,
+        };
+        if (is_int_cmd) {
             // Return as integer
             const prefix = "{\"value\":";
             @memcpy(json_buf[json_len..][0..prefix.len], prefix);
@@ -550,8 +672,8 @@ fn build_json_response(rctx: [*c]redis_request_ctx, pool: [*c]ngx_pool_t) ?ngx_s
         }
     } else {
         // Empty string or OK response
-        if (rctx.*.command == .set) {
-            // SET returns OK
+        if (rctx.*.command == .set or rctx.*.command == .ping or rctx.*.command == .hset) {
+            // SET/HSET/PING return OK
             const ok_json = "{\"ok\":true}";
             @memcpy(json_buf[0..ok_json.len], ok_json);
             json_len = ok_json.len;
@@ -998,8 +1120,8 @@ export fn ngx_http_redis_body_handler(
         redis_request_ctx,
         r.*.ctx[ngx_http_redis_module.ctx_index],
     )) |rctx| {
-        // Extract value from request body for SET and EXPIRE
-        if (rctx.*.command == .set or rctx.*.command == .expire) {
+        // Extract value from request body for SET, EXPIRE, and HSET
+        if (rctx.*.command == .set or rctx.*.command == .expire or rctx.*.command == .hset) {
             rctx.*.value = get_request_body(r);
             if (rctx.*.value.len == 0 and rctx.*.command == .set) {
                 // SET requires a value
@@ -1009,6 +1131,11 @@ export fn ngx_http_redis_body_handler(
             if (rctx.*.value.len == 0 and rctx.*.command == .expire) {
                 // EXPIRE requires TTL - default to 60 seconds
                 rctx.*.value = ngx_string("60");
+            }
+            if (rctx.*.value.len == 0 and rctx.*.command == .hset) {
+                // HSET requires a value
+                http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+                return;
             }
         }
 
@@ -1112,6 +1239,31 @@ fn parse_mget_keys(r: [*c]ngx_http_request_t, rctx: [*c]redis_request_ctx) void 
     }
 }
 
+// Parse a named query parameter from the request args.
+// Returns ngx_null_str if the parameter is not found.
+fn parse_query_param(r: [*c]ngx_http_request_t, comptime name: []const u8) ngx_str_t {
+    if (r.*.args.len == 0) return ngx.string.ngx_null_str;
+    const args = core.slicify(u8, r.*.args.data, r.*.args.len);
+    var pos: usize = 0;
+
+    while (pos + name.len + 1 < args.len) : (pos += 1) {
+        if (std.mem.eql(u8, args[pos..][0..name.len], name) and args[pos + name.len] == '=') {
+            pos += name.len + 1; // skip "name="
+            const val_start = pos;
+            while (pos < args.len and args[pos] != '&') : (pos += 1) {}
+            const val_len = pos - val_start;
+            if (val_len > 0) {
+                if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, val_len))) |val_copy| {
+                    @memcpy(core.slicify(u8, val_copy, val_len), args[val_start..pos]);
+                    return ngx_str_t{ .data = val_copy, .len = val_len };
+                }
+            }
+            break;
+        }
+    }
+    return ngx.string.ngx_null_str;
+}
+
 export fn ngx_http_redis_handler(
     r: [*c]ngx_http_request_t,
 ) callconv(.c) ngx_int_t {
@@ -1138,20 +1290,23 @@ export fn ngx_http_redis_handler(
 
     // Validate HTTP method for command
     switch (command) {
-        .get, .mget => {
+        .get, .mget, .exists, .ttl, .strlen, .hget => {
             if (r.*.method != http.NGX_HTTP_GET) {
                 return http.NGX_HTTP_NOT_ALLOWED;
             }
         },
-        .set, .incr, .expire => {
+        .set, .incr, .decr, .expire, .hset => {
             if (r.*.method != http.NGX_HTTP_POST) {
                 return http.NGX_HTTP_NOT_ALLOWED;
             }
         },
-        .del => {
+        .del, .hdel => {
             if (r.*.method != http.NGX_HTTP_DELETE and r.*.method != http.NGX_HTTP_POST) {
                 return http.NGX_HTTP_NOT_ALLOWED;
             }
+        },
+        .ping => {
+            // PING accepts any method
         },
     }
 
@@ -1167,6 +1322,7 @@ export fn ngx_http_redis_handler(
         rctx.*.command = command;
         rctx.*.key = get_redis_key(r, lccf);
         rctx.*.value = ngx.string.ngx_null_str;
+        rctx.*.field = ngx.string.ngx_null_str;
         rctx.*.state = .start;
         rctx.*.data_len = 0;
         rctx.*.data = ngx.string.ngx_null_str;
@@ -1175,6 +1331,15 @@ export fn ngx_http_redis_handler(
         // Parse MGET keys from query string
         if (command == .mget) {
             parse_mget_keys(r, rctx);
+        }
+
+        // Parse field from query string for hash commands
+        if (command == .hget or command == .hset or command == .hdel) {
+            rctx.*.field = parse_query_param(r, "field");
+            if (rctx.*.field.len == 0) {
+                // field is required for hash commands
+                return http.NGX_HTTP_BAD_REQUEST;
+            }
         }
     }
 

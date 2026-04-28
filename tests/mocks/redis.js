@@ -135,6 +135,72 @@ export class RedisMock {
         return `:${count}\r\n`;
       }
 
+      case "STRLEN": {
+        const key = args[1];
+        if (!key)
+          return "-ERR wrong number of arguments for 'strlen' command\r\n";
+        this.checkExpired(key);
+        const val = this.store.get(key);
+        if (val === undefined) return ":0\r\n";
+        return `:${val.length}\r\n`;
+      }
+
+      case "HGET": {
+        const key = args[1];
+        const field = args[2];
+        if (!key || !field)
+          return "-ERR wrong number of arguments for 'hget' command\r\n";
+        this.checkExpired(key);
+        const hash = this.store.get(key);
+        if (hash === undefined) return "$-1\r\n";
+        // Store hash as JSON object
+        let obj;
+        try { obj = JSON.parse(hash); } catch { return "$-1\r\n"; }
+        if (typeof obj !== "object" || obj === null) return "$-1\r\n";
+        const fieldVal = obj[field];
+        if (fieldVal === undefined) return "$-1\r\n";
+        const strVal = String(fieldVal);
+        return `$${strVal.length}\r\n${strVal}\r\n`;
+      }
+
+      case "HSET": {
+        const key = args[1];
+        const field = args[2];
+        const val = args[3];
+        if (!key || !field || val === undefined)
+          return "-ERR wrong number of arguments for 'hset' command\r\n";
+        this.checkExpired(key);
+        const existing = this.store.get(key);
+        let obj = {};
+        if (existing) {
+          try { obj = JSON.parse(existing); } catch { obj = {}; }
+          if (typeof obj !== "object" || obj === null) obj = {};
+        }
+        const isNew = !(field in obj);
+        obj[field] = val;
+        this.store.set(key, JSON.stringify(obj));
+        return `:${isNew ? 1 : 0}\r\n`;
+      }
+
+      case "HDEL": {
+        const key = args[1];
+        const field = args[2];
+        if (!key || !field)
+          return "-ERR wrong number of arguments for 'hdel' command\r\n";
+        this.checkExpired(key);
+        const existing = this.store.get(key);
+        if (!existing) return ":0\r\n";
+        let obj;
+        try { obj = JSON.parse(existing); } catch { return ":0\r\n"; }
+        if (typeof obj !== "object" || obj === null) return ":0\r\n";
+        if (field in obj) {
+          delete obj[field];
+          this.store.set(key, JSON.stringify(obj));
+          return ":1\r\n";
+        }
+        return ":0\r\n";
+      }
+
       case "INCR": {
         const key = args[1];
         if (!key)

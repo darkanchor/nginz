@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { startNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
 
 const MODULE = "pgrest";
-const PG_CONTAINER = "pg18";
+const PG_CONTAINER = "pgrest-nginz-test";
 const PG_USER = "nginz_test";
 const PG_PASSWORD = "nginz_test_pass";
 const PG_DB = "nginz_test";

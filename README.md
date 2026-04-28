@@ -35,7 +35,7 @@ A Dockerfile is provided as reference so that one can build their own dev image.
 
 ### Container Tests
 
-Three modules rely on running containers for their integration tests. All container interaction uses `sudo docker`.
+Four modules rely on running containers for their integration tests. All container interaction uses `sudo docker`.
 
 **nftset** — Docker-isolated live nftables suite. Provisions temporary tables/sets inside a
 disposable container namespace so the host nftables ruleset is never touched.
@@ -45,11 +45,18 @@ disposable container namespace so the host nftables ruleset is never touched.
 - `ghcr.io/letsencrypt/pebble:latest`
 - `ghcr.io/letsencrypt/pebble-challtestsrv:latest`
 
-**pgrest** — Requires a running PostgreSQL container named `pg18`. The tests create and drop a
-dedicated database on each run, so no manual setup is needed beyond starting the container:
+**pgrest** — Requires a running PostgreSQL container named `pgrest-nginz-test`. The tests create
+and drop a dedicated database on each run, so no manual setup is needed beyond starting the container:
 
 ```bash
-sudo docker run -d --name pg18 -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18.1-trixie
+sudo docker run -d --name pgrest-nginz-test -p 5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:18.1-trixie
+```
+
+**redis** — Requires a running Redis container named `redis-nginz-test`. Tests run against a
+real Redis instance, flushing all keys before each suite:
+
+```bash
+sudo docker run -d --name redis-nginz-test -p 6379:6379 redis:8.6.2-trixie
 ```
 
 > [!NOTE]
