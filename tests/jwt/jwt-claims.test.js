@@ -18,7 +18,7 @@ function createToken(payload, secret, alg = "HS256") {
 
 // ── Suite ──────────────────────────────────────────────────────────────
 
-describe("JWT Batch 2 — Claims as Variables", () => {
+describe("JWT — Claim Variable Extraction", () => {
   beforeAll(async () => {
     await startNginz("tests/jwt/nginx.claims.conf", MODULE);
   }, 30000);

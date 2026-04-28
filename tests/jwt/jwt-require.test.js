@@ -20,7 +20,7 @@ const SECRET = "require-test-secret-hs256";
 
 // ── Suite ──────────────────────────────────────────────────────────────
 
-describe("JWT Batch 3 — Rich Claim Validation", () => {
+describe("JWT — Rich Claim Validation", () => {
   beforeAll(async () => {
     await startNginz("tests/jwt/nginx.require.conf", MODULE);
   }, 30000);

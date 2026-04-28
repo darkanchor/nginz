@@ -77,7 +77,7 @@ function generateRsaKeys() {
 
 // ── Suite ──────────────────────────────────────────────────────────────
 
-describe("JWT Batch 1 — Algorithm Expansion & Key Loading", () => {
+describe("JWT — Algorithm Support & Key Loading", () => {
   beforeAll(async () => {
     generateRsaKeys();
 

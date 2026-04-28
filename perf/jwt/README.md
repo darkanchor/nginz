@@ -1,0 +1,48 @@
+# JWT Module — Performance
+
+## Quick start
+
+```bash
+# Snapshot baseline (default)
+bun perf/jwt/benchmark/run.js
+
+# Perf-stat profiling
+bun perf/jwt/benchmark/run.js --profile=perf-stat
+
+# Single scenario, custom load
+bun perf/jwt/benchmark/run.js --scenario=valid-hs256 --requests=5000 --concurrency=4,16,64
+```
+
+## Scenarios
+
+| Name | Description | Expected | Overhead profile |
+|------|------------|----------|-----------------|
+| `valid-hs256` | Valid HS256 token → 200 OK | body="OK" | JWT parse + base64 decode + HMAC-SHA256 verify |
+| `valid-claims` | Valid token + claim extraction → 200 OK + headers | body="OK", X-Jwt-Sub="claim-user" | above + CJSON decode + claim traversal |
+| `reject-no-token` | No Authorization header → 401 | 401 status | Fast: enabled check + header absence |
+| `reject-wrong-secret` | Token with wrong secret → 401 | 401 status | Full parse + HMAC verify (fail) |
+
+## Architecture
+
+The JWT module is the simplest possible perf target — pure CPU, no external
+dependencies, no containers, no mock servers:
+
+```
+Bun test runner → HTTP → nginz (single worker) → JWT access handler
+                                                    │
+                                                    ├─ base64url decode (header + payload)
+                                                    ├─ HMAC-SHA256 verify (OpenSSL)
+                                                    ├─ Optional: CJSON decode + claim extract
+                                                    └─ Return 200 OK or 401
+```
+
+## No external dependencies
+
+Unlike pgrest (PostgreSQL) or redis (Redis mock), the JWT benchmark requires
+zero setup. Tokens are pre-computed in `scenarios.js` using Bun's built-in
+`crypto.createHmac`. The nginx config uses inline `jwt_secret` with an HS256 key.
+
+## Baseline
+
+See `notes/2026-04-28-baseline.md` for the initial baseline with full analysis
+including perf-stat hardware counters.
