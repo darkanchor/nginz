@@ -805,29 +805,65 @@ fn merge_jwt_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     const prev = core.castPtr(jwt_loc_conf, parent) orelse return conf.NGX_CONF_OK;
     const c = core.castPtr(jwt_loc_conf, child) orelse return conf.NGX_CONF_OK;
 
-    if (c.*.enabled == 0 and c.*.explicit_disable == 0) c.*.enabled = prev.*.enabled;
-    if (c.*.secret.len == 0) c.*.secret = prev.*.secret;
-    if (c.*.key_file.len == 0) c.*.key_file = prev.*.key_file;
-    if (c.*.key_format == 1 and prev.*.key_format != 1) c.*.key_format = prev.*.key_format;
-    if (c.*.validate_exp == conf.NGX_CONF_UNSET) c.*.validate_exp = prev.*.validate_exp;
-    if (c.*.validate_sig == conf.NGX_CONF_UNSET) c.*.validate_sig = prev.*.validate_sig;
-    if (c.*.leeway == conf.NGX_CONF_UNSET) c.*.leeway = prev.*.leeway;
-    if (c.*.token_var.len == 0) c.*.token_var = prev.*.token_var;
-    if (c.*.phase == conf.NGX_CONF_UNSET_UINT) c.*.phase = prev.*.phase;
-    if (c.*.keys_count == 0 and prev.*.keys_count > 0) { c.*.keys_count = prev.*.keys_count; c.*.keys = prev.*.keys; }
+    // Convert [*c]T to *const T / *T to get correct field access semantics.
+    // Direct [*c]T.*.array_field access can miscompile for large extern structs.
+    const p: *const jwt_loc_conf = @ptrCast(@alignCast(prev));
+    const ch: *jwt_loc_conf = @ptrCast(@alignCast(c));
+
+    if (ch.enabled == 0 and ch.explicit_disable == 0) ch.enabled = p.enabled;
+    if (ch.secret.len == 0) ch.secret = p.secret;
+    if (ch.key_file.len == 0) ch.key_file = p.key_file;
+    if (ch.key_format == 1 and p.key_format != 1) ch.key_format = p.key_format;
+    if (ch.validate_exp == conf.NGX_CONF_UNSET) ch.validate_exp = p.validate_exp;
+    if (ch.validate_sig == conf.NGX_CONF_UNSET) ch.validate_sig = p.validate_sig;
+    if (ch.leeway == conf.NGX_CONF_UNSET) ch.leeway = p.leeway;
+    if (ch.token_var.len == 0) ch.token_var = p.token_var;
+    if (ch.phase == conf.NGX_CONF_UNSET_UINT) ch.phase = p.phase;
+
+    // keys array
+    if (ch.keys_count == 0 and p.keys_count > 0) {
+        @memcpy(ch.keys[0..p.keys_count], p.keys[0..p.keys_count]);
+        ch.keys_count = p.keys_count;
+    }
+
     // Merge claim_vars: append parent entries after child entries
-    if (prev.*.claim_vars_count > 0) {
-        for (0..prev.*.claim_vars_count) |i| {
-            if (c.*.claim_vars_count >= MAX_CLAIM_VARS) break;
-            c.*.claim_vars[c.*.claim_vars_count] = prev.*.claim_vars[i];
-            c.*.claim_vars_count += 1;
+    if (p.claim_vars_count > 0) {
+        for (0..p.claim_vars_count) |i| {
+            if (ch.claim_vars_count >= MAX_CLAIM_VARS) break;
+            ch.claim_vars[ch.claim_vars_count] = p.claim_vars[i];
+            ch.claim_vars_count += 1;
         }
     }
-    if (c.*.require_count == 0 and prev.*.require_count > 0) { c.*.require_count = prev.*.require_count; c.*.require_rules = prev.*.require_rules; }
-    if (c.*.require_header_count == 0 and prev.*.require_header_count > 0) { c.*.require_header_count = prev.*.require_header_count; c.*.require_header_rules = prev.*.require_header_rules; }
-    if (c.*.require_var_count == 0 and prev.*.require_var_count > 0) { c.*.require_var_count = prev.*.require_var_count; c.*.require_var_indices = prev.*.require_var_indices; }
-    if (c.*.revoked_subs_count == 0 and prev.*.revoked_subs_count > 0) { c.*.revoked_subs_count = prev.*.revoked_subs_count; c.*.revoked_subs = prev.*.revoked_subs; }
-    if (c.*.revoked_kids_count == 0 and prev.*.revoked_kids_count > 0) { c.*.revoked_kids_count = prev.*.revoked_kids_count; c.*.revoked_kids = prev.*.revoked_kids; }
+
+    // require_rules array
+    if (ch.require_count == 0 and p.require_count > 0) {
+        @memcpy(ch.require_rules[0..p.require_count], p.require_rules[0..p.require_count]);
+        ch.require_count = p.require_count;
+    }
+
+    // require_header_rules array
+    if (ch.require_header_count == 0 and p.require_header_count > 0) {
+        @memcpy(ch.require_header_rules[0..p.require_header_count], p.require_header_rules[0..p.require_header_count]);
+        ch.require_header_count = p.require_header_count;
+    }
+
+    // require_var_indices array
+    if (ch.require_var_count == 0 and p.require_var_count > 0) {
+        @memcpy(ch.require_var_indices[0..p.require_var_count], p.require_var_indices[0..p.require_var_count]);
+        ch.require_var_count = p.require_var_count;
+    }
+
+    // revoked_subs array
+    if (ch.revoked_subs_count == 0 and p.revoked_subs_count > 0) {
+        @memcpy(ch.revoked_subs[0..p.revoked_subs_count], p.revoked_subs[0..p.revoked_subs_count]);
+        ch.revoked_subs_count = p.revoked_subs_count;
+    }
+
+    // revoked_kids array
+    if (ch.revoked_kids_count == 0 and p.revoked_kids_count > 0) {
+        @memcpy(ch.revoked_kids[0..p.revoked_kids_count], p.revoked_kids[0..p.revoked_kids_count]);
+        ch.revoked_kids_count = p.revoked_kids_count;
+    }
 
     return conf.NGX_CONF_OK;
 }
@@ -1039,6 +1075,7 @@ fn populate_claims(rctx: [*c]jwt_ctx, payload_json: []const u8, lccf: [*c]jwt_lo
     // Extract registered claim variables
     for (lccf.*.claim_vars[0..lccf.*.claim_vars_count]) |*cv| {
         if (rctx.*.claim_values_count >= MAX_CLAIM_VARS) break;
+        if (cv.name.data == null) continue;
         const name = core.slicify(u8, cv.name.data, cv.name.len);
         if (extract_claim(json, name, pool)) |val| {
             const idx = rctx.*.claim_values_count;
