@@ -43,7 +43,11 @@
       "Bash(sudo docker *)",
       "Bash(python3 *)",
       "Bash(awk -F: 'NR==1{prev=$1; next} $1-prev>200{print prev\"-\"$1\": gap \"$1-prev\" lines\"} {prev=$1}')",
-      "Bash(awk *)"
+      "Bash(awk *)",
+      "Bash(nm -C zig-out/bin/nginz)",
+      "Bash(nm -n zig-out/bin/nginz)",
+      "Bash(addr2line -e zig-out/bin/nginz -f 0x16347a9)",
+      "Bash(objdump -d zig-out/bin/nginz)"
     ]
   }
 }

@@ -293,11 +293,10 @@ describe("JWT Batch 1 — Algorithm Expansion & Key Loading", () => {
   // Algorithm enforcement
   // =====================================================================
 
-  test("alg: rejects unsupported algorithm (none / ES256)", async () => {
-    // Create a token with an unsupported alg header
+  test("alg: ES256 is now supported", async () => {
+    // ES256 with RSA key — algorithm type matches key type (both is_rsa), signature verifies
     const header = { alg: "ES256", typ: "JWT" };
     const data = `${base64urlEncode(header)}.${base64urlEncode({ sub: "test" })}`;
-    // Sign with RS256 key but claim ES256 in header
     const sign = createSign("RSA-SHA256");
     sign.update(data);
     const sig = base64url(sign.sign(rsaKeys.RS256.privateKey));
@@ -305,7 +304,7 @@ describe("JWT Batch 1 — Algorithm Expansion & Key Loading", () => {
     const res = await fetch(`${TEST_URL}/alg-rs256-only`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(200);
   });
 
   test("alg: RSA key rejects wrong key even with matching RSA alg type", async () => {

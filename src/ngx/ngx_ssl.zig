@@ -82,9 +82,11 @@ pub const BIO_CTRL_INFO = ngx.BIO_CTRL_INFO;
 pub const EVP_PKEY_get0_RSA = ngx.EVP_PKEY_get0_RSA;
 pub const PEM_write_bio_PrivateKey = ngx.PEM_write_bio_PrivateKey;
 
-// SHA256 DIGEST SIGN/VERIFY
+// SHA256/384/512 DIGEST SIGN/VERIFY
 const SHA256_DIGEST_LENGTH = ngx.SHA256_DIGEST_LENGTH;
 pub const EVP_sha256 = ngx.EVP_sha256;
+pub extern fn EVP_sha384() ?*const EVP_MD;
+pub extern fn EVP_sha512() ?*const EVP_MD;
 pub const EVP_MD_CTX = ngx.EVP_MD_CTX;
 pub const EVP_MD_CTX_new = ngx.EVP_MD_CTX_new;
 pub const EVP_MD_CTX_free = ngx.EVP_MD_CTX_free;
@@ -147,6 +149,28 @@ pub const ASN1_TIME_diff = ngx.ASN1_TIME_diff;
 // base64
 const EVP_EncodeBlock = ngx.EVP_EncodeBlock;
 const EVP_DecodeBlock = ngx.EVP_DecodeBlock;
+
+// EC keys (ECDSA) — declared locally since not in ngx.zig
+pub const EC_KEY = opaque {};
+pub extern fn EC_KEY_new_by_curve_name(nid: c_int) ?*EC_KEY;
+pub extern fn EC_KEY_free(key: ?*EC_KEY) void;
+pub extern fn EC_KEY_get0_group(key: ?*const EC_KEY) ?*anyopaque;
+
+// Raw public key import (EdDSA, ECDSA) — declared locally
+pub extern fn EVP_PKEY_new_raw_public_key(nid: c_int, e: ?*anyopaque, pub_key: [*c]const u8, len: usize) ?*EVP_PKEY;
+
+// RSA-PSS — declared locally
+pub const RSA_PKCS1_PSS_PADDING: c_int = 6;
+pub const RSA_PSS_SALTLEN_DIGEST: c_int = -1;
+pub extern fn EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx: ?*EVP_PKEY_CTX, saltlen: c_int) c_int;
+
+// Curve NIDs — declared locally
+pub const NID_X9_62_prime256v1: c_int = 415;
+pub const NID_secp384r1: c_int = 715;
+pub const NID_secp521r1: c_int = 716;
+pub const NID_secp256k1: c_int = 714;
+pub const NID_ED25519: c_int = 1087;
+pub extern fn OBJ_txt2nid(s: [*c]const u8) c_int;
 
 // HMAC
 pub const HMAC_CTX = ngx.HMAC_CTX;

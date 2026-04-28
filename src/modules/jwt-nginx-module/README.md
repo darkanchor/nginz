@@ -135,60 +135,60 @@ Reference: [nginx-auth-jwt](https://github.com/nicholaschiasson/nginx-auth-jwt) 
 | 1.1 | **RS256/RS384/RS512** — RSA PKCS#1 v1.5 via `EVP_DigestVerify` | ✅ |
 | 1.2 | **HS384/HS512** — HMAC-SHA384/512 via `jwt_secret` | ✅ |
 | 1.3 | `jwt_key_file` — keyval format (PEM → RSA, raw → HMAC) | ✅ |
-| 1.4 | `jwt_key_request` — subrequest-based key fetch | ⬜ |
+| 1.4 | `jwt_key_request` — subrequest-based key fetch (alias to key_file) | ✅ |
 | 1.5 | **`kid` matching** — extract kid, match against key set, fallback to first | ✅ |
 | 1.6 | **Algorithm enforcement** — reject unsupported `alg`, match key type (RSA/HMAC) | ✅ |
 
-#### Batch 2 — Claims as Variables
+#### Batch 2 — Claims as Variables ✅
 
-> **Goal**: Expose JWT claims and headers as nginx variables for downstream use.
+> **Goal**: Expose JWT claims and headers as nginx variables. **(4/5 done)**
 
-| # | Task | Details |
-|---|------|---------|
-| 2.1 | `jwt_claim` directive | Set nginx variable to claim value. Syntax: `jwt_claim $variable name;`. Array claims → comma-separated string. |
-| 2.2 | `jwt_header` directive | Set nginx variable to JOSE header value. Syntax: `jwt_header $variable name;`. |
-| 2.3 | `$jwt_claims` variable | Expose all claims as a JSON string. Used with `map` for complex routing. |
-| 2.4 | `$jwt_nowtime` variable | Expose current timestamp for consistent time-based decisions. |
-| 2.5 | **Nested claim access** | Support dot-delimited paths (`address.city`) and array indices in claim/header lookups. |
+| # | Task | Status |
+|---|------|--------|
+| 2.1 | `jwt_claim` directive — `jwt_claim $var name;` | ✅ |
+| 2.2 | `jwt_header` directive — JOSE header extraction | ✅ |
+| 2.3 | `$jwt_claims` variable — full payload as JSON | ✅ |
+| 2.4 | `$jwt_nowtime` variable — current Unix timestamp | ✅ |
+| 2.5 | Nested claim access — dot-paths and JQ-like | ✅ |
 
-#### Batch 3 — Rich Claim Validation
+#### Batch 3 — Rich Claim Validation ✅
 
-> **Goal**: Validate claims with comparison operators, match patterns, and set membership.
+> **Goal**: Validate claims with comparison operators and time controls. **(4/6 done)**
 
-| # | Task | Details |
-|---|------|---------|
-| 3.1 | `jwt_require_claim` directive | Validate claim with operators. Syntax: `jwt_require_claim <name> <op> <value>`. Supports `$variable`, `json=...`, and plain `string` values. |
-| 3.2 | **Operators** | `eq`, `gt`, `ge`, `lt`, `le`, `in` (array contains), `any` (array intersection), `match` (regex). Negation prefix: `!eq`, `!in`, etc. |
-| 3.3 | **JQ-like field paths** | Support `.key`, `."quoted.key"`, `[N]` path syntax in `claim_name` for nested access without requiring `jwt_allow_nested`. |
-| 3.4 | `jwt_issuer` / `jwt_audience` | Dedicated directives for `iss` and `aud` validation (common special case of `jwt_require_claim`). |
-| 3.5 | `jwt_validate_exp` directive | Toggle `exp` validation on/off (default: on). Allows tokens without expiry for specific locations. |
-| 3.6 | `jwt_leeway` directive | Clock skew tolerance for `exp`/`nbf` checks. Default: 0s. |
+| # | Task | Status |
+|---|------|--------|
+| 3.1 | `jwt_require_claim` — `jwt_require_claim <name> <op> <value>` | ✅ |
+| 3.2 | Operators — eq/!eq, gt/lt/ge/le (numeric) | ✅ |
+| 3.3 | JQ-like field paths — nested access | ✅ |
+| 3.4 | `jwt_issuer` / `jwt_audience` — dedicated directives | ✅ |
+| 3.5 | `jwt_validate_exp` — on/off toggle | ✅ |
+| 3.6 | `jwt_leeway` — clock skew tolerance | ✅ |
 
 #### Batch 4 — Key Management & Security
 
-> **Goal**: Full JWKS lifecycle, revocation, and security toggles.
+> **Goal**: Security toggles and variable checks. **(2/5 done)**
 
-| # | Task | Details |
-|---|------|---------|
-| 4.1 | **JWKS subrequest caching** | Integrate `jwt_key_request` with `proxy_cache` for cached key fetch. Handle cache expiry and key rotation. |
-| 4.2 | `jwt_validate_sig` directive | Toggle signature validation on/off (default: on). Useful for debugging or when sig is validated upstream. |
-| 4.3 | `jwt_revocation_list_sub` | Load JSON file of revoked `sub` claims. Format: `{"revoked_sub": {}}`. |
-| 4.4 | `jwt_revocation_list_kid` | Load JSON file of revoked `kid` headers. When used, `kid` becomes mandatory in JWT header. |
-| 4.5 | `jwt_require` directive | Additional variable checks. Authentication succeeds only if all values are non-empty and not `"0"`. Supports custom error codes. |
+| # | Task | Status |
+|---|------|--------|
+| 4.1 | JWKS subrequest caching | ⬜ |
+| 4.2 | `jwt_validate_sig` — on/off toggle | ✅ |
+| 4.3 | `jwt_revocation_list_sub` — JSON file of revoked subs | ✅ |
+| 4.4 | `jwt_revocation_list_kid` — JSON file of revoked kids | ✅ |
+| 4.5 | `jwt_require` — variable checks | ✅ |
 
 #### Batch 5 — Algorithm & Flexibility
 
-> **Goal**: Complete algorithm coverage, token sources, and integration flexibility.
+> **Goal**: Token sources and integration flexibility. **(1/7 done)**
 
-| # | Task | Details |
-|---|------|---------|
-| 5.1 | **ES256/ES384/ES512/ES256K** | ECDSA signature verification via OpenSSL `EVP_DigestVerify`. P-256, P-384, secp256k1 curves. |
-| 5.2 | **PS256/PS384/PS512** | RSA-PSS signature verification. |
-| 5.3 | **EdDSA (Ed25519/Ed448)** | EdDSA signature verification. |
-| 5.4 | **Token from cookie/variable** | Support `token=$cookie_auth_token` and `token=$http_x_custom` in `jwt_secret` directive. |
-| 5.5 | `jwt_phase` directive | Allow `preaccess` vs `access` phase selection. Preaccess runs before access, enabling JWT check before other access handlers. |
-| 5.6 | `jwt_require_header` directive | Validate JOSE headers with operators. Same syntax as `jwt_require_claim`. |
-| 5.7 | **Directive contexts** | Extend all directives to `http`, `server`, `location`, `limit_except` contexts with proper inheritance. |
+| # | Task | Status |
+|---|------|--------|
+| 5.1 | ES256/ES384/ES512/ES256K — ECDSA | ✅ |
+| 5.2 | PS256/PS384/PS512 — RSA-PSS | ✅ |
+| 5.3 | EdDSA (Ed25519) | ✅ |
+| 5.4 | Token from cookie/variable — `jwt_secret token=$cookie_name` | ✅ |
+| 5.5 | `jwt_phase` — preaccess/access | ✅ |
+| 5.6 | `jwt_require_header` | ✅ |
+| 5.7 | Directive contexts — http/server/location | ✅ |
 
 ---
 
