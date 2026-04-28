@@ -138,7 +138,7 @@ make install
 
 ## Module Status
 
-21 modules total. All modules have integration tests and individual README documentation.
+22 modules total. All modules have integration tests and individual README documentation.
 
 ### Feature Ready (20)
 
@@ -169,11 +169,12 @@ make install
 
 None currently.
 
-### Reference (1)
+### Reference (2)
 
 | Module | Description |
 |--------|-------------|
 | **hello** | Minimal module example |
+| **njs** | QuickJS scripting engine (built-in); integration demos for njs+Redis+PGrest orchestration |
 
 [1]: https://github.com/openresty/echo-nginx-module "echo"
 [2]: https://github.com/agentzh "agentzh"
