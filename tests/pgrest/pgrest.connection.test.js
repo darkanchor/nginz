@@ -4,6 +4,7 @@ import { cleanupRuntime, startNginz, stopNginz, TEST_URL, createPostgresMock } f
 const MODULE = "pgrest";
 
 let resetPgMock;
+let dnsErrorMock;
 
 async function runConnectionCase(configName, path = "/api/users") {
   await startNginz(`tests/${MODULE}/${configName}`, MODULE);
@@ -19,10 +20,14 @@ describe("pgrest connection error handling", () => {
   resetPgMock = createPostgresMock(15434);
   resetPgMock.setQueryHandler(/^SELECT \* FROM users$/, () => ({ close: true }));
 
+  // A separate mock on port 15437 that sends a startup error simulating DNS failure.
+  // Uses hostaddr=127.0.0.1 (no real DNS) to avoid blocking the nginx worker.
+  dnsErrorMock = createPostgresMock(15437);
+  dnsErrorMock.connectionError = "could not translate host name \"does-not-resolve\" to address: Name or service not known";
+
   afterAll(() => {
-    if (resetPgMock) {
-      resetPgMock.stop();
-    }
+    if (resetPgMock) resetPgMock.stop();
+    if (dnsErrorMock) dnsErrorMock.stop();
     cleanupRuntime(MODULE);
   });
 

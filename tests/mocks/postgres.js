@@ -13,6 +13,7 @@ export class PostgresMock {
     this.lastSetJwt = null; // Track last SET request.jwt command
     this.queryLog = []; // Log of all queries received
     this.resetRoleCount = 0; // Count of RESET ROLE commands received
+    this.connectionError = null; // If set, send this error message during startup instead of AuthenticationOk
   }
 
   start() {
@@ -109,6 +110,14 @@ export class PostgresMock {
 
     // Regular startup message (protocol 3.0 = 196608)
     if (version === 196608) {
+      // If connectionError is configured, send an error instead of AuthenticationOk.
+      // This lets tests simulate connection-level failures without real DNS.
+      if (this.connectionError !== null) {
+        this.sendStartupError(socket, this.connectionError);
+        socket.end();
+        return;
+      }
+
       // Send AuthenticationOk (R\0\0\0\8\0\0\0\0)
       socket.write(Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0]));
 
@@ -141,6 +150,24 @@ export class PostgresMock {
     buf[5 + name.length] = 0;
     buf.write(value, 5 + name.length + 1);
     buf[5 + name.length + 1 + value.length] = 0;
+    socket.write(buf);
+  }
+
+  // Send a PostgreSQL ErrorResponse during startup (before AuthenticationOk).
+  // This simulates connection-level failures that libpq reports via pgErrorMessage().
+  sendStartupError(socket, message) {
+    // PostgreSQL ErrorResponse wire format:
+    //   'E' + length (i32, includes self) + field bytes + '\0' terminator
+    // Fields: S=Severity, M=Message, C=Code
+    const severity = "FATAL\0";
+    const code = "08001\0"; // sqlconnection_exception
+    const msg = message + "\0";
+    const body = "S" + severity + "M" + msg + "C" + code + "\0";
+    const len = 4 + body.length; // length includes the 4-byte length field itself
+    const buf = Buffer.alloc(1 + len);
+    buf[0] = 0x45; // 'E'
+    buf.writeInt32BE(len, 1);
+    buf.write(body, 5);
     socket.write(buf);
   }
 
