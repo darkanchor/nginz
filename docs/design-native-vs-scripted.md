@@ -307,3 +307,180 @@ Some things have Lua solutions in OpenResty but should not follow the same patte
 | Request body parsing (JSON Schema validation) | Per-request JSON parse is the hot path; native cJSON is the right choice |
 
 The pattern: when correctness, predictability, or shared-memory coordination is the requirement, native Zig is not optional.
+
+---
+
+## Recommendations: concur vs challenge
+
+These recommendations are based on three inputs:
+
+- the project `ROADMAP.md`
+- the current `nginz` module base
+- the broader module taxonomy in `/home/kaiwu/Documents/gitea/ngx-modules/json/index.json`
+
+The taxonomy matters because it shows where the nginx ecosystem has concentrated real module demand:
+
+- **native-heavy areas**: Authentication & Security, Content Processing, Utilities & Variables, Monitoring & Logging, Protocol & Transport, Upstream & Load Balancing
+- **Lua-heavy areas**: HTTP client/proxy, routing logic, policy wrappers, data-store glue, nginx-core integration, observability push adapters
+
+That split broadly supports the design boundary in this document, but it also suggests a few adjustments in emphasis.
+
+### Concur
+
+#### 1. Concur: keep the native-vs-scripted boundary explicit
+
+The document’s core rule is sound:
+
+- **native Zig** for hot-path primitives, shared-memory state, and deep nginx/OpenSSL/system integration
+- **njs/QuickJS** for orchestration, policy composition, and product-specific logic
+
+This matches both the roadmap and the ecosystem counts from `index.json`. The native catalog is strongest where correctness, performance, or low-level integration dominate. The Lua catalog is strongest where people want to change behavior quickly without recompiling.
+
+#### 2. Concur: do not build a parallel Lua story
+
+This is the right strategic constraint. The roadmap already says the project should not split into a separate Lua runtime track, and the design doc uses that correctly as a forcing function. The taxonomy does not contradict this. It shows where Lua was useful historically, but most of those wins came from *programmability*, not from Lua as a language requirement.
+
+#### 3. Concur: productize the existing njs path before adding more native platform pieces
+
+The strongest alignment between this design doc and the roadmap is the idea that the immediate gap is not “missing scripting,” but “missing productized scripting.”
+
+The roadmap’s “HTTP njs hook module” and this doc’s “njs first-class packaging” are effectively the same platform move and should be treated as one coordinated initiative:
+
+- supported packaging
+- first-class examples
+- integration coverage
+- conventions for native-to-script exposure
+
+That should happen before the project takes on too many additional native modules.
+
+#### 4. Concur: native `headers-more`, compression, and upstream policy are the right early native bets
+
+From the ecosystem taxonomy, native demand clusters heavily around:
+
+- security/authentication
+- content processing / filtering
+- load balancing / upstream control
+
+So the design doc is directionally right to prioritize:
+
+- `headers-more`
+- `brotli` / `zstd`
+- upstream balancer / sticky / policy work
+
+These are categories where njs is not a substitute.
+
+### Challenge
+
+#### 5. Challenge: keep Sprint 1 explicitly mixed instead of letting njs productization dominate the framing
+
+The current nginz module base is already broad, but the project still lacks a few “every deployment expects this” native features.
+
+If forced to choose sequencing, I would avoid letting “njs first-class packaging” read like the *only* Sprint 1 priority. It should stay paired with at least one immediately marketable native deployment primitive, especially:
+
+1. `headers-more`
+2. `brotli`
+
+Reason: the roadmap is trying to build both OpenResty-style flexibility and commercial-nginx credibility. `headers-more` and modern compression do more for day-one production credibility than docs/examples alone.
+
+So my refinement is:
+
+- **Sprint 1 should be mixed, not purely platformization**
+- one scripting-platform deliverable
+- one or two obvious native production features
+
+#### 6. Challenge: “shared dict” is under-specified relative to how central it is to the whole architecture
+
+The design treats shared dict as a natural next primitive, which is correct, but the document understates how many later choices become constrained by it.
+
+Before building policy/authz/session/mlcache-style layers, the project needs an explicit shared-dict contract:
+
+- value types
+- eviction model
+- memory accounting
+- atomic operations
+- timer / expiration semantics
+- cross-worker notification expectations
+
+Without that, downstream njs libraries risk becoming throwaway adapters around an unstable core primitive.
+
+I would add a short design requirement:
+
+> No session/policy/cache library should be treated as stable until the shared-dict primitive contract is stable.
+
+#### 7. Challenge: some items listed as “njs libraries” are really product bundles, not just libraries
+
+The document is right that pieces like session/authz/http-wrapper belong in njs, but they will not succeed as raw helper files alone. They need to be treated as packaged platform capabilities with:
+
+- config conventions
+- example deployments
+- support boundaries
+- versioned compatibility guarantees
+
+In other words, the doc should distinguish:
+
+- **njs helper library**
+- **njs-backed nginz product feature**
+
+That distinction matters for maintenance and roadmap promises.
+
+#### 8. Challenge: “vts” is probably less urgent than first-class gateway control primitives
+
+The taxonomy does show meaningful monitoring/logging demand on the native side, but relative to the current nginz base, richer observability is less urgent than:
+
+- shared dict
+- upstream policy / sticky balancing
+- programmable cache behavior
+- policy/authz composition
+
+`prometheus` already gives nginz a respectable metrics story. A stronger commercial-nginx gap today is not “more dashboards,” but “more gateway-grade traffic policy and shared state.”
+
+So I would move `vts` down one priority notch behind:
+
+1. shared dict
+2. upstream balancer / sticky
+3. headers-more
+4. compression
+
+#### 9. Challenge: the document should explicitly separate “module candidates” from “platform bundles”
+
+Right now the list mixes:
+
+- real native modules
+- njs libraries
+- hybrid module-plus-script systems
+
+That is conceptually correct, but operationally muddy.
+
+I would add a simple label to each candidate:
+
+- **native module**
+- **njs library**
+- **hybrid platform bundle**
+
+This will reduce later roadmap confusion about what “shipping” an item actually means.
+
+### Recommended near-term adjustment
+
+If I compress the roadmap and this design into a sharper execution view, my recommendation is:
+
+#### Near-term top five
+
+1. **njs first-class packaging + examples + test matrix**
+2. **headers-more**
+3. **brotli**
+4. **shared dict primitive with a documented contract**
+5. **upstream balancer / sticky policy foundation**
+
+This keeps the document’s core philosophy intact while improving delivery order for real operator value.
+
+### Final recommendation
+
+Overall, I **concur** with the design boundary and with the rejection of a second scripting ecosystem.
+
+I **challenge** the sequencing and packaging assumptions in three places:
+
+- Sprint 1 should include at least one obvious native production primitive, not just njs platformization
+- shared dict needs a stricter primitive contract before too many dependent libraries are promised
+- the document should classify deliverables as native modules, njs libraries, or hybrid bundles to keep roadmap promises crisp
+
+That would make the document stronger without changing its core thesis.
