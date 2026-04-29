@@ -2066,55 +2066,357 @@ export var ngx_http_jwt_module = ngx.module.make_module(
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
-const expectEqual = std.testing.expectEqual;
-const expect = std.testing.expect;
+const testing = std.testing;
+const expectEqual = testing.expectEqual;
+const expect = testing.expect;
+const expectError = testing.expectError;
 
-test "jwt module" {}
+// ── Test helpers ──────────────────────────────────────────────────────
 
-test "base64url_decode" {
-    var output: [256]u8 = undefined;
-    const len = base64url_decode("SGVsbG8", &output) orelse 0;
-    try expectEqual(len, 5);
-    try expectEqual(output[0..5].*, "Hello".*);
+fn testNgxStr(s: []const u8) ngx_str_t {
+    return ngx_str_t{ .data = @constCast(s.ptr), .len = s.len };
 }
 
-test "algo_from_str all supported" {
-    try expect(algo_from_str("HS256") != null);
-    try expect(algo_from_str("HS384") != null);
-    try expect(algo_from_str("HS512") != null);
-    try expect(algo_from_str("RS256") != null);
-    try expect(algo_from_str("RS384") != null);
-    try expect(algo_from_str("RS512") != null);
-    try expect(algo_from_str("ES256") != null);
+fn hexToBytes(hex: []const u8) ![64]u8 {
+    var buf: [64]u8 = undefined;
+    if (hex.len % 2 != 0) return error.InvalidHex;
+    const byte_len = hex.len / 2;
+    if (byte_len > 64) return error.BufferTooSmall;
+    for (0..byte_len) |i| {
+        const hi = std.fmt.charToDigit(hex[i * 2], 16) catch return error.InvalidHex;
+        const lo = std.fmt.charToDigit(hex[i * 2 + 1], 16) catch return error.InvalidHex;
+        buf[i] = @intCast((hi << 4) | lo);
+    }
+    @memset(buf[byte_len..], 0);
+    return buf;
+}
+
+test "base64url_decode: basic" {
+    var out: [256]u8 = undefined;
+    const len = (base64url_decode("SGVsbG8", &out)).?;
+    try expectEqual(@as(usize, 5), len);
+    try expectEqual("Hello".*, out[0..5].*);
+}
+
+test "base64url_decode: empty input" {
+    var out: [256]u8 = undefined;
+    try expectEqual(@as(usize, 0), (base64url_decode("", &out)).?);
+}
+
+test "base64url_decode: url-safe chars - and _" {
+    // "-_" decodes differently from "+/" for the same base64 value
+    var out: [256]u8 = undefined;
+    const len = (base64url_decode("HiI-", &out)).?;
+    try expectEqual(@as(usize, 3), len);
+}
+
+test "base64url_decode: no padding" {
+    var out: [256]u8 = undefined;
+    const len = (base64url_decode("SGVsbG8", &out)).?;
+    try expectEqual(@as(usize, 5), len);
+}
+
+test "base64url_decode: one padding char" {
+    var out: [256]u8 = undefined;
+    const len = (base64url_decode("SGVsbG8=", &out)).?;
+    try expectEqual(@as(usize, 5), len);
+}
+
+test "base64url_decode: two padding chars" {
+    var out: [256]u8 = undefined;
+    const len = (base64url_decode("YQ==", &out)).?;
+    try expectEqual(@as(usize, 1), len);
+    try expectEqual(out[0], 'a');
+}
+
+test "base64url_decode: invalid char returns null" {
+    var out: [256]u8 = undefined;
+    try expect(base64url_decode("!!!", &out) == null);
+}
+
+test "base64url_decode: output buffer too small returns null" {
+    var out: [1]u8 = undefined;
+    try expect(base64url_decode("SGVsbG8", &out) == null);
+}
+
+test "base64url_decode: max buffer overflow" {
+    var out: [4096]u8 = undefined;
+    // 5000 'A' characters → input too large for temp buffer
+    const big: [5000]u8 = [_]u8{'A'} ** 5000;
+    try expect(base64url_decode(&big, &out) == null);
+}
+
+test "algo_from_str: all 14 algorithms" {
+    const cases = [_][]const u8{
+        "HS256", "HS384", "HS512",
+        "RS256", "RS384", "RS512",
+        "ES256", "ES384", "ES512", "ES256K",
+        "PS256", "PS384", "PS512",
+        "EdDSA",
+    };
+    for (cases) |name| {
+        try expect(algo_from_str(name) != null);
+    }
+}
+
+test "algo_from_str: invalid returns null" {
     try expect(algo_from_str("none") == null);
+    try expect(algo_from_str("HS128") == null);
+    try expect(algo_from_str("") == null);
+    try expect(algo_from_str("hs256") == null); // case-sensitive
+    try expect(algo_from_str("RS-256") == null);
 }
 
-test "algo_info sig lengths" {
-    try expectEqual(algo_info(.HS256).sig_len, 32);
-    try expectEqual(algo_info(.HS384).sig_len, 48);
-    try expectEqual(algo_info(.HS512).sig_len, 64);
-    try expect(algo_info(.RS256).is_rsa);
+test "algo_info: HMAC sig lengths and is_rsa" {
+    try expectEqual(@as(usize, 32), algo_info(.HS256).sig_len);
+    try expectEqual(@as(usize, 48), algo_info(.HS384).sig_len);
+    try expectEqual(@as(usize, 64), algo_info(.HS512).sig_len);
     try expect(!algo_info(.HS256).is_rsa);
+    try expect(!algo_info(.HS384).is_rsa);
+    try expect(!algo_info(.HS512).is_rsa);
 }
 
-test "const_time_eq" {
+test "algo_info: RSA sig lengths and is_rsa" {
+    try expectEqual(@as(usize, 256), algo_info(.RS256).sig_len);
+    try expectEqual(@as(usize, 384), algo_info(.RS384).sig_len);
+    try expectEqual(@as(usize, 512), algo_info(.RS512).sig_len);
+    try expect(algo_info(.RS256).is_rsa);
+    try expect(algo_info(.RS384).is_rsa);
+    try expect(algo_info(.RS512).is_rsa);
+}
+
+test "algo_info: ECDSA sig lengths and is_rsa" {
+    try expectEqual(@as(usize, 64), algo_info(.ES256).sig_len);
+    try expectEqual(@as(usize, 96), algo_info(.ES384).sig_len);
+    try expectEqual(@as(usize, 132), algo_info(.ES512).sig_len);
+    try expectEqual(@as(usize, 64), algo_info(.ES256K).sig_len);
+    try expect(algo_info(.ES256).is_rsa);
+}
+
+test "algo_info: PS sig lengths and is_rsa" {
+    try expectEqual(@as(usize, 256), algo_info(.PS256).sig_len);
+    try expectEqual(@as(usize, 384), algo_info(.PS384).sig_len);
+    try expectEqual(@as(usize, 512), algo_info(.PS512).sig_len);
+    try expect(algo_info(.PS256).is_rsa);
+}
+
+test "algo_info: EdDSA" {
+    try expectEqual(@as(usize, 64), algo_info(.EdDSA).sig_len);
+    try expect(algo_info(.EdDSA).is_rsa);
+}
+
+test "algo_info: HMAC md is null, RSA md is non-null" {
+    try expect(algo_info(.HS256).md == null);
+    try expect(algo_info(.HS384).md == null);
+    try expect(algo_info(.HS512).md == null);
+    try expect(algo_info(.RS256).md != null);
+    try expect(algo_info(.EdDSA).md == null); // EdDSA uses NULL md
+}
+
+test "const_time_eq: equal and unequal" {
     try expect(const_time_eq("abc", "abc"));
     try expect(!const_time_eq("abc", "abd"));
     try expect(!const_time_eq("abc", "ab"));
     try expect(!const_time_eq("ab", "abc"));
 }
 
-test "split_jwt" {
-    const parts = split_jwt("a.b.c") orelse unreachable;
-    try expectEqual(parts.header_b64.len, 1);
-    try expectEqual(parts.payload_b64.len, 1);
-    try expectEqual(parts.sig_b64.len, 1);
-
-    try expect(split_jwt("no.dots") == null);
-    try expect(split_jwt("only.onedot") == null);
+test "const_time_eq: edge cases" {
+    try expect(const_time_eq("", ""));
+    try expect(!const_time_eq("a", ""));
+    try expect(!const_time_eq("", "a"));
+    // last-byte mismatch
+    try expect(!const_time_eq("abcde", "abcdx"));
+    // first-byte mismatch
+    try expect(!const_time_eq("xbcde", "abcde"));
+    // all same except one bit
+    try expect(!const_time_eq("\x00", "\x01"));
 }
 
-test "jwt_loc_conf layout" {
-    _ = @sizeOf(jwt_loc_conf);
-    _ = @alignOf(jwt_loc_conf);
+test "split_jwt: valid three-part token" {
+    const parts = split_jwt("a.b.c") orelse unreachable;
+    try expectEqual(@as(usize, 1), parts.header_b64.len);
+    try expectEqual(@as(usize, 1), parts.payload_b64.len);
+    try expectEqual(@as(usize, 1), parts.sig_b64.len);
+    try expectEqual('a', parts.header_b64[0]);
+    try expectEqual('b', parts.payload_b64[0]);
+    try expectEqual('c', parts.sig_b64[0]);
+}
+
+test "split_jwt: real-looking token" {
+    const token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature";
+    const parts = split_jwt(token) orelse unreachable;
+    try testing.expectEqualSlices(u8, "eyJhbGciOiJIUzI1NiJ9", parts.header_b64);
+    try testing.expectEqualSlices(u8, "eyJzdWIiOiIxMjMifQ", parts.payload_b64);
+    try testing.expectEqualSlices(u8, "signature", parts.sig_b64);
+}
+
+test "split_jwt: empty segments" {
+    const parts = split_jwt("..") orelse unreachable;
+    try expectEqual(@as(usize, 0), parts.header_b64.len);
+    try expectEqual(@as(usize, 0), parts.payload_b64.len);
+    try expectEqual(@as(usize, 0), parts.sig_b64.len);
+}
+
+test "split_jwt: too few dots" {
+    try expect(split_jwt("no.dots") == null);
+    try expect(split_jwt("onlyonedot") == null);
+    try expect(split_jwt("") == null);
+}
+
+test "split_jwt: more than two dots (treats first two as separators)" {
+    const parts = split_jwt("a.b.c.d") orelse unreachable;
+    try testing.expectEqualSlices(u8, "a", parts.header_b64);
+    try testing.expectEqualSlices(u8, "b", parts.payload_b64);
+    try testing.expectEqualSlices(u8, "c.d", parts.sig_b64); // rest after second dot
+}
+
+test "parse_claim_op: all six operators" {
+    try expectEqual(ClaimOp.eq, (parse_claim_op(testNgxStr("eq"))).?);
+    try expectEqual(ClaimOp.neq, (parse_claim_op(testNgxStr("!eq"))).?);
+    try expectEqual(ClaimOp.gt, (parse_claim_op(testNgxStr("gt"))).?);
+    try expectEqual(ClaimOp.lt, (parse_claim_op(testNgxStr("lt"))).?);
+    try expectEqual(ClaimOp.ge, (parse_claim_op(testNgxStr("ge"))).?);
+    try expectEqual(ClaimOp.le, (parse_claim_op(testNgxStr("le"))).?);
+}
+
+test "parse_claim_op: invalid operators return null" {
+    try expect(parse_claim_op(testNgxStr("==")) == null);
+    try expect(parse_claim_op(testNgxStr("!=")) == null);
+    try expect(parse_claim_op(testNgxStr(">=")) == null);
+    try expect(parse_claim_op(testNgxStr("<=")) == null);
+    try expect(parse_claim_op(testNgxStr("")) == null);
+    try expect(parse_claim_op(testNgxStr("EQ")) == null); // case-sensitive
+}
+
+test "hmac_verify: HS256 known answer" {
+    const key = "benchmark-secret-hs256";
+    const data = "test message";
+    // Expected HMAC-SHA256 computed via Python hmac.new(key, data, hashlib.sha256)
+    const expected = try hexToBytes("64056978700c383ab799ecd235ef6768e581a340823d64352a021e4860bd7ab2");
+    try expect(hmac_verify(data, expected[0..32], key, EVP_sha256(), 32));
+}
+
+test "hmac_verify: wrong signature rejects" {
+    const key = "benchmark-secret-hs256";
+    const data = "test message";
+    var bad_sig = [_]u8{0} ** 32;
+    try expect(!hmac_verify(data, &bad_sig, key, EVP_sha256(), 32));
+}
+
+test "hmac_verify: wrong key rejects" {
+    const wrong_key = "wrong-key-for-hmac-test";
+    const data = "test message";
+    const expected = try hexToBytes("64056978700c383ab799ecd235ef6768e581a340823d64352a021e4860bd7ab2");
+    try expect(!hmac_verify(data, expected[0..32], wrong_key, EVP_sha256(), 32));
+}
+
+test "hmac_verify: tampered message rejects" {
+    const key = "benchmark-secret-hs256";
+    // expected is HMAC of "test message" with key; verifying against different data should fail
+    const expected = try hexToBytes("64056978700c383ab799ecd235ef6768e581a340823d64352a021e4860bd7ab2");
+    try expect(!hmac_verify("message-b", expected[0..32], key, EVP_sha256(), 32));
+}
+
+test "hmac_verify: wrong signature length rejects" {
+    const key = "benchmark-secret-hs256";
+    const data = "test message";
+    var short_sig = [_]u8{0} ** 4;
+    try expect(!hmac_verify(data, &short_sig, key, EVP_sha256(), 32));
+}
+
+test "hmac_verify: HS384 known answer" {
+    const key = "benchmark-secret-hs384-32-bytes!!!!!!";
+    const data = "test message";
+    const expected = try hexToBytes("8912cc1290a16fcdae61653169b94829b9f004c85b5013d3c9ef8079d04b20c865d962446df91df95307049e25bcc498");
+    try expect(hmac_verify(data, expected[0..48], key, EVP_sha384(), 48));
+}
+
+test "hmac_verify: HS512 known answer" {
+    const key = "benchmark-secret-hs512-64-bytes!!!!!!!!!!!!!!!!!!!!!!!!!!!!!";
+    const data = "test message";
+    const expected = try hexToBytes("575f62c1be43b3fc4fb78081b8b9b7acfc09aa86502bd822e50a8744c1b149ff02357a866c3624bdcac41691bd3fa7060fd8dfb065ee587de538ae0b820bab10");
+    try expect(hmac_verify(data, expected[0..64], key, EVP_sha512(), 64));
+}
+
+test "hmac_verify: wrong HS384 signature rejects" {
+    const key = "benchmark-secret-hs384-32-bytes!!!!!!";
+    const data = "test message";
+    var bad_sig = [_]u8{0} ** 48;
+    try expect(!hmac_verify(data, &bad_sig, key, EVP_sha384(), 48));
+}
+
+test "hmac_verify: HS256 with long key" {
+    const key = "A" ** 200; // 200-byte key
+    const data = "short";
+    // Expected HMAC-SHA256 computed via Python
+    const expected = try hexToBytes("fb7b1f65db47f74705c727c97c72cc387d1523a90de198a094b31559a87b825c");
+    try expect(hmac_verify(data, expected[0..32], key, EVP_sha256(), 32));
+}
+
+test "hmac_md_for: correct digest per algorithm" {
+    try expect(hmac_md_for(.HS256) == EVP_sha256());
+    try expect(hmac_md_for(.HS384) == EVP_sha384());
+    try expect(hmac_md_for(.HS512) == EVP_sha512());
+}
+
+test "struct layout: jwt_loc_conf size and alignment" {
+    try expect(@sizeOf(jwt_loc_conf) > 0);
+    try expect(@alignOf(jwt_loc_conf) > 0);
+}
+
+test "struct layout: jwt_ctx size and alignment" {
+    try expect(@sizeOf(jwt_ctx) > 0);
+    try expect(@alignOf(jwt_ctx) > 0);
+}
+
+test "struct layout: JwtKeyRequest size" {
+    try expect(@sizeOf(JwtKeyRequest) > 0);
+}
+
+test "struct layout: JwtKeyRequestRuntime size" {
+    try expect(@sizeOf(JwtKeyRequestRuntime) > 0);
+}
+
+test "struct layout: ClaimOp discriminant values are ordered starting from 0" {
+    try expectEqual(@intFromEnum(ClaimOp.eq), @as(u8, 0));
+    try expectEqual(@intFromEnum(ClaimOp.neq), @as(u8, 1));
+    try expectEqual(@intFromEnum(ClaimOp.gt), @as(u8, 2));
+    try expectEqual(@intFromEnum(ClaimOp.lt), @as(u8, 3));
+    try expectEqual(@intFromEnum(ClaimOp.ge), @as(u8, 4));
+    try expectEqual(@intFromEnum(ClaimOp.le), @as(u8, 5));
+}
+
+test "struct layout: Algorithm discriminant values" {
+    try expectEqual(@intFromEnum(Algorithm.HS256), @as(u8, 0));
+    try expectEqual(@intFromEnum(Algorithm.HS384), @as(u8, 1));
+    try expectEqual(@intFromEnum(Algorithm.HS512), @as(u8, 2));
+    try expectEqual(@intFromEnum(Algorithm.RS256), @as(u8, 3));
+}
+
+test "ngx_str_t helper constructs correctly" {
+    const s = testNgxStr("hello");
+    try expectEqual(@as(usize, 5), s.len);
+    try expectEqual('h', s.data[0]);
+    try expectEqual('o', s.data[4]);
+}
+
+test "hexToBytes: valid hex" {
+    const bytes = try hexToBytes("deadbeef");
+    try expectEqual(@as(u8, 0xde), bytes[0]);
+    try expectEqual(@as(u8, 0xad), bytes[1]);
+    try expectEqual(@as(u8, 0xbe), bytes[2]);
+    try expectEqual(@as(u8, 0xef), bytes[3]);
+}
+
+test "hexToBytes: odd length returns error" {
+    try expectError(error.InvalidHex, hexToBytes("abc"));
+}
+
+test "hexToBytes: invalid char returns error" {
+    try expectError(error.InvalidHex, hexToBytes("zzzz"));
+}
+
+test "hexToBytes: empty string" {
+    const bytes = try hexToBytes("");
+    try expectEqual(@as(usize, 64), bytes.len); // padded to 64
 }
