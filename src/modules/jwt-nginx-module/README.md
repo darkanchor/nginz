@@ -9,7 +9,7 @@ JWT (JSON Web Token) validation for nginx access control.
 ### Features
 
 - **Algorithm coverage in integration tests**: HS256/384/512, RS256/384/512, ES256, PS256, EdDSA, and local JWKS RSA paths are covered end-to-end; broader ES*/PS* family variants remain good candidates for additional matrix coverage
-- **Key material**: inline HMAC secrets, keyval key files, and local JWKS files (`oct` and RSA public keys)
+- **Key material**: inline HMAC secrets, keyval key files, local JWKS files (`oct` and RSA public keys), and subrequest-based key fetching via `jwt_key_request`
 - **Token sources**: Authorization Bearer tokens and `token=$variable` via `jwt_secret`
 - **Claim and header extraction**: `jwt_claim`, `jwt_header`, nested dot-path/array-index lookups, `$jwt_claims`, and `$jwt_nowtime`
 - **Validation controls**: `jwt_require_claim`, `jwt_require_header`, `jwt_require`, `jwt_validate_exp`, `jwt_validate_sig`, `jwt_leeway`, `jwt_issuer`, and `jwt_audience`
@@ -23,6 +23,26 @@ JWT (JSON Web Token) validation for nginx access control.
 *context:* `http`, `server`, `location`
 
 Enable JWT validation and set the inline HMAC secret or token source. The directive inherits across `http` → `server` → `location`, and `jwt_secret off;` explicitly disables inherited JWT protection for the current block.
+
+#### jwt_key_request
+
+*syntax:* `jwt_key_request <url-or-$variable> [jwks|keyval];`
+*context:* `http`, `server`, `location`
+
+Fetch key material (JWKS or keyval) via an nginx subrequest. The subrequest response body is parsed as JWKS (default) or keyval JSON format. Supports literal URLs and nginx variable-based URLs (e.g., `$jwt_key_url`). Multiple `jwt_key_request` directives may be specified; all subrequests are issued in parallel and waited on before JWT validation proceeds.
+
+```nginx
+location /jwks {
+    return 200 '{"keys":[{"kty":"oct","kid":"k1","k":"...","alg":"HS256"}]}';
+}
+
+location /api {
+    jwt_key_request /jwks;
+    # or variable-based:
+    # jwt_key_request $jwt_key_url;
+    proxy_pass http://backend;
+}
+```
 
 ### Usage
 
@@ -117,7 +137,7 @@ Tokens without `exp` or `nbf` claims pass validation (no time check).
 
 Current implementation has these limitations:
 
-- **`jwt_key_request` not implemented**: the directive is intentionally rejected at config parse time; use `jwt_key_file` for local key material
+- **`jwt_key_request`**: subrequest-based key fetching now supported — issues nginx subrequests with `NGX_HTTP_SUBREQUEST_WAITED | NGX_HTTP_SUBREQUEST_IN_MEMORY` to fetch JWKS or keyval material from internal/external endpoints
 - **Fixed-size limits**: `MAX_KEYS = 16`, `MAX_CLAIM_VARS = 8`, `MAX_REQUIRE_CLAIMS = 8`
 - **Fixed decode buffers**: header and payload decoding currently rely on bounded stack buffers in the module implementation
 - **Nested extraction is leaf-oriented**: nested string and integer values are the strongest supported extraction targets today
@@ -130,14 +150,14 @@ Reference: [nginx-auth-jwt](https://github.com/nicholaschiasson/nginx-auth-jwt) 
 
 #### Batch 1 — Algorithm Expansion & Key Loading ✅
 
-> **Goal**: Support RSA + HMAC variants, load keys from files. **(5/6 done)**
+> **Goal**: Support RSA + HMAC variants, load keys from files, subrequest-based key fetch. **(6/6 done)**
 
 | # | Task | Status |
 |---|------|--------|
 | 1.1 | **RS256/RS384/RS512** — RSA PKCS#1 v1.5 via `EVP_DigestVerify` | ✅ |
 | 1.2 | **HS384/HS512** — HMAC-SHA384/512 via `jwt_secret` | ✅ |
 | 1.3 | `jwt_key_file` — keyval format (PEM → RSA, raw → HMAC) | ✅ |
-| 1.4 | `jwt_key_request` — subrequest-based key fetch | ⬜ |
+| 1.4 | `jwt_key_request` — subrequest-based key fetch | ✅ |
 | 1.5 | **`kid` matching** — extract kid, match against key set, fallback to first | ✅ |
 | 1.6 | **Algorithm enforcement** — reject unsupported `alg`, match key type (RSA/HMAC) | ✅ |
 
@@ -168,11 +188,11 @@ Reference: [nginx-auth-jwt](https://github.com/nicholaschiasson/nginx-auth-jwt) 
 
 #### Batch 4 — Key Management & Security
 
-> **Goal**: Security toggles and variable checks. **(4/5 done)**
+> **Goal**: Security toggles, variable checks, and key request. **(5/5 done)**
 
 | # | Task | Status |
 |---|------|--------|
-| 4.1 | JWKS subrequest caching | ⬜ |
+| 4.1 | JWKS subrequest caching (jwt_key_request) | ✅ |
 | 4.2 | `jwt_validate_sig` — on/off toggle | ✅ |
 | 4.3 | `jwt_revocation_list_sub` — JSON file of revoked subs | ✅ |
 | 4.4 | `jwt_revocation_list_kid` — JSON file of revoked kids | ✅ |
@@ -230,7 +250,7 @@ token = jwt.encode(
 - [x] Bun integration coverage exists at `tests/jwt/`.
 - [x] Bun integration coverage verifies nested child-location inheritance, JOSE header extraction, nested claim/header access, audience matching, revocation lists, local JWKS RSA loading, and phase configuration smoke behavior.
 - [x] Algorithm validation is now key-type aware instead of the old HS256-only behavior described by previous docs.
-- [x] `jwt_key_request` no longer silently aliases `jwt_key_file`; unsupported use now fails clearly at config parse time.
+- [x] `jwt_key_request` now supports real subrequest-based key fetching via nginx subrequests.
 - [x] The README top summary, counters, and current limitations were refreshed to match the shipped implementation.
 
 ### Audit Addendum — 2026-04-29
@@ -252,14 +272,13 @@ Resolved in this remediation pass:
 - `jwt_phase` is now wired through separate preaccess/access handlers instead of being stored but ignored.
 - Local JWKS RSA public-key loading is now supported alongside existing `oct` key handling.
 - Revocation-list parsing now reads string-array values correctly, and integration coverage exists for both `sub` and `kid` revocation paths.
-- `jwt_key_request` no longer silently aliases `jwt_key_file`; unsupported use now fails clearly during config parsing.
+- `jwt_key_request` now supports real subrequest-based JWKS/keyval fetching via nginx subrequests.
 - Nested claim/header access now works for dot-path and array-index lookups on leaf string/integer values.
 - `jwt_audience` now exists as a dedicated shortcut and matches both string and array-form `aud` claims.
 
 Remaining intentionally deferred items:
 
-- real subrequest-backed `jwt_key_request` behavior
-- broader perf characterization beyond the current HS256-focused benchmark scenarios
+- broader perf characterization beyond HS256 + RS256 benchmark scenarios
 
 #### Comparison note against the local C reference
 
@@ -267,6 +286,6 @@ The local C reference still goes further on remote key retrieval and some parity
 
 #### Follow-up TODOs
 
-- [ ] Implement real subrequest-backed `jwt_key_request` semantics.
+- [x] Implement real subrequest-backed `jwt_key_request` semantics. *(NGX_HTTP_SUBREQUEST_WAITED + IN_MEMORY, completion callback, re-entrant handler, 7 integration tests)*
 - [x] Extend algorithm-matrix coverage further across ES384/ES512/ES256K and PS384/PS512 variants. *(ES384, ES512, PS384, PS512 covered; ES256K deferred — Bun's built-in OpenSSL lacks secp256k1)*
 - [x] Extend perf coverage beyond the current HS256-focused baseline. *(RS256 worst-case analysis in `perf/jwt/notes/2026-04-29-rs256-worstcase.md`: 1,955 rps/core, 2.1× slower than HS256, IPC=1.11, ~427K instr/req)*

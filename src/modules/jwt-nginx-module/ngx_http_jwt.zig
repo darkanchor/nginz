@@ -31,6 +31,7 @@ const log = ngx.log;
 
 extern var ngx_http_core_module: ngx_module_t;
 extern fn time(t: ?*i64) i64;
+extern fn ngx_http_get_indexed_variable(r: [*c]ngx_http_request_t, index: ngx_uint_t) [*c]http.ngx_http_variable_value_t;
 
 // ── OpenSSL bindings (existing from ssl module) ───────────────────────
 
@@ -94,6 +95,12 @@ const MAX_KEYS = 16;
 const MAX_CLAIM_VARS = 8;
 const MAX_REQUIRE_CLAIMS = 8;
 
+// Subrequest flags (from nginx ngx_http_request.h)
+const NGX_HTTP_SUBREQUEST_IN_MEMORY: ngx_uint_t = 2;
+const NGX_HTTP_SUBREQUEST_WAITED: ngx_uint_t = 4;
+
+const NGX_AGAIN = core.NGX_AGAIN;
+
 const jwt_claim_var = extern struct {
     name: ngx_str_t, // claim/header name (e.g., "sub", "iss")
     var_index: ngx_uint_t, // nginx variable index
@@ -117,6 +124,18 @@ const jwt_require_rule = extern struct {
     name: ngx_str_t, // claim name
     op: ClaimOp,
     value: ngx_str_t, // expected value as string
+};
+
+const JwtKeyRequest = extern struct {
+    index: ngx_int_t, // nginx variable index (if URL starts with $), -1 for literal
+    url: ngx_str_t, // literal URL (if not variable-based)
+    jwks: ngx_uint_t, // 1 = JWKS format, 0 = keyval
+};
+
+// Per-subrequest runtime context (allocated on parent request pool)
+const JwtKeyRequestRuntime = extern struct {
+    ctx: *jwt_ctx, // parent request context
+    jwks: bool,
 };
 
 const jwt_loc_conf = extern struct {
@@ -153,6 +172,9 @@ const jwt_loc_conf = extern struct {
     revoked_subs: [MAX_KEYS]ngx_str_t,
     revoked_kids_count: ngx_uint_t,
     revoked_kids: [MAX_KEYS]ngx_str_t,
+    // Key requests (subrequest-based key loading)
+    key_requests_count: ngx_uint_t,
+    key_requests: [MAX_KEYS]JwtKeyRequest,
     // Toggles
     validate_exp: ngx_flag_t,
     validate_sig: ngx_flag_t,
@@ -168,6 +190,14 @@ const jwt_ctx = extern struct {
     claim_values: [MAX_CLAIM_VARS]jwt_claim_entry,
     header_values_count: ngx_uint_t,
     header_values: [MAX_CLAIM_VARS]jwt_claim_entry,
+    // Subrequest coordination
+    done: ngx_uint_t, // completed subrequest count
+    subrequest: ngx_uint_t, // issued subrequest count
+    reject_request: ngx_flag_t,
+    status: ngx_int_t,
+    // Per-request key storage (subrequest-loaded keys)
+    request_keys_count: ngx_uint_t,
+    request_keys: [MAX_KEYS]JwtKey,
 };
 
 // ── Base64URL decode ──────────────────────────────────────────────────
@@ -331,6 +361,17 @@ fn hmac_md_for(alg: Algorithm) ?*const ssl.EVP_MD {
 
 fn find_key_by_kid(lccf: [*c]jwt_loc_conf, kid: []const u8) ?*JwtKey {
     for (lccf.*.keys[0..lccf.*.keys_count]) |*key| {
+        const k = core.slicify(u8, key.kid.data, key.kid.len);
+        if (std.mem.eql(u8, k, kid)) return key;
+    }
+    return null;
+}
+
+fn find_key_by_kid_all(lccf: [*c]jwt_loc_conf, rctx: *jwt_ctx, kid: []const u8) ?*JwtKey {
+    // Search local keys first
+    if (find_key_by_kid(lccf, kid)) |k| return k;
+    // Then subrequest-loaded keys
+    for (rctx.request_keys[0..rctx.request_keys_count]) |*key| {
         const k = core.slicify(u8, key.kid.data, key.kid.len);
         if (std.mem.eql(u8, k, kid)) return key;
     }
@@ -529,7 +570,7 @@ fn load_key_file(cf: [*c]ngx_conf_t, lccf: [*c]jwt_loc_conf) bool {
 
 // ── Validate JWT signature (unified dispatch) ─────────────────────────
 
-fn validate_jwt_signature(token: []const u8, lccf: [*c]jwt_loc_conf, pool: [*c]core.ngx_pool_t) bool {
+fn validate_jwt_signature(token: []const u8, lccf: [*c]jwt_loc_conf, rctx: ?*jwt_ctx, pool: [*c]core.ngx_pool_t) bool {
     // Split token into header.payload.signature
     const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return false;
     const rest = token[first_dot + 1 ..];
@@ -549,15 +590,28 @@ fn validate_jwt_signature(token: []const u8, lccf: [*c]jwt_loc_conf, pool: [*c]c
     const alg_str = CJSON.stringValue(alg_node) orelse return false;
     const alg = algo_from_str(core.slicify(u8, alg_str.data, alg_str.len)) orelse return false;
 
-    // Select key: try kid match first, fall back to first key
+    // Select key: try kid match first (search both lccf and ctx), fall back to first key
     var key: ?*JwtKey = null;
+    const total_keys = lccf.*.keys_count + (if (rctx) |rx| rx.request_keys_count else 0);
     if (CJSON.query(header, "$.kid")) |kid_node| {
         if (CJSON.stringValue(kid_node)) |kid_val| {
-            key = find_key_by_kid(lccf, core.slicify(u8, kid_val.data, kid_val.len));
+            const kid_slice = core.slicify(u8, kid_val.data, kid_val.len);
+            if (rctx) |rx| {
+                key = find_key_by_kid_all(lccf, rx, kid_slice);
+            } else {
+                key = find_key_by_kid(lccf, kid_slice);
+            }
         }
     }
-    if (key == null and lccf.*.keys_count > 0) {
-        key = @as(?*JwtKey, @ptrCast(&lccf.*.keys[0]));
+    if (key == null and total_keys > 0) {
+        // Fall back to first local key, then first subrequest-loaded key
+        if (lccf.*.keys_count > 0) {
+            key = @as(?*JwtKey, @ptrCast(&lccf.*.keys[0]));
+        } else if (rctx) |rx| {
+            if (rx.request_keys_count > 0) {
+                key = &rx.request_keys[0];
+            }
+        }
     }
     if (key == null) return false;
 
@@ -668,13 +722,71 @@ fn split_jwt(token: []const u8) ?struct { header_b64: []const u8, payload_b64: [
     };
 }
 
+// ── Subrequest completion callback ───────────────────────────────────
+
+fn jwt_key_request_completion(
+    sr: [*c]ngx_http_request_t,
+    data: ?*anyopaque,
+    rc: ngx_int_t,
+) callconv(.c) ngx_int_t {
+    const rctx_data = core.castPtr(JwtKeyRequestRuntime, data) orelse return rc;
+    const ctx = rctx_data.*.ctx;
+    const jwks = rctx_data.*.jwks;
+
+    // Reject compressed responses (cannot parse gzip/deflate inline)
+    if (sr.*.headers_out.content_encoding) |ce| {
+        if (ce.*.value.len > 0) {
+            ctx.reject_request = 1;
+            ctx.status = NGX_HTTP_UNAUTHORIZED;
+            ctx.done += 1;
+            return rc;
+        }
+    }
+
+    // Read in-memory response body
+    if (sr.*.out) |out_chain| {
+        if (out_chain.*.buf) |buf| {
+            const body_len: usize = @intCast(@intFromPtr(buf.*.last) - @intFromPtr(buf.*.pos));
+            const body = buf.*.pos[0..body_len];
+            if (body.len > 0) {
+                if (jwks) {
+                    _ = load_keys_jwks(body, sr.*.pool, &ctx.request_keys, &ctx.request_keys_count);
+                } else {
+                    _ = load_keys_keyval(body, sr.*.pool, &ctx.request_keys, &ctx.request_keys_count);
+                }
+            }
+        }
+    }
+
+    ctx.done += 1;
+    return rc;
+}
+
 // ── Access handlers ───────────────────────────────────────────────────
 
 fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf) ngx_int_t {
 
+    // Get or create per-request context (needed early for subrequest coordination)
+    const rctx = http.ngz_http_get_module_ctx(jwt_ctx, r, &ngx_http_jwt_module) catch return NGX_HTTP_UNAUTHORIZED;
+    const first_entry = rctx.*.lccf == core.nullptr(jwt_loc_conf);
+
+    // ── Re-entry path ──────────────────────────────────────────────────
+    if (!first_entry) {
+        // Still waiting for subrequests?
+        if (rctx.*.done < rctx.*.subrequest) {
+            return NGX_AGAIN;
+        }
+        // Subrequest completed with error
+        if (rctx.*.reject_request != 0) {
+            return rctx.*.status;
+        }
+        // Subrequests done — continue to validation below
+    } else {
+        rctx.*.lccf = lccf;
+    }
+
     // Extract token: prefer cookie/variable, fallback to Authorization header
     const token = if (lccf.*.token_var.len > 0) blk: {
-        // Look up nginx variable
         const vn = lccf.*.token_var;
         const vk = http.ngx_http_get_variable_index(null, @constCast(&vn));
         if (vk != core.NGX_ERROR) {
@@ -689,11 +801,47 @@ fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf)
 
     const token_slice = token orelse return NGX_HTTP_UNAUTHORIZED;
 
+    // ── Issue subrequests for key material (first entry only) ──────────
+    if (first_entry and lccf.*.key_requests_count > 0) {
+        const flags: ngx_uint_t = NGX_HTTP_SUBREQUEST_WAITED | NGX_HTTP_SUBREQUEST_IN_MEMORY;
+        for (lccf.*.key_requests[0..lccf.*.key_requests_count]) |*kr| {
+            // Resolve URL: variable or literal
+            var url: ngx_str_t = undefined;
+            if (kr.index >= 0) {
+                const vv = ngx_http_get_indexed_variable(r, @intCast(kr.index));
+                if (vv == null or vv.*.flags.not_found) continue;
+                url.data = vv.*.data;
+                url.len = @intCast(vv.*.flags.len);
+            } else {
+                url = kr.url;
+            }
+            if (url.len == 0) continue;
+
+            // Allocate runtime context on parent pool
+            if (core.ngz_pcalloc_c(JwtKeyRequestRuntime, r.*.pool)) |rr| {
+                rr.*.ctx = rctx;
+                rr.*.jwks = kr.jwks != 0;
+
+                const ps = core.castPtr(http.ngx_http_post_subrequest_t, core.ngx_pcalloc(r.*.pool, @sizeOf(http.ngx_http_post_subrequest_t))) orelse continue;
+                ps.*.handler = jwt_key_request_completion;
+                ps.*.data = rr;
+
+                var sr: [*c]ngx_http_request_t = undefined;
+                if (http.ngx_http_subrequest(r, &url, null, &sr, ps, flags) == NGX_OK) {
+                    rctx.*.subrequest += 1;
+                }
+            }
+        }
+        if (rctx.*.subrequest > 0) {
+            return NGX_AGAIN;
+        }
+    }
+
     // Validate signature (unless disabled)
     const vs: ngx_int_t = if (lccf.*.validate_sig == conf.NGX_CONF_UNSET) @as(ngx_int_t, 1) else lccf.*.validate_sig;
     if (vs != 0) {
-        if (lccf.*.keys_count > 0) {
-            if (!validate_jwt_signature(token_slice, lccf, r.*.pool)) {
+        if (lccf.*.keys_count > 0 or rctx.*.request_keys_count > 0) {
+            if (!validate_jwt_signature(token_slice, lccf, rctx, r.*.pool)) {
                 return NGX_HTTP_UNAUTHORIZED;
             }
         } else if (lccf.*.secret.len > 0) {
@@ -723,7 +871,6 @@ fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf)
     // Enforce jwt_require_header rules (validate JOSE headers)
     if (lccf.*.require_header_count > 0) {
         var cj = CJSON.init(r.*.pool);
-        // Decode header JSON for evaluation
         var header_json_buf: [1024]u8 = undefined;
         const header_json_len = base64url_decode(parts.header_b64, &header_json_buf) orelse return NGX_HTTP_UNAUTHORIZED;
         const header_json = cj.decode(ngx_str_t{ .data = header_json_buf[0..header_json_len].ptr, .len = header_json_len }) catch return NGX_HTTP_UNAUTHORIZED;
@@ -763,9 +910,7 @@ fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf)
     }
 
     // Store claims and header values in request context for variable extraction
-    const rctx = http.ngz_http_get_module_ctx(jwt_ctx, r, &ngx_http_jwt_module) catch return NGX_HTTP_UNAUTHORIZED;
-    if (rctx.*.lccf == core.nullptr(jwt_loc_conf)) {
-        rctx.*.lccf = lccf;
+    if (rctx.*.claims_json.len == 0) {
         // Copy payload JSON to pool for $jwt_claims variable
         if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, payload_len))) |json_copy| {
             @memcpy(core.slicify(u8, json_copy, payload_len), payload[0..payload_len]);
@@ -873,6 +1018,7 @@ fn create_jwt_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.phase = conf.NGX_CONF_UNSET_UINT;
         p.*.revoked_subs_count = 0;
         p.*.revoked_kids_count = 0;
+        p.*.key_requests_count = 0;
         return p;
     }
     return null;
@@ -901,6 +1047,12 @@ fn merge_jwt_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     if (ch.leeway == conf.NGX_CONF_UNSET) ch.leeway = p.leeway;
     if (ch.token_var.len == 0) ch.token_var = p.token_var;
     if (ch.phase == conf.NGX_CONF_UNSET_UINT) ch.phase = p.phase;
+
+    // key_requests array
+    if (ch.key_requests_count == 0 and p.key_requests_count > 0) {
+        @memcpy(ch.key_requests[0..p.key_requests_count], p.key_requests[0..p.key_requests_count]);
+        ch.key_requests_count = p.key_requests_count;
+    }
 
     // keys array
     if (ch.keys_count == 0 and p.keys_count > 0) {
@@ -1680,9 +1832,54 @@ fn ngx_conf_set_jwt_key_request(
     loc: ?*anyopaque,
 ) callconv(.c) [*c]u8 {
     _ = cmd;
-    _ = loc;
-    log.ngz_log_error(log.NGX_LOG_EMERG, cf.*.log, 0, "jwt_key_request is not implemented yet; use jwt_key_file for local key material", .{});
-    return conf.NGX_CONF_ERROR;
+    const lccf = core.castPtr(jwt_loc_conf, loc) orelse return conf.NGX_CONF_ERROR;
+
+    // Parse first argument: URL or $variable
+    var index: ngx_uint_t = 1;
+    const value = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index) orelse return conf.NGX_CONF_ERROR;
+    if (value.*.len == 0) return conf.NGX_CONF_ERROR;
+
+    // Parse optional format argument
+    var jwks: ngx_uint_t = 1; // default: jwks
+    if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index)) |fmt_arg| {
+        const fmt = core.slicify(u8, fmt_arg.*.data, fmt_arg.*.len);
+        if (std.mem.eql(u8, fmt, "keyval")) {
+            jwks = 0;
+        } else if (!std.mem.eql(u8, fmt, "jwks")) {
+            return conf.NGX_CONF_ERROR;
+        }
+    }
+
+    lccf.*.enabled = 1;
+
+    const v = core.slicify(u8, value.*.data, value.*.len);
+    // Use local pointers to avoid [*c] deref issues with array assignment
+    const kr_count = &lccf.*.key_requests_count;
+    const kr_array: *[MAX_KEYS]JwtKeyRequest = &lccf.*.key_requests;
+    if (v.len > 0 and v[0] == '$') {
+        // Variable-based URL
+        var var_name = ngx_str_t{ .data = value.*.data + 1, .len = value.*.len - 1 };
+        const vi = http.ngx_http_get_variable_index(cf, &var_name);
+        if (vi == core.NGX_ERROR) return conf.NGX_CONF_ERROR;
+        if (kr_count.* >= MAX_KEYS) return conf.NGX_CONF_ERROR;
+        kr_array[kr_count.*] = JwtKeyRequest{
+            .index = vi,
+            .url = ngx.string.ngx_null_str,
+            .jwks = jwks,
+        };
+        kr_count.* += 1;
+    } else {
+        // Literal URL
+        if (kr_count.* >= MAX_KEYS) return conf.NGX_CONF_ERROR;
+        kr_array[kr_count.*] = JwtKeyRequest{
+            .index = -1,
+            .url = value.*,
+            .jwks = jwks,
+        };
+        kr_count.* += 1;
+    }
+
+    return conf.NGX_CONF_OK;
 }
 
 // ── Postconfiguration ──────────────────────────────────────────────────
