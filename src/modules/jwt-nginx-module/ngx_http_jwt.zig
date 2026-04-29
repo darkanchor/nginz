@@ -202,51 +202,63 @@ const jwt_ctx = extern struct {
 
 // ── Base64URL decode ──────────────────────────────────────────────────
 
+// Comptime lookup table: maps ASCII byte → 6-bit value, 0xFF = invalid.
+// Handles base64url alphabet directly (-→62, _→63) so no pre-pass needed.
+const b64url_table: [256]u8 = blk: {
+    var t = [_]u8{0xFF} ** 256;
+    const std_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for (std_chars, 0..) |c, i| t[c] = @intCast(i);
+    t['-'] = 62; // base64url uses - instead of +
+    t['_'] = 63; // base64url uses _ instead of /
+    break :blk t;
+};
+
 fn base64url_decode(input: []const u8, output: []u8) ?usize {
     if (input.len == 0) return 0;
+    // Each 4-char group decodes to at most 3 bytes; add 3 to round up.
+    if ((input.len + 3) / 4 * 3 > output.len) return null;
 
-    var temp: [4096]u8 = undefined;
-    if (input.len > temp.len) return null;
-
-    var temp_len: usize = 0;
-    for (input) |c| {
-        temp[temp_len] = switch (c) {
-            '-' => '+',
-            '_' => '/',
-            else => c,
-        };
-        temp_len += 1;
-    }
-
-    while (temp_len % 4 != 0) {
-        temp[temp_len] = '=';
-        temp_len += 1;
-    }
-
-    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     var out_idx: usize = 0;
     var i: usize = 0;
 
-    while (i + 4 <= temp_len) : (i += 4) {
-        const a = std.mem.indexOfScalar(u8, alphabet, temp[i]) orelse return null;
-        const b = std.mem.indexOfScalar(u8, alphabet, temp[i + 1]) orelse return null;
-        const c_val: usize = if (temp[i + 2] == '=') 0 else std.mem.indexOfScalar(u8, alphabet, temp[i + 2]) orelse return null;
-        const d_val: usize = if (temp[i + 3] == '=') 0 else std.mem.indexOfScalar(u8, alphabet, temp[i + 3]) orelse return null;
+    while (i < input.len) {
+        // Read up to 4 non-padding input bytes.
+        const a = b64url_table[input[i]];
+        if (a == 0xFF) return null;
+        i += 1;
 
-        if (out_idx >= output.len) return null;
-        output[out_idx] = @truncate((a << 2) | (b >> 4));
+        if (i >= input.len) return null; // need at least 2 chars per group
+        const b = b64url_table[input[i]];
+        if (b == 0xFF) return null;
+        i += 1;
+
+        output[out_idx] = (a << 2) | (b >> 4);
         out_idx += 1;
 
-        if (temp[i + 2] != '=') {
-            if (out_idx >= output.len) return null;
-            output[out_idx] = @truncate(((b & 0x0f) << 4) | (c_val >> 2));
-            out_idx += 1;
+        // Third char: optional (padding or absent means end of data)
+        if (i >= input.len or input[i] == '=') {
+            i += 1;
+            if (i < input.len and input[i] == '=') i += 1;
+            break;
         }
-        if (temp[i + 3] != '=') {
-            if (out_idx >= output.len) return null;
-            output[out_idx] = @truncate(((c_val & 0x03) << 6) | d_val);
-            out_idx += 1;
+        const c_val = b64url_table[input[i]];
+        if (c_val == 0xFF) return null;
+        i += 1;
+
+        output[out_idx] = ((b & 0x0F) << 4) | (c_val >> 2);
+        out_idx += 1;
+
+        // Fourth char: optional
+        if (i >= input.len or input[i] == '=') {
+            i += 1;
+            break;
         }
+        const d_val = b64url_table[input[i]];
+        if (d_val == 0xFF) return null;
+        i += 1;
+
+        output[out_idx] = ((c_val & 0x03) << 6) | d_val;
+        out_idx += 1;
     }
 
     return out_idx;

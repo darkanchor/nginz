@@ -53,3 +53,14 @@ including perf-stat hardware counters.
 See `notes/2026-04-29-rs256-worstcase.md` for the RS256 worst-case analysis.
 RS256 is 2.1× slower than HS256 at single-concurrency (1,955 vs 4,077 rps)
 due to RSA-2048 modular exponentiation (~427K instructions/request).
+
+## Upstream C comparison
+
+See `notes/2026-04-29-upstream-comparison.md` for a code-analysis-based comparison against
+`nginx-auth-jwt` (the upstream C reference module). Key findings:
+
+- **HS256**: Zig ≈ 1.05× faster (5%) — pool-based JSON allocation offsets slower base64 decode
+- **RS256**: Zig ≈ 1.01× (parity) — RSA compute dominates, framework differences are noise
+- **Main gap**: `base64url_decode` uses a linear scan (`indexOfScalar`) instead of a 256-entry
+  lookup table; fixing this would push HS256 advantage to ~1.10–1.15×
+- No upstream benchmark was run; all upstream figures are estimates from static code analysis

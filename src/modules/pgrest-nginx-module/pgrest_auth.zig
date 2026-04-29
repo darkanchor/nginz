@@ -57,16 +57,24 @@ pub fn extract_jwt_token(r: [*c]ngx_http_request_t) ?[]const u8 {
     return null;
 }
 
+const b64url_table: [256]u8 = blk: {
+    var t = [_]u8{0xFF} ** 256;
+    const std_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for (std_chars, 0..) |c, i| t[c] = @intCast(i);
+    t['-'] = 62;
+    t['_'] = 63;
+    break :blk t;
+};
+
 pub fn base64url_decode(input: []const u8, output: []u8) ?usize {
-    const b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     var out_idx: usize = 0;
     var bits: u32 = 0;
     var bit_count: u32 = 0;
 
     for (input) |c| {
-        const val: u32 = for (b64_chars, 0..) |bc, i| {
-            if (bc == c) break @intCast(i);
-        } else return null;
+        if (c == '=') break;
+        const val = b64url_table[c];
+        if (val == 0xFF) return null;
 
         bits = (bits << 6) | val;
         bit_count += 6;
