@@ -9,6 +9,7 @@ const MODULE = "jwt";
 const SUBREQ_SECRET = "subreq-secret-hs256-test-32bytes!";
 const SUBREQ_SECRET_A = "subreq-secret-a-hs256-test-32bytes!!";
 const SUBREQ_SECRET_B = "subreq-secret-b-hs256-test-32bytes!!";
+const SUBREQ_SECRET_C = "subreq-secret-c-hs256-test-32bytes!!";
 const SUBREQ_KEYVAL_SECRET = "subreq-keyval-secret-hs256-32bytes!!";
 const DUP_SECRET_VALID = "dup-secret-valid-hs256-32bytes!!";
 const HTTP_SCOPE_SECRET = "subreq-http-secret-hs256-32bytes!!";
@@ -108,6 +109,37 @@ describe("JWT — Key Request (Subrequest)", () => {
     });
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("KEYREQUEST MULTI OK");
+  });
+
+  // Key accumulation order parity + request-key append semantics
+  // Three jwt_key_request entries; each source provides one unique kid.
+  // All three accumulate into the shared request_keys array regardless of
+  // declaration or subrequest completion order, because all keys are tried.
+  test("accumulates keys from all three jwt_key_request sources (first source)", async () => {
+    const token = createHS256Token({ sub: "triple-a", exp: FAR_FUTURE }, SUBREQ_SECRET_A, { kid: "kid-a" });
+    const res = await fetch(`${TEST_URL}/protected-triple`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.text()).trim()).toBe("KEYREQUEST TRIPLE OK");
+  });
+
+  test("accumulates keys from all three jwt_key_request sources (second source)", async () => {
+    const token = createHS256Token({ sub: "triple-b", exp: FAR_FUTURE }, SUBREQ_SECRET_B, { kid: "kid-b" });
+    const res = await fetch(`${TEST_URL}/protected-triple`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.text()).trim()).toBe("KEYREQUEST TRIPLE OK");
+  });
+
+  test("accumulates keys from all three jwt_key_request sources (third/last source)", async () => {
+    const token = createHS256Token({ sub: "triple-c", exp: FAR_FUTURE }, SUBREQ_SECRET_C, { kid: "kid-c" });
+    const res = await fetch(`${TEST_URL}/protected-triple`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.text()).trim()).toBe("KEYREQUEST TRIPLE OK");
   });
 
   test("accepts token on keyval-format jwt_key_request", async () => {
@@ -256,5 +288,27 @@ describe("JWT — Key Request (Subrequest)", () => {
   test("public endpoint accessible without token", async () => {
     const res = await fetch(`${TEST_URL}/public`);
     expect(res.status).toBe(200);
+  });
+
+  // Missing/empty variable URL behavior
+  test("empty variable URL rejects token (no keys loaded)", async () => {
+    const token = createHS256Token({ sub: "empty-var", exp: FAR_FUTURE }, SUBREQ_SECRET);
+    const res = await fetch(`${TEST_URL}/protected-empty-var-url`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("empty variable URL rejects request without token", async () => {
+    const res = await fetch(`${TEST_URL}/protected-empty-var-url`);
+    expect(res.status).toBe(401);
+  });
+
+  test("missing variable URL (header not sent) rejects token", async () => {
+    const token = createHS256Token({ sub: "missing-var", exp: FAR_FUTURE }, SUBREQ_SECRET);
+    const res = await fetch(`${TEST_URL}/protected-missing-var-url`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
   });
 });

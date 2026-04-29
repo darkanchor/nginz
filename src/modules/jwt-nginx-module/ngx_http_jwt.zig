@@ -877,6 +877,8 @@ fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf)
                 var sr: [*c]ngx_http_request_t = undefined;
                 if (http.ngx_http_subrequest(r, &url, null, &sr, ps, flags) == NGX_OK) {
                     rctx.*.subrequest += 1;
+                } else {
+                    log.ngz_log_error(log.NGX_LOG_ERR, r.*.connection.*.log, 0, "jwt: failed to create key_request subrequest for \"%V\"", .{&url});
                 }
             }
         }
@@ -898,6 +900,12 @@ fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf)
                 return NGX_HTTP_UNAUTHORIZED;
             }
         } else {
+            // key_requests_count > 0 but all variable URLs were empty/missing at
+            // runtime — no keys loaded. Reject rather than decline so an empty
+            // variable cannot silently bypass auth on a protected location.
+            if (lccf.*.key_requests_count > 0) {
+                return NGX_HTTP_UNAUTHORIZED;
+            }
             return NGX_DECLINED;
         }
     }
