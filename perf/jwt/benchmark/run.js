@@ -13,7 +13,7 @@ import {
   writeManifest,
 } from "../../common/artifacts.js";
 import { startProfiling, stopProfiling } from "../../common/profiling.js";
-import { SCENARIOS, getScenario } from "./scenarios.js";
+import { SCENARIOS, getScenario, generateRsaKeyPair, createRsaToken } from "./scenarios.js";
 import { validateScenario } from "./validate.js";
 
 const MODULE = "jwt";
@@ -24,8 +24,16 @@ const OUTPUT_DIR = join(BENCH_DIR, "output");
 let activeRuntime = {};
 let activeArtifacts = {};
 
-function buildNginzConfig(port) {
+function buildNginzConfig(port, rsaKeyFile) {
   const configPath = join(activeArtifacts.runtimeDir, "nginx.conf");
+  const rs256Block = rsaKeyFile ? [
+    "",
+    "        # Valid RS256 token — RSA-2048 signature verification (compute-heavy worst case)",
+    "        location /bench/valid-rs256 {",
+    `            jwt_key_file ${rsaKeyFile} keyval;`,
+    "            echozn OK;",
+    "        }",
+  ] : [];
   const config = [
     "daemon off;",
     "error_log logs/error.log notice;",
@@ -60,6 +68,7 @@ function buildNginzConfig(port) {
     "            jwt_secret \"different-secret-hs256\";",
     "            echozn OK;",
     "        }",
+    ...rs256Block,
     "",
     "        # Health-check (no JWT required)",
     "        location / {",
@@ -116,9 +125,35 @@ async function main() {
   }
 
   const options = parseBenchmarkArgs(process.argv.slice(2));
-  const scenarios = options.scenario
-    ? [getScenario(options.scenario)].filter(Boolean)
+
+  // ── RS256 worst-case scenario setup (must happen before scenario filtering) ──
+
+  let rsaKeyFile = null;
+  let rs256Scenario = null;
+  const wantRs256 = !options.scenario || options.scenario === "valid-rs256";
+  if (wantRs256) {
+    console.log("Generating RSA-2048 key pair for RS256 worst-case scenario...");
+    const rsaKeys = generateRsaKeyPair();
+    rsaKeyFile = "keys-rs256-bench.json";
+    const FAR_FUTURE = 9999999999;
+    const TOKEN_RS256 = createRsaToken({ sub: "bench-rsa", exp: FAR_FUTURE }, rsaKeys.privateKey);
+    rs256Scenario = {
+      name: "valid-rs256",
+      description: "Valid RS256 token → 200 OK (RSA-2048 signature verification — compute-heavy worst case)",
+      path: "/bench/valid-rs256",
+      method: "GET",
+      headers: { Authorization: `Bearer ${TOKEN_RS256}` },
+      expectedStatus: 200,
+      _rsaPublicKey: rsaKeys.publicKey, // carry for later key file write
+    };
+  }
+
+  const allStaticScenarios = wantRs256 && rs256Scenario
+    ? [...SCENARIOS, rs256Scenario]
     : SCENARIOS;
+  const scenarios = options.scenario
+    ? allStaticScenarios.filter(s => s.name === options.scenario)
+    : allStaticScenarios;
   if (scenarios.length === 0) { console.error("No scenarios"); process.exit(1); }
   const concurrencies = options.concurrency;
 
@@ -134,7 +169,18 @@ async function main() {
   activeRuntime.dir = activeArtifacts.runtimeDir;
 
   resetRuntimeDir(activeArtifacts.runtimeDir);
-  const configPath = buildNginzConfig(activeRuntime.nginzPort);
+
+  // Write RSA key file now that runtime dir exists
+  if (rs256Scenario && rsaKeyFile) {
+    writeFileSync(
+      join(activeArtifacts.runtimeDir, rsaKeyFile),
+      JSON.stringify({ "rs256-bench-key": rs256Scenario._rsaPublicKey }, null, 2),
+    );
+    delete rs256Scenario._rsaPublicKey; // clean up internal field
+  }
+
+  const configPath = buildNginzConfig(activeRuntime.nginzPort, rsaKeyFile);
+
   await startNginz(configPath, activeArtifacts.runtimeDir, activeRuntime.nginzPort, { resetRuntime: false });
   const nginzPid = getNginzPid();
 

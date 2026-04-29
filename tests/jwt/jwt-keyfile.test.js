@@ -106,7 +106,7 @@ function writeRsaJwksFile(dir, name, kid, alg, publicKeyPem) {
 // ── Generate RSA key pairs ─────────────────────────────────────────────
 
 let rsaKeys = {}; // { RS256: { publicKey, privateKey }, ... }
-let ecKeys = {};
+let ecKeys = {}; // ES256, ES384, ES512
 let pssKeys = {};
 let eddsaKeys = {};
 
@@ -122,12 +122,16 @@ function generateRsaKeys() {
 }
 
 function generateEcKeys() {
-  const { publicKey, privateKey } = generateKeyPairSync("ec", {
-    namedCurve: "prime256v1",
-    publicKeyEncoding: { type: "spki", format: "pem" },
-    privateKeyEncoding: { type: "pkcs8", format: "pem" },
-  });
-  ecKeys.ES256 = { publicKey, privateKey };
+  for (const [alg, curve] of [["ES256", "prime256v1"], ["ES384", "secp384r1"], ["ES512", "secp521r1"]]) {
+    const { publicKey, privateKey } = generateKeyPairSync("ec", {
+      namedCurve: curve,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    ecKeys[alg] = { publicKey, privateKey };
+  }
+  // ES256K (secp256k1) is not available in Bun's built-in crypto;
+  // the Zig module supports it but test coverage requires external key generation.
 }
 
 function generatePssKeys() {
@@ -175,7 +179,11 @@ describe("JWT — Algorithm Support & Key Loading", () => {
     });
     writeRsaJwksFile(keyDir, "keys-jwks-rs256.json", "jwks-rs256", "RS256", rsaKeys.RS256.publicKey);
     writeKeyFile(keyDir, "keys-es256.json", { "es256-key": ecKeys.ES256.publicKey });
+    writeKeyFile(keyDir, "keys-es384.json", { "es384-key": ecKeys.ES384.publicKey });
+    writeKeyFile(keyDir, "keys-es512.json", { "es512-key": ecKeys.ES512.publicKey });
     writeKeyFile(keyDir, "keys-ps256.json", { "ps256-key": pssKeys.PS256.publicKey });
+    writeKeyFile(keyDir, "keys-ps384.json", { "ps384-key": pssKeys.PS384.publicKey });
+    writeKeyFile(keyDir, "keys-ps512.json", { "ps512-key": pssKeys.PS512.publicKey });
     writeKeyFile(keyDir, "keys-eddsa.json", { "eddsa-key": eddsaKeys.EdDSA.publicKey });
 
     await startNginz("tests/jwt/nginx.keyfile.conf", MODULE);
@@ -190,7 +198,11 @@ describe("JWT — Algorithm Support & Key Loading", () => {
     try { unlinkSync("tests/jwt/keys-kid.json"); } catch {}
     try { unlinkSync("tests/jwt/keys-jwks-rs256.json"); } catch {}
     try { unlinkSync("tests/jwt/keys-es256.json"); } catch {}
+    try { unlinkSync("tests/jwt/keys-es384.json"); } catch {}
+    try { unlinkSync("tests/jwt/keys-es512.json"); } catch {}
     try { unlinkSync("tests/jwt/keys-ps256.json"); } catch {}
+    try { unlinkSync("tests/jwt/keys-ps384.json"); } catch {}
+    try { unlinkSync("tests/jwt/keys-ps512.json"); } catch {}
     try { unlinkSync("tests/jwt/keys-eddsa.json"); } catch {}
   });
 
@@ -415,6 +427,79 @@ describe("JWT — Algorithm Support & Key Loading", () => {
     expect(res.status).toBe(401);
   });
 
+  // =====================================================================
+  // ES384 (ECDSA with P-384 curve)
+  // =====================================================================
+
+  test("ES384: validates token signed with P-384 ECDSA key", async () => {
+    const token = createEcdsaToken("ES384", { sub: "es384-user" }, ecKeys.ES384.privateKey);
+    const res = await fetch(`${TEST_URL}/es384`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("ES384: rejects token signed with a different ECDSA key", async () => {
+    const { privateKey } = generateKeyPairSync("ec", {
+      namedCurve: "P-384",
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const token = createEcdsaToken("ES384", { sub: "es384-bad" }, privateKey);
+    const res = await fetch(`${TEST_URL}/es384`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("ES384: rejects token with ES256 alg on ES384 endpoint", async () => {
+    const token = createEcdsaToken("ES256", { sub: "test" }, ecKeys.ES256.privateKey);
+    const res = await fetch(`${TEST_URL}/es384`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  // =====================================================================
+  // ES512 (ECDSA with P-521 curve)
+  // =====================================================================
+
+  test("ES512: validates token signed with P-521 ECDSA key", async () => {
+    const token = createEcdsaToken("ES512", { sub: "es512-user" }, ecKeys.ES512.privateKey);
+    const res = await fetch(`${TEST_URL}/es512`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("ES512: rejects token signed with a different ECDSA key", async () => {
+    const { privateKey } = generateKeyPairSync("ec", {
+      namedCurve: "P-521",
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const token = createEcdsaToken("ES512", { sub: "es512-bad" }, privateKey);
+    const res = await fetch(`${TEST_URL}/es512`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("ES512: rejects expired token", async () => {
+    const token = createEcdsaToken("ES512", {
+      sub: "es512-user",
+      exp: Math.floor(Date.now() / 1000) - 3600,
+    }, ecKeys.ES512.privateKey);
+    const res = await fetch(`${TEST_URL}/es512`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  // =====================================================================
+  // PS256 (RSA-PSS with SHA-256)
+  // =====================================================================
+
   test("PS256: validates token signed with RSA-PSS", async () => {
     const token = createPssToken("PS256", { sub: "ps256-user" }, pssKeys.PS256.privateKey);
     const res = await fetch(`${TEST_URL}/ps256`, {
@@ -426,6 +511,65 @@ describe("JWT — Algorithm Support & Key Loading", () => {
   test("PS256: rejects token signed by a different RSA key", async () => {
     const token = createPssToken("PS256", { sub: "ps256-bad" }, rsaKeys.RS256.privateKey);
     const res = await fetch(`${TEST_URL}/ps256`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  // =====================================================================
+  // PS384 (RSA-PSS with SHA-384)
+  // =====================================================================
+
+  test("PS384: validates token signed with RSA-PSS SHA-384", async () => {
+    const token = createPssToken("PS384", { sub: "ps384-user" }, pssKeys.PS384.privateKey);
+    const res = await fetch(`${TEST_URL}/ps384`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("PS384: rejects token signed by a different RSA key", async () => {
+    const token = createPssToken("PS384", { sub: "ps384-bad" }, rsaKeys.RS256.privateKey);
+    const res = await fetch(`${TEST_URL}/ps384`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("PS384: rejects token with PS256 alg on PS384 endpoint", async () => {
+    const token = createPssToken("PS256", { sub: "test" }, pssKeys.PS256.privateKey);
+    const res = await fetch(`${TEST_URL}/ps384`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  // =====================================================================
+  // PS512 (RSA-PSS with SHA-512)
+  // =====================================================================
+
+  test("PS512: validates token signed with RSA-PSS SHA-512", async () => {
+    const token = createPssToken("PS512", { sub: "ps512-user" }, pssKeys.PS512.privateKey);
+    const res = await fetch(`${TEST_URL}/ps512`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("PS512: rejects token signed by a different RSA key", async () => {
+    const token = createPssToken("PS512", { sub: "ps512-bad" }, rsaKeys.RS256.privateKey);
+    const res = await fetch(`${TEST_URL}/ps512`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("PS512: rejects expired token", async () => {
+    const token = createPssToken("PS512", {
+      sub: "ps512-user",
+      exp: Math.floor(Date.now() / 1000) - 3600,
+    }, pssKeys.PS512.privateKey);
+    const res = await fetch(`${TEST_URL}/ps512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);

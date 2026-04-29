@@ -21,6 +21,7 @@ bun perf/jwt/benchmark/run.js --scenario=valid-hs256 --requests=5000 --concurren
 | `valid-claims` | Valid token + claim extraction → 200 OK + headers | body="OK", X-Jwt-Sub="claim-user" | above + CJSON decode + claim traversal |
 | `reject-no-token` | No Authorization header → 401 | 401 status | Fast: enabled check + header absence |
 | `reject-wrong-secret` | Token with wrong secret → 401 | 401 status | Full parse + HMAC verify (fail) |
+| `valid-rs256` | Valid RS256 token (RSA-2048) → 200 OK | body="OK" | JWT parse + base64 decode + EVP_DigestVerify (RSA modular exponentiation) |
 
 ## Architecture
 
@@ -44,5 +45,11 @@ zero setup. Tokens are pre-computed in `scenarios.js` using Bun's built-in
 
 ## Baseline
 
-See `notes/2026-04-28-baseline.md` for the initial baseline with full analysis
+See `notes/2026-04-28-baseline.md` for the initial HS256 baseline with full analysis
 including perf-stat hardware counters.
+
+## Worst-case (RS256)
+
+See `notes/2026-04-29-rs256-worstcase.md` for the RS256 worst-case analysis.
+RS256 is 2.1× slower than HS256 at single-concurrency (1,955 vs 4,077 rps)
+due to RSA-2048 modular exponentiation (~427K instructions/request).

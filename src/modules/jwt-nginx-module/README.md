@@ -268,5 +268,5 @@ The local C reference still goes further on remote key retrieval and some parity
 #### Follow-up TODOs
 
 - [ ] Implement real subrequest-backed `jwt_key_request` semantics.
-- [ ] Extend algorithm-matrix coverage further across ES384/ES512/ES256K and PS384/PS512 variants.
-- [ ] Extend perf coverage beyond the current HS256-focused baseline.
+- [x] Extend algorithm-matrix coverage further across ES384/ES512/ES256K and PS384/PS512 variants. *(ES384, ES512, PS384, PS512 covered; ES256K deferred — Bun's built-in OpenSSL lacks secp256k1)*
+- [x] Extend perf coverage beyond the current HS256-focused baseline. *(RS256 worst-case analysis in `perf/jwt/notes/2026-04-29-rs256-worstcase.md`: 1,955 rps/core, 2.1× slower than HS256, IPC=1.11, ~427K instr/req)*

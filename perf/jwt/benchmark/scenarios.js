@@ -1,10 +1,11 @@
 // JWT benchmark scenarios.
 //
 // All HS256 tokens use the shared secret "benchmark-secret-hs256".
+// RS256 tokens use a pre-generated RSA key pair.
 // Tokens are pre-computed once and reused across all requests to
 // avoid crypto overhead inside the measurement loop.
 
-import { createHmac } from "crypto";
+import { createHmac, generateKeyPairSync, createSign } from "crypto";
 
 const SECRET = "benchmark-secret-hs256";
 const WRONG_SECRET = "different-secret-hs256";
@@ -20,6 +21,25 @@ function createToken(payload, secret = SECRET) {
   const header = JSON.stringify({ alg: "HS256", typ: "JWT" });
   const data = `${base64url(header)}.${base64url(JSON.stringify(payload))}`;
   const sig = base64url(createHmac("sha256", secret).update(data).digest());
+  return `${data}.${sig}`;
+}
+
+// ── RSA key generation ──────────────────────────────────────────────────
+
+export function generateRsaKeyPair() {
+  return generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+}
+
+export function createRsaToken(payload, privateKey) {
+  const header = JSON.stringify({ alg: "RS256", typ: "JWT" });
+  const data = `${base64url(header)}.${base64url(JSON.stringify(payload))}`;
+  const sign = createSign("RSA-SHA256");
+  sign.update(data);
+  const sig = base64url(sign.sign(privateKey));
   return `${data}.${sig}`;
 }
 
