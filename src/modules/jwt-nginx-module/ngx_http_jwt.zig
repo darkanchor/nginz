@@ -136,6 +136,7 @@ const JwtKeyRequest = extern struct {
 const JwtKeyRequestRuntime = extern struct {
     ctx: *jwt_ctx, // parent request context
     jwks: bool,
+    slot: ngx_uint_t,
 };
 
 const jwt_loc_conf = extern struct {
@@ -196,6 +197,9 @@ const jwt_ctx = extern struct {
     reject_request: ngx_flag_t,
     status: ngx_int_t,
     // Per-request key storage (subrequest-loaded keys)
+    request_keys_ready: ngx_flag_t,
+    request_key_counts: [MAX_KEYS]ngx_uint_t,
+    request_key_slots: [MAX_KEYS][MAX_KEYS]JwtKey,
     request_keys_count: ngx_uint_t,
     request_keys: [MAX_KEYS]JwtKey,
 };
@@ -437,6 +441,22 @@ fn try_verify_key_slice(
         if (verify_jwt_with_key(alg, sig_info, header_payload, signature, key)) return true;
     }
     return false;
+}
+
+fn flatten_request_keys_in_declared_order(rctx: *jwt_ctx) void {
+    if (rctx.request_keys_ready != 0) return;
+
+    rctx.request_keys_count = 0;
+    for (0..rctx.subrequest) |slot| {
+        const count = rctx.request_key_counts[slot];
+        for (0..count) |i| {
+            if (rctx.request_keys_count >= MAX_KEYS) break;
+            rctx.request_keys[rctx.request_keys_count] = rctx.request_key_slots[slot][i];
+            rctx.request_keys_count += 1;
+        }
+        if (rctx.request_keys_count >= MAX_KEYS) break;
+    }
+    rctx.request_keys_ready = 1;
 }
 
 // ── Load PEM public key ───────────────────────────────────────────────
@@ -779,6 +799,7 @@ fn jwt_key_request_completion(
     const rctx_data = core.castPtr(JwtKeyRequestRuntime, data) orelse return rc;
     const ctx = rctx_data.*.ctx;
     const jwks = rctx_data.*.jwks;
+    const slot = rctx_data.*.slot;
 
     // Reject compressed responses (cannot parse gzip/deflate inline)
     if (sr.*.headers_out.content_encoding) |ce| {
@@ -797,9 +818,9 @@ fn jwt_key_request_completion(
             const body = buf.*.pos[0..body_len];
             if (body.len > 0) {
                 const ok = if (jwks)
-                    load_keys_jwks(body, sr.*.pool, &ctx.request_keys, &ctx.request_keys_count)
+                    load_keys_jwks(body, sr.*.pool, &ctx.request_key_slots[slot], &ctx.request_key_counts[slot])
                 else
-                    load_keys_keyval(body, sr.*.pool, &ctx.request_keys, &ctx.request_keys_count);
+                    load_keys_keyval(body, sr.*.pool, &ctx.request_key_slots[slot], &ctx.request_key_counts[slot]);
 
                 if (!ok) {
                     ctx.reject_request = 1;
@@ -835,6 +856,9 @@ fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf)
         // Still waiting for subrequests?
         if (rctx.*.done < rctx.*.subrequest) {
             return NGX_AGAIN;
+        }
+        if (rctx.*.subrequest > 0) {
+            flatten_request_keys_in_declared_order(rctx);
         }
         // Subrequest completed with error
         if (rctx.*.reject_request != 0) {
@@ -881,6 +905,7 @@ fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf)
             if (core.ngz_pcalloc_c(JwtKeyRequestRuntime, r.*.pool)) |rr| {
                 rr.*.ctx = rctx;
                 rr.*.jwks = kr.jwks != 0;
+                rr.*.slot = rctx.*.subrequest;
 
                 const ps = core.castPtr(http.ngx_http_post_subrequest_t, core.ngx_pcalloc(r.*.pool, @sizeOf(http.ngx_http_post_subrequest_t))) orelse continue;
                 ps.*.handler = jwt_key_request_completion;

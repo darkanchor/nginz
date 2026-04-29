@@ -312,7 +312,7 @@ The local C reference still goes further on remote key retrieval and some parity
 The `jwt_key_request` feature now has the main subrequest path implemented, but it is not yet fully upstream-equivalent with `/home/kaiwu/Documents/github/nginx-auth-jwt`.
 
 - [x] Add integration coverage for **multiple `jwt_key_request` directives** on one location.
-- [x] Add integration coverage proving **key accumulation order** matches upstream semantics. *(Three-source test (`/protected-triple`) proves keys from the first, second, and last-declared `jwt_key_request` are all available after parallel completion. Subrequests complete in event-loop order, not necessarily declaration order; correctness is preserved because all accumulated keys are tried on every validation — unlike the upstream C module's sequential, first-match behavior, this try-all approach means declaration order never causes false rejections.)*
+- [x] Add integration coverage proving **key accumulation order** matches upstream semantics. *(The `/protected-order` regression uses delayed subrequest completions plus `MAX_KEYS` overflow to prove request-loaded keys are flattened in declared `jwt_key_request` order, not completion order.)*
 - [x] Add integration coverage proving duplicate-`kid` sources are all considered during verification.
 - [x] Add integration coverage for **mixed sources**: local `jwt_key_file` + `jwt_key_request`.
 - [x] Add integration coverage for **inherited `jwt_key_request` entries** across the full `http`/`server`/`location` matrix.
@@ -321,16 +321,16 @@ The `jwt_key_request` feature now has the main subrequest path implemented, but 
 - [x] Add integration coverage for **malformed subrequest bodies** returning auth failure.
 - [x] Add integration coverage for **compressed subrequest responses** being rejected.
 - [x] Add integration coverage for **missing/empty variable URL** behavior.
-- [x] Add integration coverage for **subrequest creation failure** or equivalent failure-path observability if practically testable. *(Subrequest creation failures are logged at `error` level. When all subrequests fail to create and no static key material exists, the request is rejected with 401. Direct integration testing of `ngx_http_subrequest` failure requires OOM/internal-nginx conditions that are not practically triggerable in the test harness; the empty/missing variable URL tests above cover the equivalent observable failure path.)*
-- [x] Verify and, if needed, fix **request-key append semantics** across repeated subrequests. *(Each subrequest completion appends its parsed keys to a shared `request_keys` array in the per-request context. nginx is single-threaded so completions serialize; no concurrent write hazard. Fail-any policy: if any completion callback cannot parse its response body, `reject_request` is set and the whole request is rejected regardless of other successful completions. Verified: the three-source test shows all three sets of keys are correctly accumulated across parallel completions.)*
+- [x] Add integration coverage for **subrequest creation failure** or equivalent failure-path observability if practically testable. *(The `/protected-invalid-var-url` regression drives a non-empty invalid runtime URI through `jwt_key_request` and verifies the request fails closed with 401.)*
+- [x] Verify and, if needed, fix **request-key append semantics** across repeated subrequests. *(Each subrequest completion appends its parsed keys to a shared `request_keys` array in the per-request context. Current coverage proves repeated subrequest-loaded keysets are accumulated and remain usable across the tested cases.)*
 - [x] Verify and, if needed, fix **duplicate-`kid` override behavior** across request-loaded sources. *(All keys from all sources are accumulated and tried; duplicate `kid` entries from different sources are both attempted — no last-write-wins override. Integration tests confirm both declaration orderings work.)*
 - [x] Document explicitly that **caching is not built into `jwt_key_request`** and should be done in the subrequest location with nginx mechanisms like `proxy_cache`.
-- [x] Document the upstream-style limitation around **JWT auth running inside a subrequest / ACCESS phase not executing there**, if it also applies here. *(The Zig module does not skip subrequests — it does not check `r != r->main`. The ACCESS phase runs for both main requests and nginx internal subrequests. JWT protection is therefore enforced when a protected location is accessed as a subrequest, e.g. from `auth_request` or SSI. This differs from modules that explicitly gate on `r == r->main`.)*
+- [x] Document the upstream-style limitation around **JWT auth running inside a subrequest / ACCESS phase not executing there**, if it also applies here. *(Integration probe: `tests/jwt/jwt-keyrequest.test.js` calls `/protected-sub-inner` through an njs subrequest and receives `200`, showing `jwt_key_request` protection is skipped in that subrequest context.)*
 - [x] Add README examples showing the **recommended cached internal JWKS location pattern**.
 - [x] Re-audit the README language so it says **subrequest fetching** rather than **module-provided caching**.
-- [x] Add a targeted audit note or regression test for **nested-subrequest limitation**, if reproducible in this repo. *(The nested-subrequest scenario — a location protected by `jwt_key_request` being accessed itself as a subrequest — requires `auth_request` or SSI, neither compiled into nginz. Behaviorally: nginx supports sub-subrequests up to its nesting limit (default 200); the `NGX_HTTP_SUBREQUEST_WAITED | IN_MEMORY` flags are valid in this context. If `jwt_key_request` is used inside a subrequest context and the inner jwt_key_request subrequest also uses the same flags, the nesting depth increases by 1. No failure-path has been observed in practice; document as "supported up to nginx nesting limits, not integration-tested due to harness constraints".)*
+- [x] Add a targeted audit note or regression test for **nested-subrequest limitation**, if reproducible in this repo. *(Regression probe exists at `/nested-probe`, which confirms the protected inner location returns `200` when reached as a subrequest.)*
 
-Progress (all parity work complete):
+Progress from implemented parity waves:
 
 - request-time subrequest loading works for literal and variable URLs
 - multiple `jwt_key_request` directives on one location are integration-tested
@@ -342,8 +342,9 @@ Progress (all parity work complete):
 - mixed `jwt_key_file` + `jwt_key_request` sources are now integration-tested
 - full `http`/`server`/`location` inheritance and inherited variable-URL coverage are now integration-tested
 - empty/missing variable URL correctly returns 401 (no silent auth bypass)
-- subrequest creation failures are logged and result in 401 when no other key material exists
-- JWT auth runs inside nginx subrequests (no `r == r->main` skip); nested-subrequest depth supported up to nginx limits
+- order-sensitive overflow regression proves declaration-order accumulation under parallel completion
+- invalid runtime URI regression proves the subrequest creation-failure path fails closed
+- nested subrequest probe confirms `jwt_key_request` is skipped when the protected location is executed as a subrequest
 
 #### Follow-up TODOs
 

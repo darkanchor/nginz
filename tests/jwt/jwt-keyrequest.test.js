@@ -15,7 +15,17 @@ const DUP_SECRET_VALID = "dup-secret-valid-hs256-32bytes!!";
 const HTTP_SCOPE_SECRET = "subreq-http-secret-hs256-32bytes!!";
 const SERVER_SCOPE_SECRET = "subreq-server-secret-hs256-32bytes!!";
 const LOCATION_SCOPE_SECRET = "subreq-location-secret-hs256-32bytes";
+const ORDER_SECRET_A = "order-secret-a-hs256-32bytes!!!!";
+const ORDER_SECRET_C = "order-secret-c-hs256-32bytes!!!!";
 let compressedServer;
+
+function buildKeyvalSet(prefix, count, firstSecret) {
+  const obj = {};
+  for (let i = 0; i < count; i++) {
+    obj[`${prefix}-kid-${i}`] = i === 0 ? firstSecret : `${prefix}-filler-secret-${i}-hs256!!`;
+  }
+  return JSON.stringify(obj);
+}
 
 function createHS256Token(payload, secret, extraHeader = {}) {
   const header = { alg: "HS256", typ: "JWT", ...extraHeader };
@@ -35,7 +45,25 @@ describe("JWT — Key Request (Subrequest)", () => {
   beforeAll(async () => {
     compressedServer = Bun.serve({
       port: 19005,
-      fetch() {
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/order-a") {
+          await Bun.sleep(80);
+          return new Response(buildKeyvalSet("order-a", 8, ORDER_SECRET_A), {
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url.pathname === "/order-b") {
+          await Bun.sleep(20);
+          return new Response(buildKeyvalSet("order-b", 8, "order-secret-b-hs256-32bytes!!!!"), {
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url.pathname === "/order-c") {
+          return new Response(buildKeyvalSet("order-c", 8, ORDER_SECRET_C), {
+            headers: { "content-type": "application/json" },
+          });
+        }
         return new Response(
           '{"keys":[{"kty":"oct","kid":"compressed-kid","k":"Y29tcHJlc3NlZC1zZWNyZXQtaHMyNTYtMzJieXRlcyEh","alg":"HS256"}]}',
           {
@@ -140,6 +168,23 @@ describe("JWT — Key Request (Subrequest)", () => {
     });
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("KEYREQUEST TRIPLE OK");
+  });
+
+  test("preserves declaration-order accumulation under parallel completion (first source retained)", async () => {
+    const token = createHS256Token({ sub: "order-a", exp: FAR_FUTURE }, ORDER_SECRET_A, { kid: "order-a-kid-0" });
+    const res = await fetch(`${TEST_URL}/protected-order`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.text()).trim()).toBe("KEYREQUEST ORDER OK");
+  });
+
+  test("preserves declaration-order accumulation under parallel completion (last source trimmed by MAX_KEYS)", async () => {
+    const token = createHS256Token({ sub: "order-c", exp: FAR_FUTURE }, ORDER_SECRET_C, { kid: "order-c-kid-0" });
+    const res = await fetch(`${TEST_URL}/protected-order`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
   });
 
   test("accepts token on keyval-format jwt_key_request", async () => {
@@ -290,6 +335,12 @@ describe("JWT — Key Request (Subrequest)", () => {
     expect(res.status).toBe(200);
   });
 
+  test("nested subrequest probe shows jwt_key_request is skipped inside subrequests", async () => {
+    const res = await fetch(`${TEST_URL}/nested-probe`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("200");
+  });
+
   // Missing/empty variable URL behavior
   test("empty variable URL rejects token (no keys loaded)", async () => {
     const token = createHS256Token({ sub: "empty-var", exp: FAR_FUTURE }, SUBREQ_SECRET);
@@ -307,6 +358,14 @@ describe("JWT — Key Request (Subrequest)", () => {
   test("missing variable URL (header not sent) rejects token", async () => {
     const token = createHS256Token({ sub: "missing-var", exp: FAR_FUTURE }, SUBREQ_SECRET);
     const res = await fetch(`${TEST_URL}/protected-missing-var-url`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("invalid runtime URI rejects when ngx_http_subrequest creation fails", async () => {
+    const token = createHS256Token({ sub: "invalid-uri", exp: FAR_FUTURE }, SUBREQ_SECRET);
+    const res = await fetch(`${TEST_URL}/protected-invalid-var-url`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
