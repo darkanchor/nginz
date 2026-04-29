@@ -4,23 +4,25 @@ JWT (JSON Web Token) validation for nginx access control.
 
 ### Status
 
-**Implemented** - Basic functionality complete (HS256)
+**Implemented** - Multi-algorithm JWT validation with claims, headers, revocation lists, and configurable phase selection.
 
 ### Features
 
-- **HS256 Validation**: HMAC-SHA256 signature verification
-- **Bearer Token**: Extracts token from Authorization header
-- **Claims Validation**: Checks `exp` (expiration) and `nbf` (not before)
-- **Access Phase**: Runs in nginx access phase before content handlers
+- **Algorithm coverage in integration tests**: HS256/384/512, RS256/384/512, ES256, PS256, EdDSA, and local JWKS RSA paths are covered end-to-end; broader ES*/PS* family variants remain good candidates for additional matrix coverage
+- **Key material**: inline HMAC secrets, keyval key files, and local JWKS files (`oct` and RSA public keys)
+- **Token sources**: Authorization Bearer tokens and `token=$variable` via `jwt_secret`
+- **Claim and header extraction**: `jwt_claim`, `jwt_header`, nested dot-path/array-index lookups, `$jwt_claims`, and `$jwt_nowtime`
+- **Validation controls**: `jwt_require_claim`, `jwt_require_header`, `jwt_require`, `jwt_validate_exp`, `jwt_validate_sig`, `jwt_leeway`, `jwt_issuer`, and `jwt_audience`
+- **Operational controls**: `jwt_revocation_list_sub`, `jwt_revocation_list_kid`, and `jwt_phase access|preaccess`
 
 ### Directives
 
 #### jwt_secret
 
 *syntax:* `jwt_secret <secret>;`
-*context:* `location`
+*context:* `http`, `server`, `location`
 
-Enable JWT validation and set the HMAC secret key for HS256 signature validation. Both `enabled` and `secret` are inherited from parent locations. Requests without a valid token receive 401 Unauthorized.
+Enable JWT validation and set the inline HMAC secret or token source. The directive inherits across `http` → `server` → `location`, and `jwt_secret off;` explicitly disables inherited JWT protection for the current block.
 
 ### Usage
 
@@ -115,10 +117,10 @@ Tokens without `exp` or `nbf` claims pass validation (no time check).
 
 Current implementation has these limitations:
 
-- **HS256 Only**: Only HMAC-SHA256 algorithm supported
-- **No Key Files/JWKS**: Only inline secrets via `jwt_secret`
-- **No Claims Extraction**: Claims not exposed as nginx variables
-- **No Rich Validation**: Only `exp`/`nbf` time checks; no `iss`, `aud`, custom claims
+- **`jwt_key_request` not implemented**: the directive is intentionally rejected at config parse time; use `jwt_key_file` for local key material
+- **Fixed-size limits**: `MAX_KEYS = 16`, `MAX_CLAIM_VARS = 8`, `MAX_REQUIRE_CLAIMS = 8`
+- **Fixed decode buffers**: header and payload decoding currently rely on bounded stack buffers in the module implementation
+- **Nested extraction is leaf-oriented**: nested string and integer values are the strongest supported extraction targets today
 
 ### Action Plan — Feature Parity Batches
 
@@ -135,13 +137,13 @@ Reference: [nginx-auth-jwt](https://github.com/nicholaschiasson/nginx-auth-jwt) 
 | 1.1 | **RS256/RS384/RS512** — RSA PKCS#1 v1.5 via `EVP_DigestVerify` | ✅ |
 | 1.2 | **HS384/HS512** — HMAC-SHA384/512 via `jwt_secret` | ✅ |
 | 1.3 | `jwt_key_file` — keyval format (PEM → RSA, raw → HMAC) | ✅ |
-| 1.4 | `jwt_key_request` — subrequest-based key fetch (alias to key_file) | ✅ |
+| 1.4 | `jwt_key_request` — subrequest-based key fetch | ⬜ |
 | 1.5 | **`kid` matching** — extract kid, match against key set, fallback to first | ✅ |
 | 1.6 | **Algorithm enforcement** — reject unsupported `alg`, match key type (RSA/HMAC) | ✅ |
 
 #### Batch 2 — Claims as Variables ✅
 
-> **Goal**: Expose JWT claims and headers as nginx variables. **(4/5 done)**
+> **Goal**: Expose JWT claims and headers as nginx variables. **(5/5 done)**
 
 | # | Task | Status |
 |---|------|--------|
@@ -153,7 +155,7 @@ Reference: [nginx-auth-jwt](https://github.com/nicholaschiasson/nginx-auth-jwt) 
 
 #### Batch 3 — Rich Claim Validation ✅
 
-> **Goal**: Validate claims with comparison operators and time controls. **(4/6 done)**
+> **Goal**: Validate claims with comparison operators and time controls. **(6/6 done)**
 
 | # | Task | Status |
 |---|------|--------|
@@ -166,7 +168,7 @@ Reference: [nginx-auth-jwt](https://github.com/nicholaschiasson/nginx-auth-jwt) 
 
 #### Batch 4 — Key Management & Security
 
-> **Goal**: Security toggles and variable checks. **(2/5 done)**
+> **Goal**: Security toggles and variable checks. **(4/5 done)**
 
 | # | Task | Status |
 |---|------|--------|
@@ -176,9 +178,9 @@ Reference: [nginx-auth-jwt](https://github.com/nicholaschiasson/nginx-auth-jwt) 
 | 4.4 | `jwt_revocation_list_kid` — JSON file of revoked kids | ✅ |
 | 4.5 | `jwt_require` — variable checks | ✅ |
 
-#### Batch 5 — Algorithm & Flexibility
+#### Batch 5 — Algorithm & Flexibility ✅
 
-> **Goal**: Token sources and integration flexibility. **(1/7 done)**
+> **Goal**: Token sources and integration flexibility. **(7/7 done)**
 
 | # | Task | Status |
 |---|------|--------|
@@ -224,9 +226,47 @@ token = jwt.encode(
 
 ### Documentation Audit Checklist
 
-- [x] Audit date: 2026-04-10
+- [x] Audit date: 2026-04-29
 - [x] Bun integration coverage exists at `tests/jwt/`.
-- [x] Bun integration coverage now verifies nested child-location inheritance, explicit rejection of non-`HS256` header algorithms, and rejection of malformed non-JSON payloads even when the HMAC matches.
-- [x] Gap fixed in this audit pass: JWT header `alg` is now validated as `HS256` instead of trusting any HMAC-signed header value.
-- [x] Gap fixed in this audit pass: malformed payload JSON now fails closed instead of being treated like a token without time-based claims.
-- [x] No additional documentation gaps were identified in this audit pass.
+- [x] Bun integration coverage verifies nested child-location inheritance, JOSE header extraction, nested claim/header access, audience matching, revocation lists, local JWKS RSA loading, and phase configuration smoke behavior.
+- [x] Algorithm validation is now key-type aware instead of the old HS256-only behavior described by previous docs.
+- [x] `jwt_key_request` no longer silently aliases `jwt_key_file`; unsupported use now fails clearly at config parse time.
+- [x] The README top summary, counters, and current limitations were refreshed to match the shipped implementation.
+
+### Audit Addendum — 2026-04-29
+
+Audit materials for this pass included:
+
+- the current Zig implementation in `src/modules/jwt-nginx-module/ngx_http_jwt.zig`
+- integration coverage under `tests/jwt/`
+- JWT perf notes under `perf/jwt/`
+- the last five JWT-related git revisions
+- the local C reference project at `/home/kaiwu/Documents/github/nginx-auth-jwt`
+
+#### Audit outcomes
+
+Resolved in this remediation pass:
+
+- README top summary, directive context notes, limitations, and roadmap counters were aligned with the shipped implementation.
+- `jwt_header` now uses dedicated request-time header extraction instead of the payload-claim path.
+- `jwt_phase` is now wired through separate preaccess/access handlers instead of being stored but ignored.
+- Local JWKS RSA public-key loading is now supported alongside existing `oct` key handling.
+- Revocation-list parsing now reads string-array values correctly, and integration coverage exists for both `sub` and `kid` revocation paths.
+- `jwt_key_request` no longer silently aliases `jwt_key_file`; unsupported use now fails clearly during config parsing.
+- Nested claim/header access now works for dot-path and array-index lookups on leaf string/integer values.
+- `jwt_audience` now exists as a dedicated shortcut and matches both string and array-form `aud` claims.
+
+Remaining intentionally deferred items:
+
+- real subrequest-backed `jwt_key_request` behavior
+- broader perf characterization beyond the current HS256-focused benchmark scenarios
+
+#### Comparison note against the local C reference
+
+The local C reference still goes further on remote key retrieval and some parity niceties, but the Zig module now covers the core local-file and local-JWKS validation surface it claims in this README.
+
+#### Follow-up TODOs
+
+- [ ] Implement real subrequest-backed `jwt_key_request` semantics.
+- [ ] Extend algorithm-matrix coverage further across ES384/ES512/ES256K and PS384/PS512 variants.
+- [ ] Extend perf coverage beyond the current HS256-focused baseline.

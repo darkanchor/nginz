@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
   startNginz, stopNginz, cleanupRuntime, TEST_URL,
 } from "../harness.js";
-import { createHmac, generateKeyPairSync, createSign, createPublicKey } from "crypto";
+import { createHmac, generateKeyPairSync, createSign, createPublicKey, sign as cryptoSign, constants as cryptoConstants } from "crypto";
 import { writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 
@@ -36,6 +36,7 @@ function createHmacToken(alg, payload, secret) {
 }
 
 const RSA_SIGN_ALGOS = { RS256: "RSA-SHA256", RS384: "RSA-SHA384", RS512: "RSA-SHA512" };
+const ECDSA_SIGN_ALGOS = { ES256: "SHA256", ES384: "SHA384", ES512: "SHA512", ES256K: "SHA256" };
 
 function createRsaToken(alg, payload, privateKey) {
   const header = { alg, typ: "JWT" };
@@ -55,14 +56,59 @@ function createRsaTokenWithKid(alg, kid, payload, privateKey) {
   return `${data}.${sig}`;
 }
 
+function createEcdsaToken(alg, payload, privateKey) {
+  const header = { alg, typ: "JWT" };
+  const data = `${base64urlEncode(header)}.${base64urlEncode(payload)}`;
+  const sign = createSign(ECDSA_SIGN_ALGOS[alg]);
+  sign.update(data);
+  const sig = base64url(sign.sign(privateKey));
+  return `${data}.${sig}`;
+}
+
+function createPssToken(alg, payload, privateKey) {
+  const header = { alg, typ: "JWT" };
+  const data = `${base64urlEncode(header)}.${base64urlEncode(payload)}`;
+  const hash = { PS256: "sha256", PS384: "sha384", PS512: "sha512" }[alg];
+  const sig = cryptoSign(hash, Buffer.from(data), {
+    key: privateKey,
+    padding: cryptoConstants.RSA_PKCS1_PSS_PADDING,
+    saltLength: cryptoConstants.RSA_PSS_SALTLEN_DIGEST,
+  });
+  return `${data}.${base64url(sig)}`;
+}
+
+function createEdDsaToken(payload, privateKey) {
+  const header = { alg: "EdDSA", typ: "JWT" };
+  const data = `${base64urlEncode(header)}.${base64urlEncode(payload)}`;
+  const sig = cryptoSign(null, Buffer.from(data), privateKey);
+  return `${data}.${base64url(sig)}`;
+}
+
 function writeKeyFile(dir, name, content) {
   const p = join(dir, name);
   writeFileSync(p, typeof content === "string" ? content : JSON.stringify(content, null, 2));
 }
 
+function writeRsaJwksFile(dir, name, kid, alg, publicKeyPem) {
+  const jwk = createPublicKey(publicKeyPem).export({ format: "jwk" });
+  writeKeyFile(dir, name, {
+    keys: [{
+      kty: "RSA",
+      kid,
+      alg,
+      use: "sig",
+      n: jwk.n,
+      e: jwk.e,
+    }],
+  });
+}
+
 // ── Generate RSA key pairs ─────────────────────────────────────────────
 
 let rsaKeys = {}; // { RS256: { publicKey, privateKey }, ... }
+let ecKeys = {};
+let pssKeys = {};
+let eddsaKeys = {};
 
 function generateRsaKeys() {
   for (const alg of ["RS256", "RS384", "RS512"]) {
@@ -75,11 +121,42 @@ function generateRsaKeys() {
   }
 }
 
+function generateEcKeys() {
+  const { publicKey, privateKey } = generateKeyPairSync("ec", {
+    namedCurve: "prime256v1",
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  ecKeys.ES256 = { publicKey, privateKey };
+}
+
+function generatePssKeys() {
+  for (const alg of ["PS256", "PS384", "PS512"]) {
+    const { publicKey, privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    pssKeys[alg] = { publicKey, privateKey };
+  }
+}
+
+function generateEdDsaKeys() {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  eddsaKeys.EdDSA = { publicKey, privateKey };
+}
+
 // ── Suite ──────────────────────────────────────────────────────────────
 
 describe("JWT — Algorithm Support & Key Loading", () => {
   beforeAll(async () => {
     generateRsaKeys();
+    generateEcKeys();
+    generatePssKeys();
+    generateEdDsaKeys();
 
     // Write key files alongside the config (conf_prefix=0 resolves to config dir)
     const keyDir = "tests/jwt";
@@ -96,6 +173,10 @@ describe("JWT — Algorithm Support & Key Loading", () => {
       "key-alpha": rsaKeys.RS256.publicKey,
       "key-beta": rsaKeys.RS384.publicKey,
     });
+    writeRsaJwksFile(keyDir, "keys-jwks-rs256.json", "jwks-rs256", "RS256", rsaKeys.RS256.publicKey);
+    writeKeyFile(keyDir, "keys-es256.json", { "es256-key": ecKeys.ES256.publicKey });
+    writeKeyFile(keyDir, "keys-ps256.json", { "ps256-key": pssKeys.PS256.publicKey });
+    writeKeyFile(keyDir, "keys-eddsa.json", { "eddsa-key": eddsaKeys.EdDSA.publicKey });
 
     await startNginz("tests/jwt/nginx.keyfile.conf", MODULE);
   }, 30000);
@@ -107,6 +188,10 @@ describe("JWT — Algorithm Support & Key Loading", () => {
     try { unlinkSync("tests/jwt/keys-rs384.json"); } catch {}
     try { unlinkSync("tests/jwt/keys-rs512.json"); } catch {}
     try { unlinkSync("tests/jwt/keys-kid.json"); } catch {}
+    try { unlinkSync("tests/jwt/keys-jwks-rs256.json"); } catch {}
+    try { unlinkSync("tests/jwt/keys-es256.json"); } catch {}
+    try { unlinkSync("tests/jwt/keys-ps256.json"); } catch {}
+    try { unlinkSync("tests/jwt/keys-eddsa.json"); } catch {}
   });
 
   // =====================================================================
@@ -289,22 +374,77 @@ describe("JWT — Algorithm Support & Key Loading", () => {
     expect(res.status).toBe(200);
   });
 
+  test("jwks: validates RSA token from JWKS key material", async () => {
+    const token = createRsaTokenWithKid("RS256", "jwks-rs256", { sub: "jwks-user" }, rsaKeys.RS256.privateKey);
+    const res = await fetch(`${TEST_URL}/jwks-rs256`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("jwks: rejects RSA token signed by a different key", async () => {
+    const token = createRsaTokenWithKid("RS256", "jwks-rs256", { sub: "jwks-bad" }, rsaKeys.RS384.privateKey);
+    const res = await fetch(`${TEST_URL}/jwks-rs256`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
   // =====================================================================
   // Algorithm enforcement
   // =====================================================================
 
-  test("alg: ES256 is now supported", async () => {
-    // ES256 with RSA key — algorithm type matches key type (both is_rsa), signature verifies
-    const header = { alg: "ES256", typ: "JWT" };
-    const data = `${base64urlEncode(header)}.${base64urlEncode({ sub: "test" })}`;
-    const sign = createSign("RSA-SHA256");
-    sign.update(data);
-    const sig = base64url(sign.sign(rsaKeys.RS256.privateKey));
-    const token = `${data}.${sig}`;
-    const res = await fetch(`${TEST_URL}/alg-rs256-only`, {
+  test("ES256: validates token signed with ECDSA key", async () => {
+    const token = createEcdsaToken("ES256", { sub: "es256-user" }, ecKeys.ES256.privateKey);
+    const res = await fetch(`${TEST_URL}/es256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
+  });
+
+  test("ES256: rejects token signed with a different ECDSA key", async () => {
+    const { privateKey } = generateKeyPairSync("ec", {
+      namedCurve: "prime256v1",
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const token = createEcdsaToken("ES256", { sub: "es256-bad" }, privateKey);
+    const res = await fetch(`${TEST_URL}/es256`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("PS256: validates token signed with RSA-PSS", async () => {
+    const token = createPssToken("PS256", { sub: "ps256-user" }, pssKeys.PS256.privateKey);
+    const res = await fetch(`${TEST_URL}/ps256`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("PS256: rejects token signed by a different RSA key", async () => {
+    const token = createPssToken("PS256", { sub: "ps256-bad" }, rsaKeys.RS256.privateKey);
+    const res = await fetch(`${TEST_URL}/ps256`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("EdDSA: validates token signed with Ed25519", async () => {
+    const token = createEdDsaToken({ sub: "eddsa-user" }, eddsaKeys.EdDSA.privateKey);
+    const res = await fetch(`${TEST_URL}/eddsa`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  test("EdDSA: rejects token signed with the wrong key", async () => {
+    const token = createEdDsaToken({ sub: "eddsa-bad" }, eddsaKeys.EdDSA.privateKey);
+    const res = await fetch(`${TEST_URL}/rs256`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
   });
 
   test("alg: RSA key rejects wrong key even with matching RSA alg type", async () => {

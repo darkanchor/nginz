@@ -9,11 +9,19 @@ function base64url(v) {
 }
 
 function createToken(payload, secret, alg = "HS256") {
-  const header = { alg, typ: "JWT" };
-  const data = `${base64url(Buffer.from(JSON.stringify(header)))}.${base64url(Buffer.from(JSON.stringify(payload)))}`;
-  const algo = { HS256: "sha256", HS384: "sha384", HS512: "sha512" }[alg];
-  const sig = createHmac(algo, secret).update(data).digest();
-  return `${data}.${base64url(sig)}`;
+    const header = { alg, typ: "JWT" };
+    const data = `${base64url(Buffer.from(JSON.stringify(header)))}.${base64url(Buffer.from(JSON.stringify(payload)))}`;
+    const algo = { HS256: "sha256", HS384: "sha384", HS512: "sha512" }[alg];
+    const sig = createHmac(algo, secret).update(data).digest();
+    return `${data}.${base64url(sig)}`;
+}
+
+function createTokenWithHeader(payload, secret, header, alg = "HS256") {
+    const fullHeader = { alg, typ: "JWT", ...header };
+    const data = `${base64url(Buffer.from(JSON.stringify(fullHeader)))}.${base64url(Buffer.from(JSON.stringify(payload)))}`;
+    const algo = { HS256: "sha256", HS384: "sha384", HS512: "sha512" }[alg];
+    const sig = createHmac(algo, secret).update(data).digest();
+    return `${data}.${base64url(sig)}`;
 }
 
 // ── Suite ──────────────────────────────────────────────────────────────
@@ -73,6 +81,72 @@ describe("JWT — Claim Variable Extraction", () => {
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("x-jwt-iat")).toBe(String(iat));
+  });
+
+  test("extracts nested claim values via dot paths and array indices", async () => {
+    const token = createToken(
+      { sub: "nested-user", profile: { name: "Nested Alice" }, roles: ["admin", "user"] },
+      "my-claim-test-secret-hs256"
+    );
+    const res = await fetch(`${TEST_URL}/claim-nested`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-jwt-profile-name")).toBe("Nested Alice");
+    expect(res.headers.get("x-jwt-role0")).toBe("admin");
+  });
+
+  test("missing nested claim path returns empty header", async () => {
+    const token = createToken(
+      { sub: "nested-missing", profile: {} },
+      "my-claim-test-secret-hs256"
+    );
+    const res = await fetch(`${TEST_URL}/claim-nested`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-jwt-profile-name") || "").toBe("");
+    expect(res.headers.get("x-jwt-role0") || "").toBe("");
+  });
+
+  test("extracts jose headers via jwt_header directive", async () => {
+    const token = createTokenWithHeader(
+      { sub: "header-user" },
+      "my-claim-test-secret-hs256",
+      { kid: "kid-123", typ: "JWT" }
+    );
+    const res = await fetch(`${TEST_URL}/header-values`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-jwt-typ")).toBe("JWT");
+    expect(res.headers.get("x-jwt-kid")).toBe("kid-123");
+  });
+
+  test("missing jose header returns empty header", async () => {
+    const token = createToken(
+      { sub: "header-missing" },
+      "my-claim-test-secret-hs256"
+    );
+    const res = await fetch(`${TEST_URL}/header-values`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-jwt-typ")).toBe("JWT");
+    expect(res.headers.get("x-jwt-kid") || "").toBe("");
+  });
+
+  test("extracts nested jose header values via dot paths", async () => {
+    const token = createTokenWithHeader(
+      { sub: "header-nested-user" },
+      "my-claim-test-secret-hs256",
+      { meta: { inner: "nested-header" } }
+    );
+    const res = await fetch(`${TEST_URL}/header-nested`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-jwt-nested-value")).toBe("nested-header");
   });
 
   // =====================================================================

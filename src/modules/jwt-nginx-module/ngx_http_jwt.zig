@@ -11,6 +11,7 @@ const NGX_OK = core.NGX_OK;
 const NGX_ERROR = core.NGX_ERROR;
 const NGX_DECLINED = core.NGX_DECLINED;
 const NGX_HTTP_UNAUTHORIZED = http.NGX_HTTP_UNAUTHORIZED;
+const NGX_HTTP_PREACCESS_PHASE: usize = 5;
 
 const ngx_str_t = core.ngx_str_t;
 const ngx_int_t = core.ngx_int_t;
@@ -49,6 +50,7 @@ const EVP_MD_CTX_free = ssl.EVP_MD_CTX_free;
 const EVP_DigestVerifyInit = ssl.EVP_DigestVerifyInit;
 const EVP_DigestVerifyUpdate = ssl.EVP_DigestVerifyUpdate;
 const EVP_DigestVerifyFinal = ssl.EVP_DigestVerifyFinal;
+extern fn EVP_DigestVerify(ctx: ?*EVP_MD_CTX, sigret: [*c]const u8, siglen: usize, tbs: [*c]const u8, tbslen: usize) c_int;
 
 const BIO = ssl.BIO;
 const BIO_new_mem_buf = ssl.BIO_new_mem_buf;
@@ -61,6 +63,13 @@ const BN_num_bytes = ssl.BN_num_bytes;
 
 extern fn EVP_sha384() ?*const ssl.EVP_MD;
 extern fn EVP_sha512() ?*const ssl.EVP_MD;
+extern fn BN_bin2bn(s: [*c]const u8, len: c_int, ret: ?*ssl.BIGNUM) ?*ssl.BIGNUM;
+extern fn BN_free(a: ?*ssl.BIGNUM) void;
+extern fn RSA_new() ?*ssl.RSA;
+extern fn RSA_free(r: ?*ssl.RSA) void;
+extern fn RSA_set0_key(r: ?*ssl.RSA, n: ?*ssl.BIGNUM, e: ?*ssl.BIGNUM, d: ?*ssl.BIGNUM) c_int;
+extern fn EVP_PKEY_new() ?*ssl.EVP_PKEY;
+extern fn EVP_PKEY_set1_RSA(pkey: ?*ssl.EVP_PKEY, key: ?*ssl.RSA) c_int;
 
 // ── C file I/O (for BIO key loading, PEM_read_bio needs BIO from raw buffer) ──
 
@@ -246,6 +255,9 @@ fn rsa_verify(data: []const u8, signature: []const u8, pkey: ?*EVP_PKEY, md: ?*c
     const ctx = EVP_MD_CTX_new() orelse return false;
     defer EVP_MD_CTX_free(ctx);
     if (EVP_DigestVerifyInit(ctx, null, md, null, pkey) != 1) return false;
+    if (md == null) {
+        return EVP_DigestVerify(ctx, signature.ptr, signature.len, data.ptr, data.len) == 1;
+    }
     if (EVP_DigestVerifyUpdate(ctx, data.ptr, data.len) != 1) return false;
     return EVP_DigestVerifyFinal(ctx, signature.ptr, signature.len) == 1;
 }
@@ -335,6 +347,38 @@ fn load_pubkey_from_pem(pem: []const u8) ?*EVP_PKEY {
     return PEM_read_bio_PUBKEY(bio, null, null, null);
 }
 
+fn load_pubkey_from_rsa_jwk(n_b64: []const u8, e_b64: []const u8) ?*EVP_PKEY {
+    var n_buf: [4096]u8 = undefined;
+    const n_len = base64url_decode(n_b64, &n_buf) orelse return null;
+
+    var e_buf: [64]u8 = undefined;
+    const e_len = base64url_decode(e_b64, &e_buf) orelse return null;
+
+    const rsa = RSA_new() orelse return null;
+    errdefer RSA_free(rsa);
+
+    const n_bn = BN_bin2bn(n_buf[0..n_len].ptr, @intCast(n_len), null) orelse return null;
+    const e_bn = BN_bin2bn(e_buf[0..e_len].ptr, @intCast(e_len), null) orelse {
+        BN_free(n_bn);
+        return null;
+    };
+
+    if (RSA_set0_key(rsa, n_bn, e_bn, null) != 1) {
+        BN_free(n_bn);
+        BN_free(e_bn);
+        return null;
+    }
+
+    const pkey = EVP_PKEY_new() orelse return null;
+    if (EVP_PKEY_set1_RSA(pkey, rsa) != 1) {
+        ssl.EVP_PKEY_free(pkey);
+        return null;
+    }
+
+    RSA_free(rsa);
+    return pkey;
+}
+
 // ── Load keys from keyval JSON file ───────────────────────────────────
 
 fn load_keys_keyval(data: []u8, pool: [*c]core.ngx_pool_t, keys: *[MAX_KEYS]JwtKey, count: *ngx_uint_t) bool {
@@ -406,7 +450,7 @@ fn load_keys_jwks(data: []u8, pool: [*c]core.ngx_pool_t, keys: *[MAX_KEYS]JwtKey
         }
 
         // Get alg
-        var alg: Algorithm = .HS256;
+        var alg: Algorithm = if (std.mem.eql(u8, kty_slice, "RSA")) .RS256 else .HS256;
         if (CJSON.query(entry, "$.alg")) |alg_node| {
             if (CJSON.stringValue(alg_node)) |a| {
                 alg = algo_from_str(core.slicify(u8, a.data, a.len)) orelse .HS256;
@@ -435,8 +479,21 @@ fn load_keys_jwks(data: []u8, pool: [*c]core.ngx_pool_t, keys: *[MAX_KEYS]JwtKey
                 }
             }
         } else if (std.mem.eql(u8, kty_slice, "RSA")) {
-            // RSA key: for now skip (needs BN_bin2bn + RSA_new)
-            // TODO: implement when RSA construction bindings are available
+            const n_node = CJSON.query(entry, "$.n") orelse continue;
+            const e_node = CJSON.query(entry, "$.e") orelse continue;
+            const n_val = CJSON.stringValue(n_node) orelse continue;
+            const e_val = CJSON.stringValue(e_node) orelse continue;
+            const pkey = load_pubkey_from_rsa_jwk(
+                core.slicify(u8, n_val.data, n_val.len),
+                core.slicify(u8, e_val.data, e_val.len),
+            ) orelse continue;
+            keys[count.*] = JwtKey{
+                .kid = kid_str,
+                .alg = alg,
+                .pkey = pkey,
+                .secret = ngx.string.ngx_null_str,
+            };
+            count.* += 1;
         }
     }
     return count.* > 0;
@@ -611,15 +668,9 @@ fn split_jwt(token: []const u8) ?struct { header_b64: []const u8, payload_b64: [
     };
 }
 
-// ── Access handler ────────────────────────────────────────────────────
+// ── Access handlers ───────────────────────────────────────────────────
 
-export fn ngx_http_jwt_access_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
-    const lccf = core.castPtr(
-        jwt_loc_conf,
-        conf.ngx_http_get_module_loc_conf(r, &ngx_http_jwt_module),
-    ) orelse return NGX_DECLINED;
-
-    if (lccf.*.enabled != 1) return NGX_DECLINED;
+fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf) ngx_int_t {
 
     // Extract token: prefer cookie/variable, fallback to Authorization header
     const token = if (lccf.*.token_var.len > 0) blk: {
@@ -711,7 +762,7 @@ export fn ngx_http_jwt_access_handler(r: [*c]ngx_http_request_t) callconv(.c) ng
         }
     }
 
-    // Store claims in request context for variable extraction
+    // Store claims and header values in request context for variable extraction
     const rctx = http.ngz_http_get_module_ctx(jwt_ctx, r, &ngx_http_jwt_module) catch return NGX_HTTP_UNAUTHORIZED;
     if (rctx.*.lccf == core.nullptr(jwt_loc_conf)) {
         rctx.*.lccf = lccf;
@@ -724,6 +775,11 @@ export fn ngx_http_jwt_access_handler(r: [*c]ngx_http_request_t) callconv(.c) ng
         if (lccf.*.claim_vars_count > 0) {
             populate_claims(rctx, payload[0..payload_len], lccf, r.*.pool);
         }
+        if (lccf.*.header_vars_count > 0) {
+            var header_json_buf: [1024]u8 = undefined;
+            const header_json_len = base64url_decode(parts.header_b64, &header_json_buf) orelse return NGX_HTTP_UNAUTHORIZED;
+            populate_headers(rctx, header_json_buf[0..header_json_len], lccf, r.*.pool);
+        }
     }
 
     // Revocation check
@@ -732,6 +788,32 @@ export fn ngx_http_jwt_access_handler(r: [*c]ngx_http_request_t) callconv(.c) ng
     }
 
     return NGX_OK;
+}
+
+export fn ngx_http_jwt_preaccess_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    const lccf = core.castPtr(
+        jwt_loc_conf,
+        conf.ngx_http_get_module_loc_conf(r, &ngx_http_jwt_module),
+    ) orelse return NGX_DECLINED;
+
+    if (lccf.*.enabled != 1) return NGX_DECLINED;
+    const phase_is_preaccess = lccf.*.phase != conf.NGX_CONF_UNSET_UINT and lccf.*.phase == 1;
+    if (!phase_is_preaccess) return NGX_DECLINED;
+
+    return jwt_validate_phase_request(r, lccf);
+}
+
+export fn ngx_http_jwt_access_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    const lccf = core.castPtr(
+        jwt_loc_conf,
+        conf.ngx_http_get_module_loc_conf(r, &ngx_http_jwt_module),
+    ) orelse return NGX_DECLINED;
+
+    if (lccf.*.enabled != 1) return NGX_DECLINED;
+    const phase_is_preaccess = lccf.*.phase != conf.NGX_CONF_UNSET_UINT and lccf.*.phase == 1;
+    if (phase_is_preaccess) return NGX_DECLINED;
+
+    return jwt_validate_phase_request(r, lccf);
 }
 
 fn check_revocations(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf, header_b64: []const u8, payload_b64: []const u8) bool {
@@ -832,6 +914,14 @@ fn merge_jwt_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
             if (ch.claim_vars_count >= MAX_CLAIM_VARS) break;
             ch.claim_vars[ch.claim_vars_count] = p.claim_vars[i];
             ch.claim_vars_count += 1;
+        }
+    }
+
+    if (p.header_vars_count > 0) {
+        for (0..p.header_vars_count) |i| {
+            if (ch.header_vars_count >= MAX_CLAIM_VARS) break;
+            ch.header_vars[ch.header_vars_count] = p.header_vars[i];
+            ch.header_vars_count += 1;
         }
     }
 
@@ -989,14 +1079,22 @@ fn jwt_variable_nowtime(
     return NGX_OK;
 }
 
-fn find_claim_value(rctx: [*c]jwt_ctx, name: ngx_str_t) ?ngx_str_t {
+fn find_ctx_value(entries: []const jwt_claim_entry, name: ngx_str_t) ?ngx_str_t {
     const n = core.slicify(u8, name.data, name.len);
-    for (rctx.*.claim_values[0..rctx.*.claim_values_count]) |*cv| {
+    for (entries) |*cv| {
         if (std.mem.eql(u8, core.slicify(u8, cv.name.data, cv.name.len), n)) {
             return cv.value;
         }
     }
     return null;
+}
+
+fn find_claim_value(rctx: [*c]jwt_ctx, name: ngx_str_t) ?ngx_str_t {
+    return find_ctx_value(rctx.*.claim_values[0..rctx.*.claim_values_count], name);
+}
+
+fn find_header_value(rctx: [*c]jwt_ctx, name: ngx_str_t) ?ngx_str_t {
+    return find_ctx_value(rctx.*.header_values[0..rctx.*.header_values_count], name);
 }
 
 fn jwt_variable_claim(
@@ -1020,15 +1118,52 @@ fn jwt_variable_claim(
     return NGX_OK;
 }
 
+fn jwt_variable_header(
+    r: [*c]ngx_http_request_t,
+    v: [*c]http.ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    const name_ptr: [*c]ngx_str_t = @ptrFromInt(data);
+    const rctx = core.castPtr(jwt_ctx, r.*.ctx[ngx_http_jwt_module.ctx_index]) orelse {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    if (find_header_value(rctx, name_ptr.*)) |val| {
+        v.*.data = val.data;
+        v.*.flags.len = @intCast(val.len);
+        v.*.flags.valid = true;
+        v.*.flags.not_found = false;
+    } else {
+        v.*.flags.not_found = true;
+    }
+    return NGX_OK;
+}
+
 // ── Extract and store claim value from JSON payload ──────────────────
 
+fn build_query_path(name: []const u8, buf: []u8) ?[]const u8 {
+    if (name.len == 0) return null;
+    if (name[0] == '$') {
+        if (name.len > buf.len) return null;
+        @memcpy(buf[0..name.len], name);
+        return buf[0..name.len];
+    }
+    if (name[0] == '.' or name[0] == '[') {
+        if (name.len + 1 > buf.len) return null;
+        buf[0] = '$';
+        @memcpy(buf[1 .. 1 + name.len], name);
+        return buf[0 .. 1 + name.len];
+    }
+    if (name.len + 2 > buf.len) return null;
+    buf[0] = '$';
+    buf[1] = '.';
+    @memcpy(buf[2 .. 2 + name.len], name);
+    return buf[0 .. 2 + name.len];
+}
+
 fn extract_claim(json: [*c]cjson.cJSON, name: []const u8, pool: [*c]core.ngx_pool_t) ?ngx_str_t {
-    // Build query path ".name"
     var path_buf: [128]u8 = undefined;
-    if (name.len + 1 > path_buf.len) return null;
-    path_buf[0] = '.';
-    @memcpy(path_buf[1 .. 1 + name.len], name);
-    const path = path_buf[0 .. 1 + name.len];
+    const path = build_query_path(name, &path_buf) orelse return null;
 
     const node = CJSON.query(json, path) orelse return null;
 
@@ -1067,6 +1202,25 @@ fn extract_claim(json: [*c]cjson.cJSON, name: []const u8, pool: [*c]core.ngx_poo
     return null;
 }
 
+fn audience_node_matches(node: [*c]cjson.cJSON, expected: []const u8) bool {
+    if (CJSON.stringValue(node)) |aud| {
+        return std.mem.eql(u8, core.slicify(u8, aud.data, aud.len), expected);
+    }
+
+    if (CJSON.arrValue(node)) |aud_arr| {
+        var it = CJSON.Iterator.init(aud_arr);
+        while (it.next()) |item| {
+            if (CJSON.stringValue(item)) |aud| {
+                if (std.mem.eql(u8, core.slicify(u8, aud.data, aud.len), expected)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 fn populate_claims(rctx: [*c]jwt_ctx, payload_json: []const u8, lccf: [*c]jwt_loc_conf, pool: [*c]core.ngx_pool_t) void {
     var cj = CJSON.init(pool);
     const json = cj.decode(ngx_str_t{ .data = @constCast(payload_json.ptr), .len = payload_json.len }) catch return;
@@ -1083,6 +1237,25 @@ fn populate_claims(rctx: [*c]jwt_ctx, payload_json: []const u8, lccf: [*c]jwt_lo
             ce[idx].name = cv.name;
             ce[idx].value = val;
             rctx.*.claim_values_count += 1;
+        }
+    }
+}
+
+fn populate_headers(rctx: [*c]jwt_ctx, header_json: []const u8, lccf: [*c]jwt_loc_conf, pool: [*c]core.ngx_pool_t) void {
+    var cj = CJSON.init(pool);
+    const json = cj.decode(ngx_str_t{ .data = @constCast(header_json.ptr), .len = header_json.len }) catch return;
+    defer cj.free(json);
+
+    for (lccf.*.header_vars[0..lccf.*.header_vars_count]) |*hv| {
+        if (rctx.*.header_values_count >= MAX_CLAIM_VARS) break;
+        if (hv.name.data == null) continue;
+        const name = core.slicify(u8, hv.name.data, hv.name.len);
+        if (extract_claim(json, name, pool)) |val| {
+            const idx = rctx.*.header_values_count;
+            const he: [*]jwt_claim_entry = @ptrCast(&rctx.*.header_values);
+            he[idx].name = hv.name;
+            he[idx].value = val;
+            rctx.*.header_values_count += 1;
         }
     }
 }
@@ -1201,25 +1374,23 @@ fn ngx_conf_set_jwt_leeway(
 
 fn eval_require_rule(json: [*c]cjson.cJSON, rule: *const jwt_require_rule, pool: [*c]core.ngx_pool_t) bool {
     const name = core.slicify(u8, rule.name.data, rule.name.len);
-    // Build CJSON query path: simple names get ".name", nested already have '.'
     var path_buf: [256]u8 = undefined;
-    var path_len: usize = 0;
-    if (name.len > 0 and (name[0] == '.' or name[0] == '[')) {
-        // JQ-like path: just prepend '.'
-        if (1 + name.len > path_buf.len) return false;
-        path_buf[0] = '.';
-        @memcpy(path_buf[1 .. 1 + name.len], name);
-        path_len = 1 + name.len;
-    } else {
-        // Simple name: convert to ".name"
-        if (name.len + 1 > path_buf.len) return false;
-        path_buf[0] = '.';
-        @memcpy(path_buf[1 .. 1 + name.len], name);
-        path_len = 1 + name.len;
-    }
-    const claim_node = CJSON.query(json, path_buf[0..path_len]);
+    const path = build_query_path(name, &path_buf) orelse return false;
+    const claim_node = CJSON.query(json, path);
 
     const node = claim_node orelse return (rule.op == .neq); // missing claim: eq fails, neq passes
+
+    _ = pool;
+    const expected = core.slicify(u8, rule.value.data, rule.value.len);
+
+    if (std.mem.eql(u8, name, "aud")) {
+        const matched = audience_node_matches(node, expected);
+        return switch (rule.op) {
+            .eq => matched,
+            .neq => !matched,
+            else => false,
+        };
+    }
 
     // Get claim value as string
     var claim_val: [256]u8 = undefined;
@@ -1249,9 +1420,6 @@ fn eval_require_rule(json: [*c]cjson.cJSON, rule: *const jwt_require_rule, pool:
     } else {
         return (rule.op == .neq);
     }
-
-    _ = pool;
-    const expected = core.slicify(u8, rule.value.data, rule.value.len);
 
     switch (rule.op) {
         .eq => return std.mem.eql(u8, claim_slice, expected),
@@ -1348,7 +1516,7 @@ fn ngx_conf_set_jwt_header(
 ) callconv(.c) [*c]u8 {
     _ = cmd;
     if (core.castPtr(jwt_loc_conf, loc)) |lccf| {
-        if (lccf.*.claim_vars_count >= MAX_CLAIM_VARS) return conf.NGX_CONF_ERROR;
+        if (lccf.*.header_vars_count >= MAX_CLAIM_VARS) return conf.NGX_CONF_ERROR;
         var index: ngx_uint_t = 1;
         const var_name = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index) orelse return conf.NGX_CONF_ERROR;
         const hdr_name = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index) orelse return conf.NGX_CONF_ERROR;
@@ -1357,13 +1525,14 @@ fn ngx_conf_set_jwt_header(
         if (core.ngz_pcalloc_c(ngx_str_t, cf.*.pool)) |name_copy| {
             name_copy.* = hdr_name.*;
             if (http.ngx_http_add_variable(cf, &vn, http.NGX_HTTP_VAR_NOCACHEABLE)) |variable| {
-                variable.*.get_handler = jwt_variable_claim;
+                variable.*.get_handler = jwt_variable_header;
                 variable.*.data = @intFromPtr(name_copy);
             }
-            const cv: [*]jwt_claim_var = @ptrCast(&lccf.*.claim_vars);
-            const idx = lccf.*.claim_vars_count;
-            cv[idx].name = hdr_name.*;
-            lccf.*.claim_vars_count += 1;
+            const hv: [*]jwt_claim_var = @ptrCast(&lccf.*.header_vars);
+            const idx = lccf.*.header_vars_count;
+            hv[idx].name = hdr_name.*;
+            hv[idx].var_index = 0;
+            lccf.*.header_vars_count += 1;
         }
     }
     return conf.NGX_CONF_OK;
@@ -1429,6 +1598,27 @@ fn ngx_conf_set_jwt_issuer(
     return conf.NGX_CONF_OK;
 }
 
+fn ngx_conf_set_jwt_audience(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(jwt_loc_conf, loc)) |lccf| {
+        if (lccf.*.require_count >= MAX_REQUIRE_CLAIMS) return conf.NGX_CONF_ERROR;
+        var index: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index)) |arg| {
+            const rc: [*]jwt_require_rule = @ptrCast(&lccf.*.require_rules);
+            const idx = lccf.*.require_count;
+            rc[idx].name = ngx_string("aud");
+            rc[idx].op = .eq;
+            rc[idx].value = arg.*;
+            lccf.*.require_count += 1;
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
 // ── Directive: jwt_revocation_list_sub ────────────────────────────────
 
 fn load_revocation_list(cf: [*c]ngx_conf_t, file_path: ngx_str_t, values: *[MAX_KEYS]ngx_str_t, count: *ngx_uint_t) void {
@@ -1444,9 +1634,9 @@ fn load_revocation_list(cf: [*c]ngx_conf_t, file_path: ngx_str_t, values: *[MAX_
     var it = CJSON.Iterator.init(root);
     while (it.next()) |val_node| {
         if (count.* >= MAX_KEYS) break;
-        if (val_node.*.string != null) {
+        if (CJSON.stringValue(val_node)) |value| {
             const v: [*]ngx_str_t = @ptrCast(values);
-            v[count.*] = ngx_str_t{ .data = val_node.*.string, .len = ngx.string.strlen(val_node.*.string) };
+            v[count.*] = value;
             count.* += 1;
         }
     }
@@ -1484,6 +1674,17 @@ fn ngx_conf_set_revocation_kid(
     return conf.NGX_CONF_OK;
 }
 
+fn ngx_conf_set_jwt_key_request(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    _ = loc;
+    log.ngz_log_error(log.NGX_LOG_EMERG, cf.*.log, 0, "jwt_key_request is not implemented yet; use jwt_key_file for local key material", .{});
+    return conf.NGX_CONF_ERROR;
+}
+
 // ── Postconfiguration ──────────────────────────────────────────────────
 
 fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
@@ -1497,14 +1698,19 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         v.*.get_handler = jwt_variable_nowtime;
     }
 
-    // Register handler in configured phase (default: access)
-    // But phase is per-location — use access phase for all, check phase in handler
+    // Register both preaccess and access handlers; runtime location config decides which one runs.
     const cmcf = core.castPtr(
         http.ngx_http_core_main_conf_t,
         conf.ngx_http_conf_get_module_main_conf(cf, &ngx_http_core_module),
     ) orelse return NGX_ERROR;
 
     var handlers = NArray(http.ngx_http_handler_pt).init0(
+        &cmcf[0].phases[NGX_HTTP_PREACCESS_PHASE].handlers,
+    );
+    const pre_h = handlers.append() catch return NGX_ERROR;
+    pre_h.* = ngx_http_jwt_preaccess_handler;
+
+    handlers = NArray(http.ngx_http_handler_pt).init0(
         &cmcf[0].phases[http.NGX_HTTP_ACCESS_PHASE].handlers,
     );
     const h = handlers.append() catch return NGX_ERROR;
@@ -1606,6 +1812,14 @@ export const ngx_http_jwt_commands = [_]ngx_command_t{
         .post = null,
     },
     ngx_command_t{
+        .name = ngx_string("jwt_audience"),
+        .type = conf.NGX_HTTP_MAIN_CONF | conf.NGX_HTTP_SRV_CONF | conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = ngx_conf_set_jwt_audience,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
         .name = ngx_string("jwt_header"),
         .type = conf.NGX_HTTP_MAIN_CONF | conf.NGX_HTTP_SRV_CONF | conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE2,
         .set = ngx_conf_set_jwt_header,
@@ -1640,7 +1854,7 @@ export const ngx_http_jwt_commands = [_]ngx_command_t{
     ngx_command_t{
         .name = ngx_string("jwt_key_request"),
         .type = conf.NGX_HTTP_MAIN_CONF | conf.NGX_HTTP_SRV_CONF | conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE12,
-        .set = ngx_conf_set_jwt_key_file,
+        .set = ngx_conf_set_jwt_key_request,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,
