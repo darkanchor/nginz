@@ -2210,9 +2210,15 @@ test "base64url_decode: output buffer too small returns null" {
     try expect(base64url_decode("SGVsbG8", &out) == null);
 }
 
-test "base64url_decode: max buffer overflow" {
+test "base64url_decode: large input fits when output buffer is sufficient" {
+    // 5000 'A' chars decode to 3750 bytes; no artificial input-size limit
     var out: [4096]u8 = undefined;
-    // 5000 'A' characters → input too large for temp buffer
+    const big: [5000]u8 = [_]u8{'A'} ** 5000;
+    try expect(base64url_decode(&big, &out) != null);
+}
+
+test "base64url_decode: large input rejected when output buffer is too small" {
+    var out: [16]u8 = undefined;
     const big: [5000]u8 = [_]u8{'A'} ** 5000;
     try expect(base64url_decode(&big, &out) == null);
 }
