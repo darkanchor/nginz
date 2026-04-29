@@ -378,6 +378,55 @@ fn find_key_by_kid_all(lccf: [*c]jwt_loc_conf, rctx: *jwt_ctx, kid: []const u8) 
     return null;
 }
 
+fn key_matches_kid(key: *const JwtKey, kid: []const u8) bool {
+    if (key.kid.len == 0 or key.kid.data == null) return false;
+    return std.mem.eql(u8, core.slicify(u8, key.kid.data, key.kid.len), kid);
+}
+
+fn verify_jwt_with_key(
+    alg: Algorithm,
+    sig_info: JwtSigInfo,
+    header_payload: []const u8,
+    signature: []const u8,
+    key: *const JwtKey,
+) bool {
+    if (sig_info.is_rsa != (key.pkey != null)) return false;
+
+    if (sig_info.is_rsa) {
+        if (key.pkey == null) return false;
+        if (alg == .EdDSA) {
+            return rsa_verify(header_payload, signature, key.pkey, null);
+        }
+        if (alg == .PS256 or alg == .PS384 or alg == .PS512) {
+            return rsa_pss_verify(header_payload, signature, key.pkey, sig_info.md.?);
+        }
+        return rsa_verify(header_payload, signature, key.pkey, sig_info.md.?);
+    }
+
+    const secret = core.slicify(u8, key.secret.data, key.secret.len);
+    return hmac_verify(header_payload, signature, secret, hmac_md_for(alg), sig_info.sig_len);
+}
+
+fn try_verify_key_slice(
+    keys: []const JwtKey,
+    kid: ?[]const u8,
+    matching_pass: bool,
+    alg: Algorithm,
+    sig_info: JwtSigInfo,
+    header_payload: []const u8,
+    signature: []const u8,
+) bool {
+    for (keys) |*key| {
+        const matches = if (kid) |k| key_matches_kid(key, k) else false;
+        if (kid != null) {
+            if (matching_pass and !matches) continue;
+            if (!matching_pass and matches) continue;
+        }
+        if (verify_jwt_with_key(alg, sig_info, header_payload, signature, key)) return true;
+    }
+    return false;
+}
+
 // ── Load PEM public key ───────────────────────────────────────────────
 
 fn load_pubkey_from_pem(pem: []const u8) ?*EVP_PKEY {
@@ -590,35 +639,17 @@ fn validate_jwt_signature(token: []const u8, lccf: [*c]jwt_loc_conf, rctx: ?*jwt
     const alg_str = CJSON.stringValue(alg_node) orelse return false;
     const alg = algo_from_str(core.slicify(u8, alg_str.data, alg_str.len)) orelse return false;
 
-    // Select key: try kid match first (search both lccf and ctx), fall back to first key
-    var key: ?*JwtKey = null;
     const total_keys = lccf.*.keys_count + (if (rctx) |rx| rx.request_keys_count else 0);
+    if (total_keys == 0) return false;
+
+    var kid_slice_opt: ?[]const u8 = null;
     if (CJSON.query(header, "$.kid")) |kid_node| {
         if (CJSON.stringValue(kid_node)) |kid_val| {
-            const kid_slice = core.slicify(u8, kid_val.data, kid_val.len);
-            if (rctx) |rx| {
-                key = find_key_by_kid_all(lccf, rx, kid_slice);
-            } else {
-                key = find_key_by_kid(lccf, kid_slice);
-            }
+            kid_slice_opt = core.slicify(u8, kid_val.data, kid_val.len);
         }
     }
-    if (key == null and total_keys > 0) {
-        // Fall back to first local key, then first subrequest-loaded key
-        if (lccf.*.keys_count > 0) {
-            key = @as(?*JwtKey, @ptrCast(&lccf.*.keys[0]));
-        } else if (rctx) |rx| {
-            if (rx.request_keys_count > 0) {
-                key = &rx.request_keys[0];
-            }
-        }
-    }
-    if (key == null) return false;
 
     const sig_info = algo_info(alg);
-
-    // Verify algorithm type matches key type (RSA key → RSA alg, HMAC key → HMAC alg)
-    if (sig_info.is_rsa != (key.?.pkey != null)) return false;
     const header_payload = token[0 .. first_dot + 1 + second_dot];
     const signature_b64 = rest[second_dot + 1 ..];
 
@@ -626,22 +657,26 @@ fn validate_jwt_signature(token: []const u8, lccf: [*c]jwt_loc_conf, rctx: ?*jwt
     var signature: [512]u8 = undefined;
     const sig_len = base64url_decode(signature_b64, &signature) orelse return false;
 
-    // Dispatch to verifier
-    if (sig_info.is_rsa) {
-        if (key.?.pkey == null) return false;
-        // EdDSA: EVP_DigestVerify with NULL md handles EdDSA natively
-        if (alg == .EdDSA) {
-            return rsa_verify(header_payload, signature[0..sig_len], key.?.pkey, null);
+    const signature_slice = signature[0..sig_len];
+
+    if (kid_slice_opt) |kid| {
+        if (try_verify_key_slice(lccf.*.keys[0..lccf.*.keys_count], kid, true, alg, sig_info, header_payload, signature_slice)) return true;
+        if (rctx) |rx| {
+            if (try_verify_key_slice(rx.request_keys[0..rx.request_keys_count], kid, true, alg, sig_info, header_payload, signature_slice)) return true;
         }
-        // RSA-PSS: need PSS padding setup
-        if (alg == .PS256 or alg == .PS384 or alg == .PS512) {
-            return rsa_pss_verify(header_payload, signature[0..sig_len], key.?.pkey, sig_info.md.?);
+
+        if (try_verify_key_slice(lccf.*.keys[0..lccf.*.keys_count], kid, false, alg, sig_info, header_payload, signature_slice)) return true;
+        if (rctx) |rx| {
+            if (try_verify_key_slice(rx.request_keys[0..rx.request_keys_count], kid, false, alg, sig_info, header_payload, signature_slice)) return true;
         }
-        return rsa_verify(header_payload, signature[0..sig_len], key.?.pkey, sig_info.md.?);
-    } else {
-        const secret = core.slicify(u8, key.?.secret.data, key.?.secret.len);
-        return hmac_verify(header_payload, signature[0..sig_len], secret, hmac_md_for(alg), sig_info.sig_len);
+        return false;
     }
+
+    if (try_verify_key_slice(lccf.*.keys[0..lccf.*.keys_count], null, false, alg, sig_info, header_payload, signature_slice)) return true;
+    if (rctx) |rx| {
+        if (try_verify_key_slice(rx.request_keys[0..rx.request_keys_count], null, false, alg, sig_info, header_payload, signature_slice)) return true;
+    }
+    return false;
 }
 
 // ── Legacy HMAC validation (backwards compat with jwt_secret) ────────
@@ -749,13 +784,26 @@ fn jwt_key_request_completion(
             const body_len: usize = @intCast(@intFromPtr(buf.*.last) - @intFromPtr(buf.*.pos));
             const body = buf.*.pos[0..body_len];
             if (body.len > 0) {
-                if (jwks) {
-                    _ = load_keys_jwks(body, sr.*.pool, &ctx.request_keys, &ctx.request_keys_count);
-                } else {
-                    _ = load_keys_keyval(body, sr.*.pool, &ctx.request_keys, &ctx.request_keys_count);
+                const ok = if (jwks)
+                    load_keys_jwks(body, sr.*.pool, &ctx.request_keys, &ctx.request_keys_count)
+                else
+                    load_keys_keyval(body, sr.*.pool, &ctx.request_keys, &ctx.request_keys_count);
+
+                if (!ok) {
+                    ctx.reject_request = 1;
+                    ctx.status = NGX_HTTP_UNAUTHORIZED;
                 }
+            } else {
+                ctx.reject_request = 1;
+                ctx.status = NGX_HTTP_UNAUTHORIZED;
             }
+        } else {
+            ctx.reject_request = 1;
+            ctx.status = NGX_HTTP_UNAUTHORIZED;
         }
+    } else {
+        ctx.reject_request = 1;
+        ctx.status = NGX_HTTP_UNAUTHORIZED;
     }
 
     ctx.done += 1;
@@ -1048,10 +1096,13 @@ fn merge_jwt_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     if (ch.token_var.len == 0) ch.token_var = p.token_var;
     if (ch.phase == conf.NGX_CONF_UNSET_UINT) ch.phase = p.phase;
 
-    // key_requests array
-    if (ch.key_requests_count == 0 and p.key_requests_count > 0) {
-        @memcpy(ch.key_requests[0..p.key_requests_count], p.key_requests[0..p.key_requests_count]);
-        ch.key_requests_count = p.key_requests_count;
+    // key_requests array: child scope entries stay first, inherited parent entries append after
+    if (p.key_requests_count > 0) {
+        for (0..p.key_requests_count) |i| {
+            if (ch.key_requests_count >= MAX_KEYS) break;
+            ch.key_requests[ch.key_requests_count] = p.key_requests[i];
+            ch.key_requests_count += 1;
+        }
     }
 
     // keys array
