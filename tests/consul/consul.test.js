@@ -123,6 +123,13 @@ describe("consul module", () => {
 
       consulMock.setServiceHealth("api-service", "api-2", "passing");
     });
+
+    test("exposes healthy service count variable on service responses", async () => {
+      const res = await fetch(`${TEST_URL}/services/api-service`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-consul-service-healthy-count")).toBe("2");
+      expect(res.headers.get("x-consul-lookup-error")).toBeNull();
+    });
   });
 
   describe("KV store", () => {
@@ -156,6 +163,9 @@ describe("consul module", () => {
 
       const body = await res.json();
       expect(body.value).toBeNull();
+      expect(res.headers.get("x-consul-kv-found")).toBe("0");
+      expect(res.headers.get("x-consul-kv-value")).toBeNull();
+      expect(res.headers.get("x-consul-lookup-error")).toBeNull();
     });
 
     test("preserves empty string KV values instead of converting them to null", async () => {
@@ -164,6 +174,8 @@ describe("consul module", () => {
 
       const body = await res.json();
       expect(body.value).toBe("");
+      expect(res.headers.get("x-consul-kv-found")).toBe("1");
+      expect(res.headers.get("x-consul-kv-value")).toBeNull();
     });
 
     test("returns JSON-safe escaped KV values", async () => {
@@ -175,6 +187,26 @@ describe("consul module", () => {
 
       const body = JSON.parse(text);
       expect(body.value).toBe('{"mode":"safe","enabled":true}');
+    });
+
+    test("exposes KV hit variables on successful lookups", async () => {
+      const res = await fetch(`${TEST_URL}/config/timeout`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-consul-kv-found")).toBe("1");
+      expect(res.headers.get("x-consul-kv-value")).toBe("30");
+      expect(res.headers.get("x-consul-lookup-error")).toBeNull();
+    });
+
+    test("exposes lookup_error on upstream failure", async () => {
+      consulMock.setKVError("config/app/error", 500, '{"error":"boom"}');
+
+      const res = await fetch(`${TEST_URL}/config/error`);
+      expect(res.status).toBe(502);
+      expect(res.headers.get("x-consul-lookup-error")).toBe("consul_error");
+      expect(res.headers.get("x-consul-kv-found")).toBe("0");
+
+      const body = await res.json();
+      expect(body).toEqual({ error: "consul_error" });
     });
   });
 

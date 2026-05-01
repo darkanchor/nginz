@@ -186,6 +186,10 @@ describe("waf module", () => {
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("clean response");
+      expect(res.headers.get("x-waf-result")).toBe("allowed");
+      expect(res.headers.get("x-waf-score")).toBe("0");
+      expect(res.headers.get("x-waf-rule-id")).toBeNull();
+      expect(res.headers.get("x-waf-category")).toBeNull();
     });
   });
 
@@ -305,6 +309,8 @@ describe("waf module", () => {
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("detect response");
+      expect(res.headers.get("x-waf-result")).toBe("dryrun");
+      expect(res.headers.get("x-waf-category")).toBe("sqli");
     });
 
     test("XSS passes in detect mode", async () => {
@@ -467,6 +473,9 @@ describe("waf module", () => {
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
       expect(body.rule).toBe("rule");
+      expect(res.headers.get("x-waf-result")).toBe("denied");
+      expect(res.headers.get("x-waf-category")).toBe("rule");
+      expect(res.headers.get("x-waf-rule-id")).toBe("1001");
     });
 
     test("blocks based on REQUEST_URI rule from file", async () => {
@@ -492,6 +501,9 @@ describe("waf module", () => {
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("rules detect response");
+      expect(res.headers.get("x-waf-result")).toBe("dryrun");
+      expect(res.headers.get("x-waf-category")).toBe("rule");
+      expect(res.headers.get("x-waf-rule-id")).toBe("1001");
     });
 
     test("blocks based on REQUEST_HEADERS rule from file", async () => {
@@ -891,6 +903,17 @@ describe("waf module", () => {
       expect(secondRecoveryText).toContain("rules ban response");
       expect(secondRecoveryMs).toBeGreaterThan(firstRecoveryMs);
     }, 15000);
+  });
+
+  describe("observability variables", () => {
+    test("score-enabled rules expose accumulated score", async () => {
+      const res = await fetch(`${TEST_URL}/rules-score?token=score-subset-needle`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-waf-result")).toBe("dryrun");
+      expect(res.headers.get("x-waf-category")).toBe("rule");
+      expect(res.headers.get("x-waf-rule-id")).toBe("3002");
+      expect(Number(res.headers.get("x-waf-score"))).toBeGreaterThanOrEqual(1);
+    });
   });
 
   describe("configuration validation", () => {

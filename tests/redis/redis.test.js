@@ -91,6 +91,24 @@ describe("Redis GET Operations", () => {
     const body = await res.json();
     expect(body.value).toBe(rawValue);
   });
+
+  test("exposes GET hit variables", async () => {
+    const res = await fetch(`${TEST_URL}/vars/get-hit`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-redis-last-value")).toBe("hello-world");
+    expect(res.headers.get("x-redis-last-exists")).toBe("1");
+    expect(res.headers.get("x-redis-last-error")).toBeNull();
+    expect(res.headers.get("x-redis-connection-state")).toBe("connected");
+  });
+
+  test("exposes GET miss variables", async () => {
+    const res = await fetch(`${TEST_URL}/vars/get-miss`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-redis-last-value")).toBeNull();
+    expect(res.headers.get("x-redis-last-exists")).toBe("0");
+    expect(res.headers.get("x-redis-last-error")).toBeNull();
+    expect(res.headers.get("x-redis-connection-state")).toBe("connected");
+  });
 });
 
 describe("Redis SET Operations", () => {
@@ -225,7 +243,7 @@ describe("Redis INCR Operations", () => {
   test("returns redis_error for non-numeric INCR target", async () => {
     redisMock.setValue("incr/not-a-number", "abc");
 
-    const res = await fetch(`${TEST_URL}/incr/not-a-number`, {
+    const res = await fetch(`${TEST_URL}/vars/incr-error`, {
       method: "POST",
     });
     expect(res.status).toBe(500);
@@ -233,6 +251,9 @@ describe("Redis INCR Operations", () => {
 
     const body = await res.json();
     expect(body).toEqual({ error: "redis_error" });
+    expect(res.headers.get("x-redis-last-error")).toBe("redis_error");
+    expect(res.headers.get("x-redis-connection-state")).toBe("degraded");
+    expect(res.headers.get("x-redis-last-exists")).toBe("0");
   });
 });
 
@@ -649,6 +670,14 @@ describe("Redis Error Handling", () => {
       method: "POST",
     });
     expect(res.status).toBe(405);
+  });
+
+  test("exposes connection failure variables when upstream is unavailable", async () => {
+    const res = await fetch(`${TEST_URL}/vars/down/missing-upstream`);
+    expect(res.status).toBe(502);
+    expect(res.headers.get("x-redis-last-error")).toBe("connection_failed");
+    expect(res.headers.get("x-redis-connection-state")).toBe("error");
+    expect(res.headers.get("x-redis-last-value")).toBeNull();
   });
 });
 

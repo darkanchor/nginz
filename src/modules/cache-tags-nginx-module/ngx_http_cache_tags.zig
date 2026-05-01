@@ -37,6 +37,15 @@ const cache_tags_loc_conf = extern struct {
     purge_enabled: ngx_flag_t,
 };
 
+const cache_tags_ctx = extern struct {
+    last_purged: ngx_uint_t,
+    last_tag: ngx_str_t,
+    last_error: ngx_str_t,
+    purge_recorded: ngx_flag_t,
+    tag_recorded: ngx_flag_t,
+    error_recorded: ngx_flag_t,
+};
+
 const CACHE_TAGS_ZONE_SIZE: usize = 8 * 1024 * 1024;
 
 // Per-worker storage for tag → URI mappings
@@ -66,6 +75,12 @@ var ngx_http_cache_tags_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_sh
 // Default header name
 const default_tag_header = ngx_string("Cache-Tag");
 
+const ngx_http_variable_value_t = http.ngx_http_variable_value_t;
+
+const CACHE_TAGS_VAR_LAST_PURGED: core.uintptr_t = 0;
+const CACHE_TAGS_VAR_LAST_TAG: core.uintptr_t = 1;
+const CACHE_TAGS_VAR_LAST_ERROR: core.uintptr_t = 2;
+
 fn getTagStore() ?[*c]cache_tags_store {
     if (ngx_http_cache_tags_zone == core.nullptr(core.ngx_shm_zone_t)) return null;
     return core.castPtr(cache_tags_store, ngx_http_cache_tags_zone.*.data);
@@ -77,6 +92,95 @@ fn getTagShpool() ?[*c]core.ngx_slab_pool_t {
         return null;
     }
     return core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr);
+}
+
+fn setCtx(r: [*c]ngx_http_request_t) ?*cache_tags_ctx {
+    if (core.castPtr(cache_tags_ctx, r.*.ctx[ngx_http_cache_tags_filter_module.ctx_index])) |existing| {
+        return existing;
+    }
+
+    const ctx = core.ngz_pcalloc_c(cache_tags_ctx, r.*.pool) orelse return null;
+    r.*.ctx[ngx_http_cache_tags_filter_module.ctx_index] = ctx;
+    return ctx;
+}
+
+fn setCtxTag(r: [*c]ngx_http_request_t, tag: []const u8) void {
+    const ctx = setCtx(r) orelse return;
+    const data = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, tag.len)) orelse return;
+    @memcpy(core.slicify(u8, data, tag.len), tag);
+    ctx.*.last_tag = ngx_str_t{ .data = data, .len = tag.len };
+    ctx.*.tag_recorded = 1;
+}
+
+fn setCtxError(r: [*c]ngx_http_request_t, err_text: []const u8) void {
+    const ctx = setCtx(r) orelse return;
+    const data = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, err_text.len)) orelse return;
+    @memcpy(core.slicify(u8, data, err_text.len), err_text);
+    ctx.*.last_error = ngx_str_t{ .data = data, .len = err_text.len };
+    ctx.*.error_recorded = 1;
+}
+
+fn setCtxPurgeResult(r: [*c]ngx_http_request_t, tag: []const u8, purged: usize) void {
+    const ctx = setCtx(r) orelse return;
+    setCtxTag(r, tag);
+    ctx.*.last_purged = @intCast(purged);
+    ctx.*.purge_recorded = 1;
+}
+
+fn ngx_http_cache_tags_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    const ctx = core.castPtr(cache_tags_ctx, r.*.ctx[ngx_http_cache_tags_filter_module.ctx_index]) orelse {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+
+    switch (data) {
+        CACHE_TAGS_VAR_LAST_PURGED => {
+            if (ctx.*.purge_recorded != 1) {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            }
+            var num_buf: [24]u8 = undefined;
+            const slice = std.fmt.bufPrint(&num_buf, "{d}", .{ctx.*.last_purged}) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            v.*.data = copied.data;
+            v.*.flags.len = @intCast(copied.len);
+        },
+        CACHE_TAGS_VAR_LAST_TAG => {
+            if (ctx.*.tag_recorded != 1 or ctx.*.last_tag.data == null) {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            }
+            v.*.data = ctx.*.last_tag.data;
+            v.*.flags.len = @intCast(ctx.*.last_tag.len);
+        },
+        CACHE_TAGS_VAR_LAST_ERROR => {
+            if (ctx.*.error_recorded != 1 or ctx.*.last_error.data == null) {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            }
+            v.*.data = ctx.*.last_error.data;
+            v.*.flags.len = @intCast(ctx.*.last_error.len);
+        },
+        else => {
+            v.*.flags.not_found = true;
+            return NGX_OK;
+        },
+    }
+
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
 }
 
 fn ngx_http_cache_tags_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) callconv(.c) ngx_int_t {
@@ -263,6 +367,7 @@ export fn ngx_http_cache_tags_header_filter(r: [*c]ngx_http_request_t) callconv(
 export fn ngx_http_cache_tags_purge_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
     // Only allow PURGE or DELETE methods
     if (r.*.method != http.NGX_HTTP_DELETE and r.*.method != http.NGX_HTTP_GET) {
+        setCtxError(r, "method_not_allowed");
         return http.NGX_HTTP_NOT_ALLOWED;
     }
 
@@ -293,6 +398,7 @@ export fn ngx_http_cache_tags_purge_handler(r: [*c]ngx_http_request_t) callconv(
 
     if (tag_to_purge) |tag| {
         const purged = purgeByTag(store, tag);
+        setCtxPurgeResult(r, tag, purged);
         const result = std.fmt.bufPrint(&response_buf, "{{\"tag\":\"{s}\",\"purged\":{d}}}\n", .{ tag, purged }) catch {
             return NGX_ERROR;
         };
@@ -443,6 +549,18 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
         zone.*.init = ngx_http_cache_tags_zone_init;
         ngx_http_cache_tags_zone = zone;
+    }
+
+    var vs = [_]http.ngx_http_variable_t{
+        http.ngx_http_variable_t{ .name = ngx_string("cache_tags_last_purged"), .set_handler = null, .get_handler = ngx_http_cache_tags_variable, .data = CACHE_TAGS_VAR_LAST_PURGED, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("cache_tags_last_tag"), .set_handler = null, .get_handler = ngx_http_cache_tags_variable, .data = CACHE_TAGS_VAR_LAST_TAG, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("cache_tags_last_error"), .set_handler = null, .get_handler = ngx_http_cache_tags_variable, .data = CACHE_TAGS_VAR_LAST_ERROR, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+    };
+    for (&vs) |*v| {
+        if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
+            x.*.get_handler = v.get_handler;
+            x.*.data = v.data;
+        }
     }
 
     // Install header filter

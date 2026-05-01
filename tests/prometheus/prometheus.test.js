@@ -242,6 +242,53 @@ describe("prometheus module", () => {
     });
   });
 
+  describe("nginx variables", () => {
+    test("prometheus_requests_total tracks non-metrics traffic", async () => {
+      const before = await fetch(`${TEST_URL}/vars`);
+      expect(before.status).toBe(200);
+      const initialCount = Number(before.headers.get("x-prometheus-requests-total"));
+
+      await fetch(`${TEST_URL}/`);
+      await fetch(`${TEST_URL}/api`);
+      await fetch(`${TEST_URL}/notfound`);
+
+      const after = await fetch(`${TEST_URL}/vars`);
+      expect(after.status).toBe(200);
+      const nextCount = Number(after.headers.get("x-prometheus-requests-total"));
+
+      expect(nextCount).toBeGreaterThanOrEqual(initialCount + 4);
+    });
+
+    test("prometheus_error_rate is 0.000 before error traffic", async () => {
+      await stopNginz();
+      await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
+
+      const res = await fetch(`${TEST_URL}/vars`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-prometheus-error-rate")).toBe("0.000");
+    });
+
+    test("prometheus_error_rate reflects 4xx and 5xx responses", async () => {
+      await stopNginz();
+      await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
+
+      const before = await fetch(`${TEST_URL}/vars`);
+      const initialCount = Number(before.headers.get("x-prometheus-requests-total"));
+
+      await fetch(`${TEST_URL}/notfound`);
+      await fetch(`${TEST_URL}/error`);
+
+      const after = await fetch(`${TEST_URL}/vars`);
+      expect(after.status).toBe(200);
+
+      const total = Number(after.headers.get("x-prometheus-requests-total"));
+      const expected = (2 / total).toFixed(3);
+
+      expect(total).toBeGreaterThanOrEqual(initialCount + 3);
+      expect(after.headers.get("x-prometheus-error-rate")).toBe(expected);
+    });
+  });
+
   describe("Prometheus format compliance", () => {
     test("HELP lines start with # HELP", async () => {
       const res = await fetch(`${TEST_URL}/metrics`);

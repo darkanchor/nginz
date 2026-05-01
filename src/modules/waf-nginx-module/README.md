@@ -433,6 +433,7 @@ The next reputation-model step remains intentionally deferred. A first attempt a
 - [x] `waf_rules_file` now applies a small explicit transformation subset via `t:none`, `t:lowercase`, `t:urlDecode`, and `t:urlDecodeUni`.
 - [x] `REQUEST_BODY:name` selectors now cover form-encoded fields, nested JSON selector paths, and multipart form-data fields via dedicated `body.rules` coverage.
 - [x] Shared-memory reputation now also supports score-based banning via `waf_score_threshold` and `waf_score_decay_window`, with Bun coverage for thresholding and quiet-period decay.
+- [x] Variable integration coverage now verifies `$waf_result`, `$waf_rule_id`, `$waf_score`, and `$waf_category` across allowed, detect-mode, rule-match, and score-enabled requests.
 - [x] Body-phase blocking now preserves clean request lifecycle behavior for blocked form, nested JSON, multipart, and libinjection-backed body matches instead of leaking preread body bytes into later request parsing.
 - [x] Static IP allow/deny remains intentionally delegated to nginx's built-in access controls rather than being reimplemented in the WAF module.
 - [x] No additional documentation gaps were identified in this audit pass.

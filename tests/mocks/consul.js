@@ -10,6 +10,7 @@ export class ConsulMock {
     this.services = new Map(); // service_name -> [instances]
     this.kv = new Map(); // key -> value
     this.health = new Map(); // service_name -> health status
+    this.kvErrors = new Map(); // key -> { status, body, headers }
     this.requestLog = [];
   }
 
@@ -29,6 +30,7 @@ export class ConsulMock {
     this.services.clear();
     this.kv.clear();
     this.health.clear();
+    this.kvErrors.clear();
     this.requestLog = [];
   }
 
@@ -156,6 +158,14 @@ export class ConsulMock {
       const key = kvMatch[1];
       const recurse = url.searchParams.has("recurse");
       const keys = url.searchParams.has("keys");
+
+       const kvError = this.kvErrors.get(key);
+       if (kvError) {
+        return new Response(kvError.body ?? "", {
+          status: kvError.status,
+          headers: kvError.headers || { "Content-Type": "application/json" },
+        });
+      }
 
       if (keys) {
         const matchingKeys = [...this.kv.keys()].filter((k) =>
@@ -289,6 +299,11 @@ export class ConsulMock {
 
   setKV(key, value) {
     this.kv.set(key, value);
+    this.kvErrors.delete(key);
+  }
+
+  setKVError(key, status, body = "", headers = { "Content-Type": "application/json" }) {
+    this.kvErrors.set(key, { status, body, headers });
   }
 
   getKV(key) {

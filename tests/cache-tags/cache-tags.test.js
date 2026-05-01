@@ -72,6 +72,9 @@ describe("cache-tags module", () => {
     const res = await fetch(`${TEST_URL}/api/test`);
     expect(res.status).toBe(200);
     expect(res.headers.get("Cache-Tag")).toBe("product,api");
+    expect(res.headers.get("x-cache-tags-last-purged")).toBeNull();
+    expect(res.headers.get("x-cache-tags-last-tag")).toBeNull();
+    expect(res.headers.get("x-cache-tags-last-error")).toBeNull();
   });
 
   describe("/cache/purge endpoint", () => {
@@ -87,6 +90,9 @@ describe("cache-tags module", () => {
       const json = await res.json();
       expect(json).toHaveProperty("tags");
       expect(Array.isArray(json.tags)).toBe(true);
+      expect(res.headers.get("x-cache-tags-last-purged")).toBeNull();
+      expect(res.headers.get("x-cache-tags-last-tag")).toBeNull();
+      expect(res.headers.get("x-cache-tags-last-error")).toBeNull();
     });
 
     test("allows DELETE requests for purge operations", async () => {
@@ -100,6 +106,9 @@ describe("cache-tags module", () => {
       const json = await res.json();
       expect(json.tag).toBe("api");
       expect(json.purged).toBeGreaterThanOrEqual(1);
+      expect(res.headers.get("x-cache-tags-last-tag")).toBe("api");
+      expect(Number(res.headers.get("x-cache-tags-last-purged"))).toBeGreaterThanOrEqual(1);
+      expect(res.headers.get("x-cache-tags-last-error")).toBeNull();
     });
 
     test("rejects POST requests", async () => {
@@ -108,6 +117,9 @@ describe("cache-tags module", () => {
       });
 
       expect(res.status).toBe(405);
+      expect(res.headers.get("x-cache-tags-last-error")).toBe("method_not_allowed");
+      expect(res.headers.get("x-cache-tags-last-tag")).toBeNull();
+      expect(res.headers.get("x-cache-tags-last-purged")).toBeNull();
     });
   });
 
@@ -205,6 +217,9 @@ describe("cache-tags module", () => {
       const json = await res.json();
       expect(json.tag).toBe("nonexistent");
       expect(json.purged).toBe(0);
+      expect(res.headers.get("x-cache-tags-last-tag")).toBe("nonexistent");
+      expect(res.headers.get("x-cache-tags-last-purged")).toBe("0");
+      expect(res.headers.get("x-cache-tags-last-error")).toBeNull();
     });
 
     test("purge uses exact tag matching only", async () => {

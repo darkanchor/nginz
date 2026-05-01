@@ -60,6 +60,11 @@ const prometheus_loc_conf = extern struct {
     metrics_endpoint: ngx_flag_t,
 };
 
+const ngx_http_variable_value_t = http.ngx_http_variable_value_t;
+
+const PROMETHEUS_VAR_REQUESTS_TOTAL: core.uintptr_t = 0;
+const PROMETHEUS_VAR_ERROR_RATE: core.uintptr_t = 1;
+
 fn getMetricsStore() ?[*c]prometheus_metrics_store {
     if (ngx_http_prometheus_zone == core.nullptr(core.ngx_shm_zone_t)) return null;
     return core.castPtr(prometheus_metrics_store, ngx_http_prometheus_zone.*.data);
@@ -71,6 +76,73 @@ fn getMetricsShpool() ?[*c]core.ngx_slab_pool_t {
         return null;
     }
     return core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr);
+}
+
+fn snapshotMetrics() ?prometheus_metrics_store {
+    const store = getMetricsStore() orelse return null;
+    const shpool = getMetricsShpool() orelse return null;
+
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+    const snapshot = store.*;
+    shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    return snapshot;
+}
+
+fn ngx_http_prometheus_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    const snapshot = snapshotMetrics() orelse {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+
+    switch (data) {
+        PROMETHEUS_VAR_REQUESTS_TOTAL => {
+            var num_buf: [24]u8 = undefined;
+            const slice = std.fmt.bufPrint(&num_buf, "{d}", .{snapshot.requests_total}) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            v.*.data = copied.data;
+            v.*.flags.len = @intCast(copied.len);
+        },
+        PROMETHEUS_VAR_ERROR_RATE => {
+            const error_count = snapshot.requests_4xx + snapshot.requests_5xx;
+            const scaled: u64 = if (snapshot.requests_total == 0)
+                0
+            else
+                @divTrunc(error_count * 1000, snapshot.requests_total);
+            const whole = @divTrunc(scaled, 1000);
+            const frac = @mod(scaled, 1000);
+
+            var rate_buf: [16]u8 = undefined;
+            const slice = std.fmt.bufPrint(&rate_buf, "{d}.{d:0>3}", .{ whole, frac }) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            v.*.data = copied.data;
+            v.*.flags.len = @intCast(copied.len);
+        },
+        else => {
+            v.*.flags.not_found = true;
+            return NGX_OK;
+        },
+    }
+
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
 }
 
 fn ngx_http_prometheus_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) callconv(.c) ngx_int_t {
@@ -378,6 +450,17 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
         zone.*.init = ngx_http_prometheus_zone_init;
         ngx_http_prometheus_zone = zone;
+    }
+
+    var vs = [_]http.ngx_http_variable_t{
+        http.ngx_http_variable_t{ .name = ngx_string("prometheus_requests_total"), .set_handler = null, .get_handler = ngx_http_prometheus_variable, .data = PROMETHEUS_VAR_REQUESTS_TOTAL, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("prometheus_error_rate"), .set_handler = null, .get_handler = ngx_http_prometheus_variable, .data = PROMETHEUS_VAR_ERROR_RATE, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+    };
+    for (&vs) |*v| {
+        if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
+            x.*.get_handler = v.get_handler;
+            x.*.data = v.data;
+        }
     }
 
     // Register log phase handler

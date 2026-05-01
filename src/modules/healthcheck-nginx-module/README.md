@@ -173,4 +173,5 @@ These variables let `nginz-njs` scripted modules compose health-aware routing an
 - [x] Audit date: 2026-04-24
 - [x] Bun integration coverage exists at `tests/healthcheck/`.
 - [x] README now matches the implemented shared-memory passive counters, shared readiness state, and module-global active HTTP probe behavior.
+- [x] Variable integration coverage now verifies readiness/liveness/backend probe variables in both healthy and unhealthy shared-state paths.
 - [x] Remaining limitations are documented without claiming unsupported upstream marking or per-target feature matrices.

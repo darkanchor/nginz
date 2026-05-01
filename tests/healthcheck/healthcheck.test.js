@@ -93,6 +93,18 @@ describe("healthcheck module", () => {
     expect(probe.getRequestsFor("/probe", "GET").length).toBeGreaterThan(0);
   });
 
+  test("health variables reflect healthy shared probe state", async () => {
+    await Bun.sleep(250);
+
+    const res = await fetch(`${TEST_URL}/health-vars`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-health-readiness")).toBe("1");
+    expect(res.headers.get("x-health-liveness")).toBe("1");
+    expect(res.headers.get("x-health-backend-healthy-count")).toBe("1");
+    expect(res.headers.get("x-health-backend-total-count")).toBe("1");
+    expect(res.headers.get("x-health-backend-failure-count")).toBe("0");
+  });
+
   test("health endpoints do not increment passive request or failure counters", async () => {
     const before = await getHealthSnapshot();
 
@@ -162,6 +174,19 @@ describe("healthcheck module", () => {
     expect(recoveredBody.probe_healthy).toBe(true);
     expect(recoveredBody.probe_total_successes).toBeGreaterThan(0);
     expect(recoveredBody.probe_consecutive_successes).toBeGreaterThanOrEqual(2);
+  });
+
+  test("health variables reflect unhealthy probe state", async () => {
+    probe.get("/probe", { status: 500, body: { status: "down" } });
+    await waitForStatus("/ready", 503);
+
+    const res = await fetch(`${TEST_URL}/health-vars`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-health-readiness")).toBe("0");
+    expect(res.headers.get("x-health-liveness")).toBe("1");
+    expect(res.headers.get("x-health-backend-healthy-count")).toBe("0");
+    expect(res.headers.get("x-health-backend-total-count")).toBe("1");
+    expect(Number(res.headers.get("x-health-backend-failure-count"))).toBeGreaterThan(0);
   });
 
   test("3xx probe responses are treated as healthy", async () => {

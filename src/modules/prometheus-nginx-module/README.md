@@ -97,17 +97,19 @@ scrape_configs:
     metrics_path: '/metrics'
 ```
 
-### Nginx Variables (TODO)
+### Nginx Variables
 
-These variables are not yet implemented. They are listed here so future work can add them. Prometheus already has a strong scrape-oriented surface; these are lower priority than `healthcheck` or `waf` variables, but a few scalar reads could still be useful for inline policy decisions.
+These variables expose low-cost shared-memory Prometheus state to `nginz-njs` or config-level policy without scraping `/metrics`.
 
 | Variable | Values | Scripted consumers |
 |---|---|---|
 | `$prometheus_requests_total` | decimal | `metrics`, `workflow` — load-aware routing and response shaping |
 | `$prometheus_error_rate` | decimal (0.0–1.0) | `circuit_breaker_policy`, `security_gateway` — degraded-mode or challenge policy |
-| `$prometheus_active_connections` | decimal | `ratelimit_policy`, `workflow` — simple load-shedding signal |
 
-Implementation note: these would read directly from the shared-memory counters already maintained by the module, with no extra computation cost.
+- `$prometheus_requests_total` is the current shared request counter excluding `/metrics` self-scrapes.
+- `$prometheus_error_rate` is `(4xx + 5xx) / total_requests`, formatted to three decimal places. It returns `0.000` when no requests have been counted yet.
+
+These variables read from the same shared-memory counters already maintained by the module, with no extra network or parsing cost.
 
 ### Limitations
 
@@ -118,6 +120,7 @@ Current implementation has these limitations:
 ### Future Enhancements
 
 - **Connection Metrics**: Active connections, accepted, handled
+- **Variable Surface Expansion**: add `$prometheus_active_connections` once the module has real connection-lifecycle bookkeeping rather than scrape-only counters
 - **Upstream Metrics**: Upstream response times, failures
 - **Custom Labels**: Add labels from nginx variables
 - **Configurable Buckets**: Custom histogram bucket boundaries
@@ -134,4 +137,5 @@ Current implementation has these limitations:
 - [x] Bun integration coverage now verifies HEAD handling on `/metrics`, self-scrape exclusion for both request totals and histogram counts, cumulative histogram buckets, and `+Inf` matching histogram count.
 - [x] Metrics are now stored in an nginx shared-memory zone so `/metrics` aggregates traffic across multiple workers.
 - [x] Bun integration coverage now runs with `worker_processes 2` and verifies cross-worker request aggregation.
+- [x] Nginx variable coverage now verifies `$prometheus_requests_total` and `$prometheus_error_rate` against live traffic.
 - [x] No additional documentation gaps were identified in this audit pass.

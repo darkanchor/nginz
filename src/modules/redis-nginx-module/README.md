@@ -334,4 +334,5 @@ bun test tests/redis/redis.container.test.js
 - [x] Audit date: 2026-04-10
 - [x] Bun integration coverage exists at `tests/redis/`.
 - [x] Gap recorded: this audit pass added Bun guardrails for JSON string escaping, invalid `INCR`/`EXPIRE` protocol errors, MGET query parsing with extra parameters, and the 16-key MGET limit.
+- [x] Variable integration coverage now verifies `$redis_last_exists`, `$redis_last_error`, and `$redis_connection_state`, plus safe `$redis_last_value` hit semantics, across hit/miss/error/failure paths.
 - [x] No additional documentation gaps were identified in this audit pass.
