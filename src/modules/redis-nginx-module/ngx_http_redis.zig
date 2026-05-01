@@ -82,6 +82,9 @@ const redis_request_ctx = extern struct {
     data: ngx_str_t, // Copied data from Redis response
     mget_count: ngx_uint_t, // For MGET: number of keys
     mget_keys: [16]ngx_str_t, // For MGET: array of keys (max 16)
+    last_exists: u8,
+    last_error: u8,
+    conn_failed: u8,
 };
 
 const redis_hide_headers = [_]ngx_str_t{
@@ -794,6 +797,7 @@ fn ngx_http_redis_upstream_process_header(
                     rctx.*.data_len = -1;
                     rctx.*.data = ngx.string.ngx_null_str;
                     rctx.*.state = .done;
+                    rctx.*.last_exists = 0;
                 } else {
                     // Check if we have all data: len bytes + \r\n
                     const data_start = p + 2; // skip \r\n
@@ -812,6 +816,7 @@ fn ngx_http_redis_upstream_process_header(
 
                     rctx.*.data_len = len;
                     rctx.*.state = .done;
+                    rctx.*.last_exists = 1;
                 }
 
                 // Build JSON response and replace buffer content
@@ -836,6 +841,7 @@ fn ngx_http_redis_upstream_process_header(
             },
             '-' => {
                 // Error response: -ERR message\r\n
+                rctx.*.last_error = 1;
                 rctx.*.state = .resp_error;
                 rctx.*.data_len = -1;
                 rctx.*.data = ngx.string.ngx_null_str;
@@ -863,6 +869,7 @@ fn ngx_http_redis_upstream_process_header(
                 rctx.*.data_len = 0;
                 rctx.*.data = ngx.string.ngx_null_str;
                 rctx.*.state = .done;
+                rctx.*.last_exists = 1;
 
                 // Build empty value JSON
                 if (build_json_response(rctx, r.*.pool)) |json| {
@@ -896,6 +903,7 @@ fn ngx_http_redis_upstream_process_header(
 
                 rctx.*.data_len = @intCast(int_len);
                 rctx.*.state = .done;
+                rctx.*.last_exists = 1;
 
                 if (build_json_response(rctx, r.*.pool)) |json| {
                     b.*.pos = json.data;
@@ -983,6 +991,7 @@ fn ngx_http_redis_upstream_process_header(
                 }
 
                 rctx.*.state = .done;
+                rctx.*.last_exists = 1;
 
                 // Build MGET JSON response
                 if (build_mget_json_response(&values, count, r.*.pool)) |json| {
@@ -1066,10 +1075,12 @@ fn ngx_http_redis_upstream_finalize_request(
     r: [*c]ngx_http_request_t,
     rc: ngx_int_t,
 ) callconv(.c) void {
-    // Upstream handles sending response through filter chain
-    // This callback is for cleanup only
-    _ = r;
     _ = rc;
+    if (core.castPtr(redis_request_ctx, r.*.ctx[ngx_http_redis_module.ctx_index])) |rctx| {
+        if (rctx.*.state != .done and rctx.*.state != .resp_error) {
+            rctx.*.conn_failed = 1;
+        }
+    }
 }
 
 fn create_upstream(
@@ -1351,9 +1362,91 @@ export fn ngx_http_redis_handler(
     return core.NGX_DONE;
 }
 
+const ngx_http_variable_value_t = http.ngx_http_variable_value_t;
+
+const REDIS_VAR_LAST_VALUE: core.uintptr_t = 0;
+const REDIS_VAR_LAST_EXISTS: core.uintptr_t = 1;
+const REDIS_VAR_LAST_ERROR: core.uintptr_t = 2;
+const REDIS_VAR_CONN_STATE: core.uintptr_t = 3;
+
+fn ngx_http_redis_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    const rctx = core.castPtr(redis_request_ctx, r.*.ctx[ngx_http_redis_module.ctx_index]) orelse {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+
+    switch (data) {
+        REDIS_VAR_LAST_VALUE => {
+            if (rctx.*.last_exists == 1 and rctx.*.data.len > 0) {
+                v.*.data = rctx.*.data.data;
+                v.*.flags.len = @intCast(rctx.*.data.len);
+            } else {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            }
+        },
+        REDIS_VAR_LAST_EXISTS => {
+            v.*.data = if (rctx.*.last_exists == 1) @constCast("1") else @constCast("0");
+            v.*.flags.len = 1;
+        },
+        REDIS_VAR_LAST_ERROR => {
+            if (rctx.*.last_error == 1) {
+                v.*.data = @constCast("redis_error");
+                v.*.flags.len = 11;
+            } else if (rctx.*.conn_failed == 1) {
+                v.*.data = @constCast("connection_failed");
+                v.*.flags.len = 17;
+            } else {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            }
+        },
+        REDIS_VAR_CONN_STATE => {
+            if (rctx.*.conn_failed == 1) {
+                v.*.data = @constCast("error");
+                v.*.flags.len = 5;
+            } else if (rctx.*.last_error == 1) {
+                v.*.data = @constCast("degraded");
+                v.*.flags.len = 8;
+            } else {
+                v.*.data = @constCast("connected");
+                v.*.flags.len = 9;
+            }
+        },
+        else => {
+            v.*.flags.not_found = true;
+            return NGX_OK;
+        },
+    }
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
+fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
+    var vs = [_]http.ngx_http_variable_t{
+        http.ngx_http_variable_t{ .name = ngx_string("redis_last_value"), .set_handler = null, .get_handler = ngx_http_redis_variable, .data = REDIS_VAR_LAST_VALUE, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("redis_last_exists"), .set_handler = null, .get_handler = ngx_http_redis_variable, .data = REDIS_VAR_LAST_EXISTS, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("redis_last_error"), .set_handler = null, .get_handler = ngx_http_redis_variable, .data = REDIS_VAR_LAST_ERROR, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("redis_connection_state"), .set_handler = null, .get_handler = ngx_http_redis_variable, .data = REDIS_VAR_CONN_STATE, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+    };
+    for (&vs) |*v| {
+        if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
+            x.*.get_handler = v.get_handler;
+            x.*.data = v.data;
+        }
+    }
+    return NGX_OK;
+}
+
 export const ngx_http_redis_module_ctx = ngx_http_module_t{
     .preconfiguration = null,
-    .postconfiguration = null,
+    .postconfiguration = postconfiguration,
     .create_main_conf = null,
     .init_main_conf = null,
     .create_srv_conf = null,

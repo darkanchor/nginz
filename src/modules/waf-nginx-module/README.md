@@ -284,6 +284,19 @@ This is intended as a small native reputation layer rather than a full anomaly-s
 
 Controls how quickly accumulated client score decays during quiet periods. Larger values keep score history longer; smaller values let clients recover more quickly after isolated hits.
 
+### Nginx Variables
+
+These variables are exposed per-request after the WAF access phase has run.
+
+| Variable | Values | Description |
+|---|---|---|
+| `$waf_result` | `allowed` / `denied` / `dryrun` | WAF outcome for this request. `dryrun` means a threat was detected in `waf_mode detect` but the request was not blocked. |
+| `$waf_rule_id` | decimal or not found | Numeric rule ID of the matched custom rule. Not found for built-in SQLi/XSS/ban matches (no rule ID). |
+| `$waf_score` | decimal | Current accumulated threat score for the client IP. `0` if score tracking is disabled or the IP has no recorded score. |
+| `$waf_category` | `sqli` / `xss` / `ban` / `rule` / not found | Category of the first detected threat. `rule` for custom file-driven rules. Not found if no threat was detected. |
+
+These variables let `nginz-njs` scripted modules compose unified security decisions, add observability, or shape denial responses without duplicating WAF logic.
+
 ### Practical policy note
 
 Static IP allow/deny policy should continue to use nginx's built-in access controls (`allow` / `deny`).

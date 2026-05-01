@@ -113,6 +113,7 @@ Access nginx APIs through the ngx namespace:
 - `ngx/pq.zig` - NEVER use it directly, likewise it is the libpq c bindings file, use its wrapper `ngx.pq` 
 - `ngz_modules.zig` For a filter module, make sure to position the module in between `ngx_http_userid_filter_module` and `ngx_http_headers_filter_module` of this file
 - Each module requires its own `README.md` documenting status, features, directives, usage examples, limitations, and future enhancements (see `prometheus-nginx-module/README.md` for reference)
+- Avoid using `buf` as a local variable name in module code — `const buf = ngx.buf;` is a top-level module alias in most modules, and a local `var buf` will shadow it and cause a compilation error
 
 ### Testing
 

@@ -62,6 +62,10 @@ const consul_request_ctx = extern struct {
     service_name: ngx_str_t,
     kv_key: ngx_str_t,
     response_data: ngx_str_t,
+    kv_value: ngx_str_t,
+    kv_found: u8,
+    service_healthy_count: ngx_uint_t,
+    lookup_error: u8,
 };
 
 const consul_hide_headers = [_]ngx_str_t{
@@ -395,7 +399,7 @@ fn ngx_http_consul_upstream_create_request(
 }
 
 // Parse Consul service response and build simplified JSON
-fn build_services_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t) ?ngx_str_t {
+fn build_services_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t, healthy_count: *ngx_uint_t) ?ngx_str_t {
     var cj = CJSON.init(pool);
 
     const parsed = cj.decode(json_data) catch return null;
@@ -411,11 +415,13 @@ fn build_services_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t) ?ngx_str_
 
     var it = CJSON.Iterator.init(parsed);
     var first = true;
+    healthy_count.* = 0;
     while (it.next()) |entry| {
         // Each entry has "Service" object with ID, Address, Port, Tags
         const svc = cjson.cJSON_GetObjectItem(entry, "Service");
         if (svc == core.nullptr(cjson.cJSON)) continue;
 
+        healthy_count.* += 1;
         if (!first) {
             out_buf[out_len] = ',';
             out_len += 1;
@@ -517,7 +523,7 @@ fn build_services_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t) ?ngx_str_
 }
 
 // Parse Consul KV response and build JSON
-fn build_kv_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t) ?ngx_str_t {
+fn build_kv_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t, rctx: [*c]consul_request_ctx) ?ngx_str_t {
     var cj = CJSON.init(pool);
 
     const parsed = cj.decode(json_data) catch return null;
@@ -544,10 +550,20 @@ fn build_kv_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t) ?ngx_str_t {
                         if (!append_json_string(&out_buf, &out_len, decoded[0..decoded_len])) {
                             return null;
                         }
+                        rctx.*.kv_found = 1;
+                        if (core.castPtr(u8, core.ngx_pnalloc(pool, decoded_len))) |vc| {
+                            @memcpy(core.slicify(u8, vc, decoded_len), decoded[0..decoded_len]);
+                            rctx.*.kv_value = ngx_str_t{ .data = vc, .len = decoded_len };
+                        }
                     } else |_| {
                         const raw_len = @min(value_slice.len, 1024);
                         if (!append_json_string(&out_buf, &out_len, value_slice[0..raw_len])) {
                             return null;
+                        }
+                        rctx.*.kv_found = 1;
+                        if (core.castPtr(u8, core.ngx_pnalloc(pool, raw_len))) |vc| {
+                            @memcpy(core.slicify(u8, vc, raw_len), value_slice[0..raw_len]);
+                            rctx.*.kv_value = ngx_str_t{ .data = vc, .len = raw_len };
                         }
                     }
 
@@ -672,6 +688,7 @@ fn ngx_http_consul_upstream_process_header(
         // Handle based on status - 404 first since it may have empty body
         if (status == 404) {
             // Not found - return empty/null response
+            rctx.*.kv_found = 0;
             const not_found = if (rctx.*.query_type == .kv)
                 "{\"value\":null}"
             else
@@ -696,6 +713,7 @@ fn ngx_http_consul_upstream_process_header(
 
         if (status != 200) {
             // Error response
+            rctx.*.lookup_error = 1;
             const error_json = "{\"error\":\"consul_error\"}";
             if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, error_json.len))) |data| {
                 @memcpy(core.slicify(u8, data, error_json.len), error_json);
@@ -715,9 +733,14 @@ fn ngx_http_consul_upstream_process_header(
         }
 
         // Parse and transform JSON response
+        var svc_count: ngx_uint_t = 0;
         const json_response: ?ngx_str_t = switch (rctx.*.query_type) {
-            .services => build_services_response(rctx.*.response_data, r.*.pool),
-            .kv => build_kv_response(rctx.*.response_data, r.*.pool),
+            .services => blk: {
+                const r2 = build_services_response(rctx.*.response_data, r.*.pool, &svc_count);
+                rctx.*.service_healthy_count = svc_count;
+                break :blk r2;
+            },
+            .kv => build_kv_response(rctx.*.response_data, r.*.pool, rctx),
             .catalog => build_catalog_response(rctx.*.response_data, r.*.pool),
         };
 
@@ -734,6 +757,7 @@ fn ngx_http_consul_upstream_process_header(
             r.*.headers_out.content_type_lowcase = null;
         } else {
             // Parse error - return error
+            rctx.*.lookup_error = 1;
             const error_json = "{\"error\":\"parse_error\"}";
             if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, error_json.len))) |data| {
                 @memcpy(core.slicify(u8, data, error_json.len), error_json);
@@ -1050,9 +1074,89 @@ fn ngx_conf_set_consul_catalog(
     return conf.NGX_CONF_OK;
 }
 
+const ngx_http_variable_value_t = http.ngx_http_variable_value_t;
+
+const CONSUL_VAR_KV_VALUE: core.uintptr_t = 0;
+const CONSUL_VAR_KV_FOUND: core.uintptr_t = 1;
+const CONSUL_VAR_SVC_COUNT: core.uintptr_t = 2;
+const CONSUL_VAR_LOOKUP_ERROR: core.uintptr_t = 3;
+
+fn ngx_http_consul_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    const rctx = core.castPtr(consul_request_ctx, r.*.ctx[ngx_http_consul_module.ctx_index]) orelse {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+
+    switch (data) {
+        CONSUL_VAR_KV_VALUE => {
+            if (rctx.*.kv_found == 1 and rctx.*.kv_value.len > 0) {
+                v.*.data = rctx.*.kv_value.data;
+                v.*.flags.len = @intCast(rctx.*.kv_value.len);
+            } else {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            }
+        },
+        CONSUL_VAR_KV_FOUND => {
+            v.*.data = if (rctx.*.kv_found == 1) @constCast("1") else @constCast("0");
+            v.*.flags.len = 1;
+        },
+        CONSUL_VAR_SVC_COUNT => {
+            var num_buf: [24]u8 = undefined;
+            const slice = std.fmt.bufPrint(&num_buf, "{d}", .{rctx.*.service_healthy_count}) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            v.*.data = copied.data;
+            v.*.flags.len = @intCast(copied.len);
+        },
+        CONSUL_VAR_LOOKUP_ERROR => {
+            if (rctx.*.lookup_error == 1) {
+                v.*.data = @constCast("consul_error");
+                v.*.flags.len = 12;
+            } else {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            }
+        },
+        else => {
+            v.*.flags.not_found = true;
+            return NGX_OK;
+        },
+    }
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
+fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
+    var vs = [_]http.ngx_http_variable_t{
+        http.ngx_http_variable_t{ .name = ngx_string("consul_kv_value"), .set_handler = null, .get_handler = ngx_http_consul_variable, .data = CONSUL_VAR_KV_VALUE, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("consul_kv_found"), .set_handler = null, .get_handler = ngx_http_consul_variable, .data = CONSUL_VAR_KV_FOUND, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("consul_service_healthy_count"), .set_handler = null, .get_handler = ngx_http_consul_variable, .data = CONSUL_VAR_SVC_COUNT, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("consul_lookup_error"), .set_handler = null, .get_handler = ngx_http_consul_variable, .data = CONSUL_VAR_LOOKUP_ERROR, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+    };
+    for (&vs) |*v| {
+        if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
+            x.*.get_handler = v.get_handler;
+            x.*.data = v.data;
+        }
+    }
+    return NGX_OK;
+}
+
 export const ngx_http_consul_module_ctx = ngx_http_module_t{
     .preconfiguration = null,
-    .postconfiguration = null,
+    .postconfiguration = postconfiguration,
     .create_main_conf = null,
     .init_main_conf = null,
     .create_srv_conf = null,

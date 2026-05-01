@@ -277,6 +277,22 @@ When `redis_key` is not configured, the key is derived from the request URI:
 
 The leading slash is stripped from the URI to form the key.
 
+### Nginx Variables
+
+These variables expose per-request Redis state to `nginz-njs` scripted modules without a subrequest round-trip.
+
+| Variable | Values | Scripted consumers |
+|---|---|---|
+| `$redis_last_value` | string / not found | `feature_flags`, `session` — cheap read-through cache adapter |
+| `$redis_last_exists` | `1` / `0` | `feature_flags`, `workflow` — branch on key presence without JSON parsing |
+| `$redis_last_error` | `redis_error` / `connection_failed` / not found | `workflow`, `circuit_breaker_policy` — retry/fallback policy |
+| `$redis_connection_state` | `connected` / `degraded` / `error` | `health_gateway`, `workflow` — health-aware routing |
+
+- `$redis_last_value` is set only when the key exists and has a non-empty string value. Not set for nil responses, SET/PING, or MGET.
+- `$redis_last_exists` is `1` for any non-nil Redis response, `0` for nil (`$-1`).
+- `$redis_last_error` is `redis_error` when Redis returned a `-ERR` response, `connection_failed` when the upstream connection failed, and not found otherwise.
+- `$redis_connection_state` is `connected` (normal), `degraded` (Redis error response), or `error` (connection failure).
+
 ### Limitations
 
 - **No Authentication**: Redis AUTH not supported

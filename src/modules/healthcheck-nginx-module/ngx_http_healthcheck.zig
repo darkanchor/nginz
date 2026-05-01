@@ -677,6 +677,63 @@ fn ngx_conf_set_health_probe_passes(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, 
     return conf.NGX_CONF_OK;
 }
 
+const ngx_http_variable_value_t = http.ngx_http_variable_value_t;
+
+const HEALTH_VAR_READINESS: core.uintptr_t = 0;
+const HEALTH_VAR_LIVENESS: core.uintptr_t = 1;
+const HEALTH_VAR_BACKEND_HEALTHY_COUNT: core.uintptr_t = 2;
+const HEALTH_VAR_BACKEND_TOTAL_COUNT: core.uintptr_t = 3;
+const HEALTH_VAR_BACKEND_FAILURE_COUNT: core.uintptr_t = 4;
+
+fn ngx_http_healthcheck_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    const snapshot = readStoreSnapshot();
+
+    switch (data) {
+        HEALTH_VAR_READINESS => {
+            v.*.data = if (readinessFromSnapshot(snapshot)) @constCast("1") else @constCast("0");
+            v.*.flags.len = 1;
+        },
+        HEALTH_VAR_LIVENESS => {
+            v.*.data = @constCast("1");
+            v.*.flags.len = 1;
+        },
+        HEALTH_VAR_BACKEND_HEALTHY_COUNT => {
+            v.*.data = if (snapshot.probe_enabled and snapshot.probe_healthy) @constCast("1") else @constCast("0");
+            v.*.flags.len = 1;
+        },
+        HEALTH_VAR_BACKEND_TOTAL_COUNT => {
+            v.*.data = if (snapshot.probe_enabled) @constCast("1") else @constCast("0");
+            v.*.flags.len = 1;
+        },
+        HEALTH_VAR_BACKEND_FAILURE_COUNT => {
+            var buf: [16]u8 = undefined;
+            const slice = std.fmt.bufPrint(&buf, "{d}", .{snapshot.probe_consecutive_failures}) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+                v.*.flags.not_found = true;
+                return NGX_OK;
+            };
+            v.*.data = copied.data;
+            v.*.flags.len = @intCast(copied.len);
+        },
+        else => {
+            v.*.flags.not_found = true;
+            return NGX_OK;
+        },
+    }
+
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
 fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     if (ngx_http_healthcheck_zone == core.nullptr(core.ngx_shm_zone_t)) {
         var zone_name = ngx_string("healthcheck_zone");
@@ -684,6 +741,20 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
         zone.*.init = healthcheck_zone_init;
         ngx_http_healthcheck_zone = zone;
+    }
+
+    var vs = [_]http.ngx_http_variable_t{
+        http.ngx_http_variable_t{ .name = ngx_string("health_readiness"), .set_handler = null, .get_handler = ngx_http_healthcheck_variable, .data = HEALTH_VAR_READINESS, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("health_liveness"), .set_handler = null, .get_handler = ngx_http_healthcheck_variable, .data = HEALTH_VAR_LIVENESS, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("health_backend_healthy_count"), .set_handler = null, .get_handler = ngx_http_healthcheck_variable, .data = HEALTH_VAR_BACKEND_HEALTHY_COUNT, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("health_backend_total_count"), .set_handler = null, .get_handler = ngx_http_healthcheck_variable, .data = HEALTH_VAR_BACKEND_TOTAL_COUNT, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("health_backend_failure_count"), .set_handler = null, .get_handler = ngx_http_healthcheck_variable, .data = HEALTH_VAR_BACKEND_FAILURE_COUNT, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+    };
+    for (&vs) |*v| {
+        if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
+            x.*.get_handler = v.get_handler;
+            x.*.data = v.data;
+        }
     }
 
     const cmcf = core.castPtr(http.ngx_http_core_main_conf_t, conf.ngx_http_conf_get_module_main_conf(cf, &ngx_http_core_module)) orelse return NGX_ERROR;

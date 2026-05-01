@@ -235,6 +235,22 @@ http {
 }
 ```
 
+### Nginx Variables
+
+These variables expose per-request Consul state to `nginz-njs` scripted modules without subrequest JSON parsing.
+
+| Variable | Values | Scripted consumers |
+|---|---|---|
+| `$consul_kv_value` | string / not found | `workflow`, `feature_flags` — dynamic config/flag lookup for policy and routing |
+| `$consul_kv_found` | `1` / `0` | `workflow` — branch on key presence without parsing JSON |
+| `$consul_service_healthy_count` | decimal | `health_gateway`, `workflow` — service-level gating and routing |
+| `$consul_lookup_error` | `consul_error` / not found | `workflow`, `health_gateway` — fail-open/fail-closed policy in scripted adapters |
+
+- `$consul_kv_value` is the base64-decoded value from a KV lookup. Not found if the key does not exist, the query is not a KV query, or parsing fails.
+- `$consul_kv_found` is `1` when the KV key exists and was decoded, `0` on 404.
+- `$consul_service_healthy_count` is the count of healthy service instances returned by a `consul_services` query.
+- `$consul_lookup_error` is `consul_error` when Consul returned a non-200/non-404 status or a parse error occurred, not found otherwise.
+
 ### Limitations
 
 - Read-only access to Consul (no service registration or KV writes)

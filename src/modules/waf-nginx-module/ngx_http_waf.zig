@@ -155,17 +155,25 @@ const waf_loc_conf = extern struct {
 };
 
 // Request context for tracking WAF state
+const WAF_RESULT_ALLOWED: u8 = 0;
+const WAF_RESULT_DENIED: u8 = 1;
+const WAF_RESULT_DRYRUN: u8 = 2;
+
 const waf_ctx = extern struct {
     done: ngx_flag_t,
     waiting_body: ngx_flag_t,
     finalized: ngx_flag_t,
     lccf: [*c]waf_loc_conf,
+    waf_result: u8,
+    waf_rule_id: ngx_uint_t,
+    waf_category: ngx_str_t,
 };
 
 // Detection result
 const DetectionResult = struct {
     detected: bool,
     rule_type: []const u8,
+    rule_id: ngx_uint_t = 0,
     pattern: []const u8,
     status: ngx_uint_t,
     force_pass: bool = false,
@@ -923,6 +931,7 @@ fn buildRuleDetection(rule: *waf_rule, detail: []const u8) DetectionResult {
     return DetectionResult{
         .detected = true,
         .rule_type = "rule",
+        .rule_id = rule.id,
         .pattern = detail,
         .status = rule.status,
         .force_pass = rule.action == WAF_RULE_ACTION_PASS,
@@ -2031,6 +2040,10 @@ fn logDetection(r: [*c]ngx_http_request_t, rule_type: []const u8, pattern: []con
 }
 
 fn finalizeBlockedRequest(r: [*c]ngx_http_request_t, rctx: *waf_ctx, rule_type: []const u8, status: ngx_uint_t) ngx_int_t {
+    if (rctx.*.waf_result != WAF_RESULT_DENIED) {
+        rctx.*.waf_result = WAF_RESULT_DENIED;
+        rctx.*.waf_category = ngx_string(rule_type);
+    }
     rctx.*.done = 1;
     rctx.*.finalized = 1;
 
@@ -2194,16 +2207,7 @@ export fn ngx_http_waf_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void
 
     const body_selector_result = analyzeBodySelectorRules(r, body[0..analyze_len], lccf, decode_buf, lower_buf);
     if (body_selector_result.detected) {
-        const disposition = resolveMatchDisposition(body_selector_result, lccf);
-        recordOffense(r, lccf, body_selector_result.score_weight);
-        if (disposition.block) {
-            _ = finalizeBlockedRequest(r, rctx, body_selector_result.rule_type, body_selector_result.status);
-            return;
-        }
-
-        if (disposition.log) {
-            logDetection(r, body_selector_result.rule_type, body_selector_result.pattern, body_selector_result.tag, body_selector_result.logdata);
-        }
+        if (handleDetection(r, rctx, lccf, body_selector_result)) |_| return;
     }
 
     // Analyze request body
@@ -2215,14 +2219,7 @@ export fn ngx_http_waf_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void
     const final_result = if (result.detected) result else custom_result;
 
     if (final_result.detected) {
-        const disposition = resolveMatchDisposition(final_result, lccf);
-        recordOffense(r, lccf, final_result.score_weight);
-        if (disposition.block) {
-            _ = finalizeBlockedRequest(r, rctx, final_result.rule_type, final_result.status);
-            return;
-        } else if (disposition.log) {
-            logDetection(r, final_result.rule_type, final_result.pattern, final_result.tag, final_result.logdata);
-        }
+        if (handleDetection(r, rctx, lccf, final_result)) |_| return;
     }
 
     // Continue to next phase
@@ -2230,6 +2227,34 @@ export fn ngx_http_waf_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void
     rctx.*.done = 1;
     r.*.write_event_handler = http.ngx_http_core_run_phases;
     http.ngx_http_core_run_phases(r);
+}
+
+// handleDetection dispatches a single detection result: records in ctx, calls
+// finalizeBlockedRequest (denied) or logDetection (dryrun). Returns the rc to
+// propagate when blocked, null when the request continues.
+inline fn handleDetection(
+    r: [*c]ngx_http_request_t,
+    rctx: *waf_ctx,
+    lccf: *waf_loc_conf,
+    result: DetectionResult,
+) ?ngx_int_t {
+    const disposition = resolveMatchDisposition(result, lccf);
+    recordOffense(r, lccf, result.score_weight);
+    if (disposition.block) {
+        rctx.*.waf_result = WAF_RESULT_DENIED;
+        rctx.*.waf_rule_id = result.rule_id;
+        rctx.*.waf_category = ngx_string(result.rule_type);
+        return finalizeBlockedRequest(r, rctx, result.rule_type, result.status);
+    }
+    if (disposition.log) {
+        if (rctx.*.waf_result == WAF_RESULT_ALLOWED) {
+            rctx.*.waf_result = WAF_RESULT_DRYRUN;
+            rctx.*.waf_rule_id = result.rule_id;
+            rctx.*.waf_category = ngx_string(result.rule_type);
+        }
+        logDetection(r, result.rule_type, result.pattern, result.tag, result.logdata);
+    }
+    return null;
 }
 
 // Access phase handler
@@ -2281,15 +2306,8 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         else
             analyzeCustomRules(uri, WAF_TARGET_REQUEST_URI, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         const final_uri_result = if (uri_result.detected) uri_result else uri_custom_result;
-
         if (final_uri_result.detected) {
-            const disposition = resolveMatchDisposition(final_uri_result, lccf);
-            recordOffense(r, lccf, final_uri_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, final_uri_result.rule_type, final_uri_result.status);
-            } else if (disposition.log) {
-                logDetection(r, final_uri_result.rule_type, final_uri_result.pattern, final_uri_result.tag, final_uri_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, final_uri_result)) |rc| return rc;
         }
     }
 
@@ -2298,13 +2316,7 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         const args = core.slicify(u8, r.*.args.data, r.*.args.len);
         const args_selector_result = analyzeArgSelectorRules(args, lccf, decode_buf, lower_buf);
         if (args_selector_result.detected) {
-            const disposition = resolveMatchDisposition(args_selector_result, lccf);
-            recordOffense(r, lccf, args_selector_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, args_selector_result.rule_type, args_selector_result.status);
-            } else if (disposition.log) {
-                logDetection(r, args_selector_result.rule_type, args_selector_result.pattern, args_selector_result.tag, args_selector_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, args_selector_result)) |rc| return rc;
         }
 
         const args_result = analyzeInput(args, lccf, decode_buf, lower_buf);
@@ -2313,15 +2325,8 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         else
             analyzeCustomRules(args, WAF_TARGET_ARGS, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         const final_args_result = if (args_result.detected) args_result else args_custom_result;
-
         if (final_args_result.detected) {
-            const disposition = resolveMatchDisposition(final_args_result, lccf);
-            recordOffense(r, lccf, final_args_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, final_args_result.rule_type, final_args_result.status);
-            } else if (disposition.log) {
-                logDetection(r, final_args_result.rule_type, final_args_result.pattern, final_args_result.tag, final_args_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, final_args_result)) |rc| return rc;
         }
     }
 
@@ -2331,23 +2336,11 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
             const cookies = core.slicify(u8, cookie_value.data, cookie_value.len);
             const cookie_selector_result = analyzeCookieSelectorRules(cookies, lccf, decode_buf, lower_buf);
             if (cookie_selector_result.detected) {
-                const disposition = resolveMatchDisposition(cookie_selector_result, lccf);
-                recordOffense(r, lccf, cookie_selector_result.score_weight);
-                if (disposition.block) {
-                    return finalizeBlockedRequest(r, rctx, cookie_selector_result.rule_type, cookie_selector_result.status);
-                } else if (disposition.log) {
-                    logDetection(r, cookie_selector_result.rule_type, cookie_selector_result.pattern, cookie_selector_result.tag, cookie_selector_result.logdata);
-                }
+                if (handleDetection(r, rctx, lccf, cookie_selector_result)) |rc| return rc;
             }
             const cookie_result = analyzeCustomRules(cookies, WAF_TARGET_REQUEST_COOKIES, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
             if (cookie_result.detected) {
-                const disposition = resolveMatchDisposition(cookie_result, lccf);
-                recordOffense(r, lccf, cookie_result.score_weight);
-                if (disposition.block) {
-                    return finalizeBlockedRequest(r, rctx, cookie_result.rule_type, cookie_result.status);
-                } else if (disposition.log) {
-                    logDetection(r, cookie_result.rule_type, cookie_result.pattern, cookie_result.tag, cookie_result.logdata);
-                }
+                if (handleDetection(r, rctx, lccf, cookie_result)) |rc| return rc;
             }
         }
     }
@@ -2356,13 +2349,7 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         const method_name = core.slicify(u8, r.*.method_name.data, r.*.method_name.len);
         const method_result = analyzeCustomRules(method_name, WAF_TARGET_REQUEST_METHOD, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (method_result.detected) {
-            const disposition = resolveMatchDisposition(method_result, lccf);
-            recordOffense(r, lccf, method_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, method_result.rule_type, method_result.status);
-            } else if (disposition.log) {
-                logDetection(r, method_result.rule_type, method_result.pattern, method_result.tag, method_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, method_result)) |rc| return rc;
         }
     }
 
@@ -2370,13 +2357,7 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         const remote_addr = core.slicify(u8, r.*.connection.*.addr_text.data, r.*.connection.*.addr_text.len);
         const addr_result = analyzeCustomRules(remote_addr, WAF_TARGET_REMOTE_ADDR, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (addr_result.detected) {
-            const disposition = resolveMatchDisposition(addr_result, lccf);
-            recordOffense(r, lccf, addr_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, addr_result.rule_type, addr_result.status);
-            } else if (disposition.log) {
-                logDetection(r, addr_result.rule_type, addr_result.pattern, addr_result.tag, addr_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, addr_result)) |rc| return rc;
         }
     }
 
@@ -2384,13 +2365,7 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         const query_string = core.slicify(u8, r.*.args.data, r.*.args.len);
         const query_result = analyzeCustomRules(query_string, WAF_TARGET_QUERY_STRING, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (query_result.detected) {
-            const disposition = resolveMatchDisposition(query_result, lccf);
-            recordOffense(r, lccf, query_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, query_result.rule_type, query_result.status);
-            } else if (disposition.log) {
-                logDetection(r, query_result.rule_type, query_result.pattern, query_result.tag, query_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, query_result)) |rc| return rc;
         }
     }
 
@@ -2398,13 +2373,7 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         const request_line_slice = core.slicify(u8, request_line.data, request_line.len);
         const request_line_result = analyzeCustomRules(request_line_slice, WAF_TARGET_REQUEST_LINE, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (request_line_result.detected) {
-            const disposition = resolveMatchDisposition(request_line_result, lccf);
-            recordOffense(r, lccf, request_line_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, request_line_result.rule_type, request_line_result.status);
-            } else if (disposition.log) {
-                logDetection(r, request_line_result.rule_type, request_line_result.pattern, request_line_result.tag, request_line_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, request_line_result)) |rc| return rc;
         }
     }
 
@@ -2412,39 +2381,21 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         const request_protocol = core.slicify(u8, r.*.http_protocol.data, r.*.http_protocol.len);
         const protocol_result = analyzeCustomRules(request_protocol, WAF_TARGET_REQUEST_PROTOCOL, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (protocol_result.detected) {
-            const disposition = resolveMatchDisposition(protocol_result, lccf);
-            recordOffense(r, lccf, protocol_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, protocol_result.rule_type, protocol_result.status);
-            } else if (disposition.log) {
-                logDetection(r, protocol_result.rule_type, protocol_result.pattern, protocol_result.tag, protocol_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, protocol_result)) |rc| return rc;
         }
     }
 
     const request_scheme = if (r.*.connection != null and r.*.connection.*.ssl != null) "https" else "http";
     const scheme_result = analyzeCustomRules(request_scheme, WAF_TARGET_REQUEST_SCHEME, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
     if (scheme_result.detected) {
-        const disposition = resolveMatchDisposition(scheme_result, lccf);
-        recordOffense(r, lccf, scheme_result.score_weight);
-        if (disposition.block) {
-            return finalizeBlockedRequest(r, rctx, scheme_result.rule_type, scheme_result.status);
-        } else if (disposition.log) {
-            logDetection(r, scheme_result.rule_type, scheme_result.pattern, scheme_result.tag, scheme_result.logdata);
-        }
+        if (handleDetection(r, rctx, lccf, scheme_result)) |rc| return rc;
     }
 
     if (collectRequestBasename(r, r.*.pool)) |request_basename| {
         const basename_slice = core.slicify(u8, request_basename.data, request_basename.len);
         const basename_result = analyzeCustomRules(basename_slice, WAF_TARGET_REQUEST_BASENAME, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (basename_result.detected) {
-            const disposition = resolveMatchDisposition(basename_result, lccf);
-            recordOffense(r, lccf, basename_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, basename_result.rule_type, basename_result.status);
-            } else if (disposition.log) {
-                logDetection(r, basename_result.rule_type, basename_result.pattern, basename_result.tag, basename_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, basename_result)) |rc| return rc;
         }
     }
 
@@ -2452,38 +2403,20 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         const ext_slice = core.slicify(u8, request_ext.data, request_ext.len);
         const ext_result = analyzeCustomRules(ext_slice, WAF_TARGET_REQUEST_EXT, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (ext_result.detected) {
-            const disposition = resolveMatchDisposition(ext_result, lccf);
-            recordOffense(r, lccf, ext_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, ext_result.rule_type, ext_result.status);
-            } else if (disposition.log) {
-                logDetection(r, ext_result.rule_type, ext_result.pattern, ext_result.tag, ext_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, ext_result)) |rc| return rc;
         }
     }
 
     const header_selector_result = analyzeHeaderSelectorRules(r, lccf, decode_buf, lower_buf);
     if (header_selector_result.detected) {
-        const disposition = resolveMatchDisposition(header_selector_result, lccf);
-        recordOffense(r, lccf, header_selector_result.score_weight);
-        if (disposition.block) {
-            return finalizeBlockedRequest(r, rctx, header_selector_result.rule_type, header_selector_result.status);
-        } else if (disposition.log) {
-            logDetection(r, header_selector_result.rule_type, header_selector_result.pattern, header_selector_result.tag, header_selector_result.logdata);
-        }
+        if (handleDetection(r, rctx, lccf, header_selector_result)) |rc| return rc;
     }
 
     if (collectRequestHeaders(r, r.*.pool)) |headers_text| {
         const headers_slice = core.slicify(u8, headers_text.data, headers_text.len);
         const headers_result = analyzeCustomRules(headers_slice, WAF_TARGET_REQUEST_HEADERS, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (headers_result.detected) {
-            const disposition = resolveMatchDisposition(headers_result, lccf);
-            recordOffense(r, lccf, headers_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, headers_result.rule_type, headers_result.status);
-            } else if (disposition.log) {
-                logDetection(r, headers_result.rule_type, headers_result.pattern, headers_result.tag, headers_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, headers_result)) |rc| return rc;
         }
     }
 
@@ -2491,13 +2424,7 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         const header_names_slice = core.slicify(u8, header_names_text.data, header_names_text.len);
         const header_names_result = analyzeCustomRules(header_names_slice, WAF_TARGET_REQUEST_HEADER_NAMES, WAF_PHASE_REQUEST, lccf, decode_buf, lower_buf);
         if (header_names_result.detected) {
-            const disposition = resolveMatchDisposition(header_names_result, lccf);
-            recordOffense(r, lccf, header_names_result.score_weight);
-            if (disposition.block) {
-                return finalizeBlockedRequest(r, rctx, header_names_result.rule_type, header_names_result.status);
-            } else if (disposition.log) {
-                logDetection(r, header_names_result.rule_type, header_names_result.pattern, header_names_result.tag, header_names_result.logdata);
-            }
+            if (handleDetection(r, rctx, lccf, header_names_result)) |rc| return rc;
         }
     }
 
@@ -2832,6 +2759,129 @@ fn ngx_conf_set_waf_score_decay_window(
     return conf.NGX_CONF_OK;
 }
 
+const ngx_http_variable_value_t = http.ngx_http_variable_value_t;
+
+fn ngx_http_waf_result_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    _ = data;
+    const rctx = core.castPtr(waf_ctx, r.*.ctx[ngx_http_waf_module.ctx_index]) orelse {
+        v.*.data = @constCast("allowed");
+        v.*.flags.len = 7;
+        v.*.flags.valid = true;
+        v.*.flags.no_cacheable = true;
+        v.*.flags.not_found = false;
+        return NGX_OK;
+    };
+    const result_str: []const u8 = switch (rctx.*.waf_result) {
+        WAF_RESULT_DENIED => "denied",
+        WAF_RESULT_DRYRUN => "dryrun",
+        else => "allowed",
+    };
+    v.*.data = @constCast(result_str.ptr);
+    v.*.flags.len = @intCast(result_str.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
+fn ngx_http_waf_rule_id_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    _ = data;
+    const rctx = core.castPtr(waf_ctx, r.*.ctx[ngx_http_waf_module.ctx_index]) orelse {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    if (rctx.*.waf_rule_id == 0) {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    }
+    var num_buf: [24]u8 = undefined;
+    const slice = std.fmt.bufPrint(&num_buf, "{d}", .{rctx.*.waf_rule_id}) catch {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    v.*.data = copied.data;
+    v.*.flags.len = @intCast(copied.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
+fn ngx_http_waf_score_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    _ = data;
+    var score: u16 = 0;
+    const rctx = core.castPtr(waf_ctx, r.*.ctx[ngx_http_waf_module.ctx_index]);
+    if (rctx != null) {
+        const lccf = rctx.?.*.lccf;
+        if (lccf != core.nullptr(waf_loc_conf) and lccf.*.score_threshold > 0) {
+            if (getClientIp(r)) |ip| {
+                const zone = ngx_http_waf_ban_zone;
+                if (zone != core.nullptr(core.ngx_shm_zone_t) and zone.*.shm.addr != null) {
+                    if (core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr)) |shpool| {
+                        shm.ngx_shmtx_lock(&shpool.*.mutex);
+                        if (getBanStore()) |store| {
+                            if (findBanEntry(store, ip)) |entry| {
+                                score = entry.*.score;
+                            }
+                        }
+                        shm.ngx_shmtx_unlock(&shpool.*.mutex);
+                    }
+                }
+            }
+        }
+    }
+    var score_buf: [8]u8 = undefined;
+    const slice = std.fmt.bufPrint(&score_buf, "{d}", .{score}) catch "0";
+    const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    v.*.data = copied.data;
+    v.*.flags.len = @intCast(copied.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
+fn ngx_http_waf_category_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    _ = data;
+    const rctx = core.castPtr(waf_ctx, r.*.ctx[ngx_http_waf_module.ctx_index]) orelse {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    if (rctx.*.waf_category.len == 0 or rctx.*.waf_category.data == null) {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    }
+    v.*.data = rctx.*.waf_category.data;
+    v.*.flags.len = @intCast(rctx.*.waf_category.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
 fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     if (ngx_http_waf_ban_zone == core.nullptr(core.ngx_shm_zone_t)) {
         var zone_name = ngx_string("waf_ban_zone");
@@ -2839,6 +2889,19 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
         zone.*.init = ngx_http_waf_ban_zone_init;
         ngx_http_waf_ban_zone = zone;
+    }
+
+    var vs = [_]http.ngx_http_variable_t{
+        http.ngx_http_variable_t{ .name = ngx_string("waf_result"), .set_handler = null, .get_handler = ngx_http_waf_result_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("waf_rule_id"), .set_handler = null, .get_handler = ngx_http_waf_rule_id_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("waf_score"), .set_handler = null, .get_handler = ngx_http_waf_score_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("waf_category"), .set_handler = null, .get_handler = ngx_http_waf_category_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+    };
+    for (&vs) |*v| {
+        if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
+            x.*.get_handler = v.get_handler;
+            x.*.data = v.data;
+        }
     }
 
     // Register access phase handler

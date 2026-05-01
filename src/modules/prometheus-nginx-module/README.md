@@ -97,6 +97,18 @@ scrape_configs:
     metrics_path: '/metrics'
 ```
 
+### Nginx Variables (TODO)
+
+These variables are not yet implemented. They are listed here so future work can add them. Prometheus already has a strong scrape-oriented surface; these are lower priority than `healthcheck` or `waf` variables, but a few scalar reads could still be useful for inline policy decisions.
+
+| Variable | Values | Scripted consumers |
+|---|---|---|
+| `$prometheus_requests_total` | decimal | `metrics`, `workflow` — load-aware routing and response shaping |
+| `$prometheus_error_rate` | decimal (0.0–1.0) | `circuit_breaker_policy`, `security_gateway` — degraded-mode or challenge policy |
+| `$prometheus_active_connections` | decimal | `ratelimit_policy`, `workflow` — simple load-shedding signal |
+
+Implementation note: these would read directly from the shared-memory counters already maintained by the module, with no extra computation cost.
+
 ### Limitations
 
 Current implementation has these limitations:

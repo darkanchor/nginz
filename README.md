@@ -3,7 +3,11 @@
 nginz is a `nginx` module writer. It allows one to write nginx modules in `zig`. so far it 
 is based on official nginx release 1.30.0 and zig 0.16. nginz is tested with linux only.
 
-A typical workflow is following: 
+A companion project [nginz-njs](https://github.com/kaiwu/nginz-njs), provides Gleam/njs modules
+for policy orchestration, JWT claim routing, rate-limit response shaping, session management,
+and more — built on top of the native primitives exposed here.
+
+The typical nginz workflow is following: 
 
 ```
 $ git submodule init
@@ -35,7 +39,7 @@ A Dockerfile is provided as reference so that one can build their own dev image.
 
 ### Container Tests
 
-Four modules rely on running containers for their integration tests. All container interaction uses `sudo docker`.
+Four modules rely on running containers for some of their integration tests. All container interaction uses `sudo docker`.
 
 **nftset** — Docker-isolated live nftables suite. Provisions temporary tables/sets inside a
 disposable container namespace so the host nftables ruleset is never touched.
@@ -82,7 +86,7 @@ It is a nginx wrapper, and by default built with
 
 nginz also has built-in `ngx_http_js_module` with quickjs engine.
 
-For the higher-level product and module direction, see [ROADMAP.md](ROADMAP.md).
+For the higher-level product and module direction, see [ROADMAP.md](ROADMAP.md) and notes under `docs/`.
 
 A module `echoz` is provided as an example, it is a tribute to @[agentzh][2] and his [echo][1] module. `echoz`
 so far is a simplified version of `echo` and it misses some of the directives.

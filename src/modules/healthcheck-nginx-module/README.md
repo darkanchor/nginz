@@ -133,6 +133,20 @@ http {
 {"status":"not_ready"}
 ```
 
+### Nginx Variables
+
+These variables are available in any nginx context after the module is loaded.
+
+| Variable | Value | Description |
+|---|---|---|
+| `$health_readiness` | `1` / `0` | `1` if the instance is ready (probe healthy or no probe configured), `0` otherwise |
+| `$health_liveness` | `1` | Always `1` while nginx is alive |
+| `$health_backend_healthy_count` | `1` / `0` | `1` if the active probe target is currently healthy, `0` otherwise |
+| `$health_backend_total_count` | `1` / `0` | `1` if an active probe target is configured, `0` if probe is disabled |
+| `$health_backend_failure_count` | decimal | Current consecutive probe failure count |
+
+These variables let `nginz-njs` scripted modules compose health-aware routing and gating decisions without a subrequest round-trip.
+
 ### Behavior Notes
 
 - Passive `requests`, `failed`, and `success_rate` counters exclude the health endpoints themselves.
