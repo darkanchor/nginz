@@ -316,3 +316,59 @@ http {
 - [x] README now includes phased checked todos and binary exit criteria for implementation.
 - [x] Bun integration coverage exists at `tests/dynamic-upstreams/` for placeholder JSON, `HEAD`, and neighboring-route behavior.
 - [x] Current scaffold claims now trace to present tests and future phase-specific verification points.
+
+The `dynamic-upstreams` module is meant to solve a different problem from `upstream-balancer`.
+
+In plain words: `upstream-balancer` decides which backend to pick for one request. `dynamic-upstreams` is supposed to change the backend list itself while nginx is still running, without doing a full reload.
+
+So the design is basically this:
+
+- `upstream-balancer` owns request-time routing.
+- `dynamic-upstreams` owns runtime updates to the peer table.
+- `healthcheck` may later influence which peers are usable.
+- Service discovery like Consul is a possible input source later, not the core of the first implementation.
+
+The README for [dynamic-upstreams]() is explicit that this module should act like a control plane, not a routing engine. It should expose an API endpoint, validate incoming upstream definitions, build a new immutable snapshot of peers, and then switch nginx over to that new snapshot safely.
+
+That “snapshot” idea is the key design choice. Instead of editing the live peer list in place, it wants to build a complete new generation, validate it, and then atomically flip from old generation to new generation. That is the right instinct, because in-place mutation is how you get half-updated state, worker races, and crashes.
+
+Right now, just like the balancer module, it is still mostly scaffolded. The API endpoint exists only as a placeholder and returns `501 Not Implemented`. The intended directives are:
+
+- `dynamic_upstreams_api`
+- `dynamic_upstreams_source <consul|static>`
+- `dynamic_upstreams_target <upstream_name>`
+- `dynamic_upstreams_refresh <milliseconds>`
+
+The intended first useful version is read-only: expose a JSON view of one configured upstream and its current active snapshot. Only after that would it accept writes to replace the peer set.
+
+The main technical challenges are more severe here than in a normal config API:
+
+1. Atomicity across workers  
+Nginx has multiple workers. If one worker sees the new peer set while another still sees the old one, that can be acceptable only if both snapshots are complete and valid. What cannot happen is partial visibility.
+
+2. Safe lifetime management  
+Requests may still be using the old peer snapshot while a new one becomes active. That means old generations cannot be freed too early.
+
+3. Validation before activation  
+A bad update must be rejected completely. Duplicate peers, malformed addresses, unsupported fields, or empty peer lists all need clear handling before anything becomes live.
+
+4. Contract with the balancer  
+This module cannot invent peer identity casually. Whatever peer IDs or generation semantics it uses must match what `upstream-balancer` expects for sticky routing. Otherwise affinity breaks the moment a snapshot changes.
+
+5. No in-place mutation  
+The README is pushing hard toward whole-snapshot replacement. That is because patching live upstream structures is much riskier than publishing a new immutable generation.
+
+6. Truthful control API  
+The API should reflect what is actually active, not what was last requested. If activation fails, the old generation must remain active and visible.
+
+7. Future source integration  
+Consul or refresh loops sound simple, but they add reconciliation problems: stale state, transient failures, partial discovery results, and “last known good” behavior. The README is right to defer that until the static write path is solid.
+
+So in plain terms, the module is trying to become nginx’s runtime upstream update manager. Its design is conservative: read first, then safe whole-snapshot writes, then optional external reconciliation. The hard part is not serving JSON. The hard part is changing backend membership live, across workers, without races, broken stickiness, or memory lifetime bugs.
+
+One useful way to think about the boundary is:
+
+- `upstream-balancer`: “Which peer should this request use?”
+- `dynamic-upstreams`: “What is the current set of peers at all?”
+
+That separation is sound. The challenge is making the handoff between those two modules precise enough that dynamic updates do not destroy deterministic routing.

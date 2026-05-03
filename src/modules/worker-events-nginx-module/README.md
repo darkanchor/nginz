@@ -278,3 +278,77 @@ server {
 - [x] README now includes phased checked todos and binary exit criteria for implementation.
 - [x] Bun integration coverage exists at `tests/worker-events/` for placeholder JSON, `HEAD`, and unaffected-route behavior.
 - [x] Current scaffold claims now trace to present tests and future phase-specific verification points.
+
+The `worker-events` module is meant to be a small cross-worker signaling primitive for nginx. In plain words: it is supposed to let one worker publish an event, and let other workers see that event, so modules do not have to rely on polling.
+
+So the design goal is not “business logic” and not “message queue.” It is closer to an internal event bus: publish something like “cache key X was purged” or “token Y was revoked,” and let other workers react.
+
+The README at [worker-events]() keeps the boundary pretty disciplined. This module should own:
+
+- shared-memory ring or queue behavior
+- event publish and inspect operations
+- channel naming
+- generation tracking
+- dropped-event accounting
+
+It should not own:
+
+- cache invalidation policy
+- session revocation logic
+- broad workflow orchestration
+
+That separation is the right call. This module is meant to be transport, not policy.
+
+The design centers on a bounded shared-memory ring. That means events are appended to a fixed-size circular buffer in shared memory. A writer adds a new entry, readers inspect the buffer, and each event has minimal fields like:
+
+- `generation`
+- `channel`
+- `type`
+- `payload`
+
+The important choice here is that it is intentionally not trying to guarantee delivery. It is a best-effort coordination primitive for invalidation-class signals. If the ring overflows, that has to be visible and counted, not hidden.
+
+Right now it is still scaffolded. The code in [ngx_http_worker_events.zig]() parses config stubs and exposes a placeholder endpoint that just returns `501`. The test in [worker-events.test.js]() confirms exactly that.
+
+The intended directives are:
+
+- `worker_events_api`
+- `worker_events_zone <name>`
+- `worker_events_channel <channel>`
+- `worker_events_ring_size <entries>`
+
+The idea is: configure a location that exposes a small operational API. `GET` would inspect ring state, and `POST` would publish one event.
+
+The hard technical problems are mostly around correctness under concurrency:
+
+1. Shared memory correctness  
+Multiple workers may write or read concurrently. The module has to make sure readers never see a half-written or corrupted event entry.
+
+2. Overflow semantics  
+A fixed-size ring eventually fills up. The design has to choose a policy and document it clearly:
+drop oldest, reject newest, or something similar. Silent overwrite without accounting would be a bad design.
+
+3. Generation tracking  
+Readers need a way to tell whether they missed events. That is why the README keeps talking about generation IDs and dropped-event counts.
+
+4. Bounded payload design  
+Event payloads must stay simple enough to store safely in shared memory. If payload format becomes too flexible or too large, the implementation gets much harder to audit.
+
+5. Cross-worker visibility  
+It is not enough for one worker to publish and read back its own event. The module only becomes useful once another worker can reliably observe it too.
+
+6. Lifetime and ordering guarantees  
+The module has to define what ordering means. Probably append order within one ring or one channel, not global workflow guarantees. If that is vague, consumers will build wrong assumptions on top.
+
+7. Not turning into a full queue system  
+The README is careful here: no guaranteed delivery, no acknowledgements, no cross-node fanout, no replay system. That restraint matters, because those features would multiply complexity fast.
+
+So in plain terms, `worker-events` is trying to become nginx’s internal “shout across workers” primitive. One module or endpoint publishes a small signal into shared memory, and other workers can notice it and act. The engineering challenge is making that shared ring safe, bounded, observable, and honest about loss.
+
+A useful way to frame it is:
+
+- `dynamic-upstreams`: changes shared configuration state
+- `worker-events`: tells other workers that something changed
+- consumers like cache/session/health modules: decide what to do about that signal
+
+That architecture makes sense. The dangerous part is not the HTTP endpoint. The dangerous part is building a shared-memory event ring that stays deterministic under concurrent workers.

@@ -282,3 +282,58 @@ server {
 - [x] README now includes phased checked todos and binary exit criteria for implementation.
 - [x] Bun integration coverage exists at `tests/cache-purge/` for placeholder JSON, `HEAD`, and unaffected-route behavior.
 - [x] Current scaffold claims now trace to present tests and future phase-specific verification points.
+
+The `cache-purge` module is meant to be the operator-facing way to invalidate cached content. In plain words: it is supposed to give you an API endpoint where you can say “remove these cached entries” without doing a blunt full cache clear.
+
+Its design is intentionally split from `cache-tags`. `cache-tags` is supposed to do the response-side work of tagging cache entries as they are created. `cache-purge` is supposed to do the control-side work of finding those tagged or indexed entries and invalidating them on demand.
+
+That separation is good. One module writes metadata during normal traffic, the other uses that metadata later for operational invalidation. The README at [cache-purge]() is pretty explicit that this module should not become a filter, and should not duplicate what `cache-tags` already owns.
+
+The intended API surface is small:
+
+- `cache_purge_api`
+- `cache_purge_zone <name>`
+- `cache_purge_match <exact|prefix|glob>`
+- `cache_purge_authorize <off|allowlist|signed-token>`
+- `cache_purge_max_keys <count>`
+
+So the shape is: expose a location, bind it to some purge metadata zone, choose how matching works, choose how callers are authorized, and put a hard limit on how many keys can be purged in one request.
+
+The important design choice is that it wants to start with exact matching first, then maybe prefix matching later, and treat glob matching as optional and probably late. That is the right order. Exact invalidation is much easier to make correct and bounded. Prefix can be justified. Glob can get expensive and ambiguous fast.
+
+Right now the module is still only scaffolded. The code in [ngx_http_cache_purge.zig]() stores stub config and returns a `501` placeholder JSON response. The test in [cache-purge.test.js]() only proves that placeholder behavior.
+
+The real engineering challenges are mostly about metadata and correctness:
+
+1. Defining the metadata contract with `cache-tags`  
+This is the central problem. Purge cannot work unless there is a reliable index of what cache key or tag points to which cache entries. The README calls this out directly.
+
+2. Choosing the lookup model  
+You need to decide whether you purge by exact cache key, by tag, or both. Those are different data structures and different operational expectations.
+
+3. Keeping invalidation bounded  
+A purge API can become dangerous if one request can scan too much state. That is why the design includes `max_keys` and treats broader matching modes cautiously.
+
+4. Multi-worker visibility  
+If the cache metadata is shared, all workers need to see the same invalidation state. Otherwise one worker may still serve stale content after another thinks it was purged.
+
+5. Partial failure handling  
+A purge request must not silently invalidate some entries and lose track of the rest without saying so. The operator needs a truthful response: purged count, missing count, rejected count.
+
+6. Authorization  
+This endpoint is operationally sensitive. If it exists, it needs a clear policy for who can call it. The README is right to separate “base API contract” from stronger auth like signed tokens.
+
+7. Not depending on `worker-events` too early  
+The design keeps fanout optional. That is sensible. First make single-node selective invalidation work correctly. Then add cross-worker or broader event propagation as an improvement, not as a prerequisite.
+
+So in plain terms, `cache-purge` is trying to become the safe remote control for cached content. It should let operators invalidate targeted entries without external Redis glue and without clearing everything.
+
+The hard part is not building the HTTP endpoint. The hard part is building the metadata lookup path behind it so that “purge this” actually means something precise, bounded, and consistent across workers.
+
+A useful mental model is:
+
+- `cache-tags`: labels cached objects when they are written
+- `cache-purge`: looks up those labels later and invalidates matching objects
+- `worker-events`: may later help fan out purge notifications, but it is not the core of purge correctness
+
+That architecture is sound. The risky part is the shared metadata design between tagging and purging.

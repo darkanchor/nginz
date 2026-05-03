@@ -195,3 +195,66 @@ These variables let `nginz-njs` scripted modules compose health-aware routing an
 - [x] README now reflects that active checks are already implemented and that the missing roadmap work is upstream integration rather than probe existence.
 - [x] Variable integration coverage now verifies readiness/liveness/backend probe variables in both healthy and unhealthy shared-state paths.
 - [x] Remaining limitations are documented without claiming unsupported upstream marking or per-target feature matrices.
+
+The `healthcheck` module is different from the previous ones because it is not just a scaffold. It already works in a limited but real way.
+
+In plain words, this module gives nginx a way to answer two questions:
+
+- “Am I alive?”
+- “Am I ready to serve traffic?”
+
+It does that with two kinds of signals. First, it keeps shared counters across workers for normal request traffic and failures. Second, it can actively probe a configured HTTP target on a timer, then share that result with every worker.
+
+The design is deliberately simple right now. One worker runs the periodic probe loop. The result of that probe is written into shared memory. Then `/health`, `/healthz`, and `/ready` all read the same shared state. That means all workers answer consistently instead of each worker inventing its own view.
+
+The current behavior in [README.md](), [ngx_http_healthcheck.zig](), and [healthcheck.test.js]() is:
+
+- `health_status` exposes a JSON health endpoint
+- `health_liveness` exposes a simple “process is alive” endpoint
+- `health_readiness` exposes a readiness endpoint
+- `health_probe` configures an active HTTP probe target
+- interval, timeout, fail threshold, and pass threshold control probe behavior
+
+So the module is doing two jobs:
+
+1. Passive health reporting  
+It counts requests and failures across workers.
+
+2. Active readiness checking  
+It periodically probes a backend-like target and flips readiness healthy/unhealthy based on consecutive pass/fail thresholds.
+
+That threshold design matters. It avoids flapping. One failed probe does not instantly mark the system unhealthy unless configured that way. Likewise recovery can require multiple successful probes before traffic is considered safe again.
+
+The biggest design limitation is also the main next step: the probe state is currently shared at the module level, not keyed per upstream peer. So it can say “the configured probe target is healthy” but it does not yet integrate directly with nginx upstream peer selection.
+
+That leads to the main technical challenges:
+
+1. Shared state across workers  
+The module needs one consistent readiness state for all workers. Shared memory solves that, but you have to get synchronization and lifecycle right.
+
+2. Single-writer probe loop  
+Only one worker should run the active probe timer, otherwise you get duplicate probes and conflicting state updates.
+
+3. Avoiding false health signals  
+Liveness and readiness are different. The module gets that right: nginx can be alive while readiness is failing.
+
+4. Flap control  
+Fail/pass thresholds are there to avoid noisy state transitions. Without them, a shaky backend would make readiness unstable.
+
+5. Upstream integration is still missing  
+This is the real unfinished part. Today the module reports health. It does not yet mark upstream peers down or influence load balancing directly.
+
+6. Probe scope is too broad  
+Right now there is effectively one shared probe definition, not a full per-upstream or per-peer health model. That is fine for service readiness, but not enough for a serious upstream health system.
+
+7. Probe implementation limits  
+The README is honest here: HTTP only, no TLS probing yet, and timeout handling is still fairly basic.
+
+So in plain terms, the module already works as a shared readiness/liveness system for nginx itself, with active probing and counters. What it is not yet is a full upstream health manager.
+
+A useful mental model is:
+
+- today: “is this nginx instance ready?”
+- later: “which upstream peers are healthy, and should the balancer avoid the bad ones?”
+
+That second step is the hard one. It requires the health state to become peer-aware and to integrate cleanly with the upstream-balancer logic instead of just exposing `/ready` and `/health`.

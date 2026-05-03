@@ -274,3 +274,50 @@ http {
 - [x] Build, package, and module-registration wiring are planned alongside this scaffold.
 - [x] Bun integration coverage exists at `tests/upstream-balancer/` for directive acceptance and proxy preservation.
 - [x] Current scaffold claims now trace to present tests and future phase-specific verification points.
+
+I read [src/modules/upstream-balancer-nginx-module/README.md]() and checked the current scaffold in
+[ngx_http_upstream_balancer.zig]() plus its test in [upstream-balancer.test.js]().
+
+In plain words, this module is meant to become the part of `nginz` that decides which backend server a request should go to.
+Its first job is not “dynamic service discovery” or “health checking.” Its job is narrower: own nginx’s low-level upstream selection
+callback in a small native Zig module, then add sticky routing on top. “Sticky” here means: if a request carries a cookie or header key,
+the same key should keep landing on the same backend server.
+
+The design is intentionally layered:
+
+1. `upstream-balancer` owns request-time peer selection.
+2. `dynamic-upstreams` will later own changing the set of peers at runtime.
+3. `healthcheck` may later inform which peers are healthy, but that logic should stay separate.
+
+That separation matters because nginx upstream internals are a sharp edge. The README is basically saying: first build a safe, auditable selector, then let other modules feed it data later.
+
+Right now, the module is only scaffolded. The directives exist:
+
+- `upstream_balancer_sticky_cookie <name>`
+- `upstream_balancer_sticky_header <name>`
+- `upstream_balancer_fallback <next|off>`
+
+But the code currently just accepts them and does nothing with them yet. Traffic still behaves like stock nginx.
+
+The intended runtime behavior is straightforward:
+
+- Read a cookie or header from the request.
+- Turn that value into a stable hash.
+- Map the hash to one backend peer deterministically.
+- If that lookup fails, either:
+  - `fallback next`: let normal nginx peer selection choose another server for this request
+  - `fallback off`: fail cleanly instead of silently picking a different server
+
+The hard technical parts are these:
+
+- Owning nginx’s upstream callback safely. This is deep nginx internals, not a normal request handler.
+- Keeping behavior identical to stock nginx when sticky mode is off. Just inserting yourself into that callback path can break routing if done carelessly.
+- Defining stable peer identity. If peer “2” today becomes a different machine tomorrow, sticky mapping becomes wrong. That is why the README keeps talking about a peer identity contract and snapshot generations.
+- Multi-worker consistency. Nginx has multiple workers; the same sticky key must resolve the same way in every worker.
+- Dynamic updates later. Once `dynamic-upstreams` starts replacing peer sets, the balancer must avoid partial state and preserve deterministic mapping rules.
+- Clear failure behavior. Affinity miss, malformed cookie/header, and dead peers all need explicit, test-backed behavior.
+- Keeping scope tight. The README repeatedly avoids turning this into a giant “load balancing platform” module.
+
+So the design idea is good and disciplined: one native module for the dangerous hot-path selection logic, other modules layered around it. The main challenge is not the hash itself. The real challenge is making nginx peer selection customizable without breaking correctness, worker consistency, or future dynamic updates.
+
+One important practical note: this is still a planned foundation, not a working sticky balancer yet. The README is more of an engineering contract and phase plan than end-user documentation.
