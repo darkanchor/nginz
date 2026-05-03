@@ -173,6 +173,15 @@ make install
 
 None currently.
 
+### Planning (4)
+
+| Module | Description |
+|--------|-------------|
+| **upstream-balancer** | Scaffolded native upstream peer-selection and sticky-session foundation |
+| **dynamic-upstreams** | Scaffolded runtime upstream reconfiguration API built on future peer-table foundations |
+| **worker-events** | Scaffolded cross-worker event-bus primitive for native and njs coordination |
+| **cache-purge** | Scaffolded selective cache-purge API intended to complement `cache-tags` |
+
 ### Reference (2)
 
 | Module | Description |

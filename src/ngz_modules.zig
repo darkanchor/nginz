@@ -93,6 +93,8 @@ extern var ngx_http_wechatpay_module: ngx_module_t;
 extern var ngx_http_pgrest_module: ngx_module_t;
 extern var ngx_http_redis_module: ngx_module_t;
 extern var ngx_http_consul_module: ngx_module_t;
+extern var ngx_http_upstream_balancer_module: ngx_module_t;
+extern var ngx_http_dynamic_upstreams_module: ngx_module_t;
 
 // Security & Auth Modules
 extern var ngx_http_jwt_module: ngx_module_t;
@@ -108,6 +110,7 @@ extern var ngx_http_canary_module: ngx_module_t;
 extern var ngx_http_ratelimit_module: ngx_module_t;
 extern var ngx_http_requestid_filter_module: ngx_module_t;
 extern var ngx_http_circuit_breaker_module: ngx_module_t;
+extern var ngx_http_worker_events_module: ngx_module_t;
 
 // Network Security Modules
 extern var ngx_http_nftset_module: ngx_module_t;
@@ -116,6 +119,7 @@ extern var ngx_http_nftset_module: ngx_module_t;
 extern var ngx_http_graphql_module: ngx_module_t;
 extern var ngx_http_cache_tags_filter_module: ngx_module_t;
 extern var ngx_http_transform_filter_module: ngx_module_t;
+extern var ngx_http_cache_purge_module: ngx_module_t;
 extern var ngx_http_prometheus_module: ngx_module_t;
 
 // Ordered list of modules (following nginx's module loading order)
@@ -189,6 +193,8 @@ export const ngx_modules = [_][*c]ngx_module_t{
     &ngx_http_upstream_random_module,
     &ngx_http_upstream_keepalive_module,
     &ngx_http_upstream_zone_module,
+    &ngx_http_upstream_balancer_module,
+    &ngx_http_dynamic_upstreams_module,
 
     // Javascript modules
     &ngx_http_js_module,
@@ -209,9 +215,11 @@ export const ngx_modules = [_][*c]ngx_module_t{
     // Traffic Management
     &ngx_http_healthcheck_module,
     &ngx_http_canary_module,
+    &ngx_http_worker_events_module,
 
     // Advanced Processing
     &ngx_http_graphql_module,
+    &ngx_http_cache_purge_module,
     &ngx_http_prometheus_module,
 
     // Filter Modules (placed at the end)
@@ -294,6 +302,8 @@ export const ngx_module_names = [_][*c]const u8{
     "ngx_http_upstream_random_module",
     "ngx_http_upstream_keepalive_module",
     "ngx_http_upstream_zone_module",
+    "ngx_http_upstream_balancer_module",
+    "ngx_http_dynamic_upstreams_module",
     "ngx_http_js_module",
     "ngx_http_echoz_module",
     "ngx_http_pgrest_module",
@@ -305,7 +315,9 @@ export const ngx_module_names = [_][*c]const u8{
     "ngx_http_acme_module",
     "ngx_http_healthcheck_module",
     "ngx_http_canary_module",
+    "ngx_http_worker_events_module",
     "ngx_http_graphql_module",
+    "ngx_http_cache_purge_module",
     "ngx_http_prometheus_module",
     "ngx_http_write_filter_module",
     "ngx_http_header_filter_module",

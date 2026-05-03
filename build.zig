@@ -26,6 +26,8 @@ var modules = [_][]const u8{
     "src/modules/pgrest-nginx-module/ngx_http_pgrest.zig",
     "src/modules/redis-nginx-module/ngx_http_redis.zig",
     "src/modules/consul-nginx-module/ngx_http_consul.zig",
+    "src/modules/upstream-balancer-nginx-module/ngx_http_upstream_balancer.zig",
+    "src/modules/dynamic-upstreams-nginx-module/ngx_http_dynamic_upstreams.zig",
 
     // Security & Auth Modules
     "src/modules/jwt-nginx-module/ngx_http_jwt.zig",
@@ -40,11 +42,13 @@ var modules = [_][]const u8{
     "src/modules/ratelimit-nginx-module/ngx_http_ratelimit.zig",
     "src/modules/requestid-nginx-module/ngx_http_requestid.zig",
     "src/modules/circuit-breaker-nginx-module/ngx_http_circuit_breaker.zig",
+    "src/modules/worker-events-nginx-module/ngx_http_worker_events.zig",
 
     // Advanced Processing Modules
     "src/modules/graphql-nginx-module/ngx_http_graphql.zig",
     "src/modules/transform-nginx-module/ngx_http_transform.zig",
     "src/modules/cache-tags-nginx-module/ngx_http_cache_tags.zig",
+    "src/modules/cache-purge-nginx-module/ngx_http_cache_purge.zig",
     "src/modules/prometheus-nginx-module/ngx_http_prometheus.zig",
 
     // Security & Network Modules
@@ -80,6 +84,8 @@ var tests = [_][]const u8{
     "src/modules/pgrest-nginx-module/pgrest_rpc.zig",
     "src/modules/redis-nginx-module/ngx_http_redis.zig",
     "src/modules/consul-nginx-module/ngx_http_consul.zig",
+    "src/modules/upstream-balancer-nginx-module/ngx_http_upstream_balancer.zig",
+    "src/modules/dynamic-upstreams-nginx-module/ngx_http_dynamic_upstreams.zig",
     "src/modules/jwt-nginx-module/ngx_http_jwt.zig",
     "src/modules/oidc-nginx-module/ngx_http_oidc.zig",
     "src/modules/waf-nginx-module/ngx_http_waf.zig",
@@ -90,9 +96,11 @@ var tests = [_][]const u8{
     "src/modules/ratelimit-nginx-module/ngx_http_ratelimit.zig",
     "src/modules/requestid-nginx-module/ngx_http_requestid.zig",
     "src/modules/circuit-breaker-nginx-module/ngx_http_circuit_breaker.zig",
+    "src/modules/worker-events-nginx-module/ngx_http_worker_events.zig",
     "src/modules/graphql-nginx-module/ngx_http_graphql.zig",
     "src/modules/transform-nginx-module/ngx_http_transform.zig",
     "src/modules/cache-tags-nginx-module/ngx_http_cache_tags.zig",
+    "src/modules/cache-purge-nginx-module/ngx_http_cache_purge.zig",
     "src/modules/prometheus-nginx-module/ngx_http_prometheus.zig",
 
     // Security & Network Modules

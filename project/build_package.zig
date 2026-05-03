@@ -60,6 +60,16 @@ pub const module_infos = [_]ModuleInfo{
         .types = &.{.HTTP},
         .needs_cjson = true,
     },
+    .{
+        .source = "src/modules/upstream-balancer-nginx-module/ngx_http_upstream_balancer.zig",
+        .modules = &.{"ngx_http_upstream_balancer_module"},
+        .types = &.{.HTTP},
+    },
+    .{
+        .source = "src/modules/dynamic-upstreams-nginx-module/ngx_http_dynamic_upstreams.zig",
+        .modules = &.{"ngx_http_dynamic_upstreams_module"},
+        .types = &.{.HTTP},
+    },
 
     // Security & Auth Modules
     .{
@@ -119,6 +129,11 @@ pub const module_infos = [_]ModuleInfo{
         .modules = &.{"ngx_http_circuit_breaker_module"},
         .types = &.{.HTTP},
     },
+    .{
+        .source = "src/modules/worker-events-nginx-module/ngx_http_worker_events.zig",
+        .modules = &.{"ngx_http_worker_events_module"},
+        .types = &.{.HTTP},
+    },
 
     // Advanced Processing Modules
     .{
@@ -137,6 +152,11 @@ pub const module_infos = [_]ModuleInfo{
         .source = "src/modules/cache-tags-nginx-module/ngx_http_cache_tags.zig",
         .modules = &.{"ngx_http_cache_tags_filter_module"},
         .types = &.{.HTTP_FILTER},
+    },
+    .{
+        .source = "src/modules/cache-purge-nginx-module/ngx_http_cache_purge.zig",
+        .modules = &.{"ngx_http_cache_purge_module"},
+        .types = &.{.HTTP},
     },
     .{
         .source = "src/modules/prometheus-nginx-module/ngx_http_prometheus.zig",

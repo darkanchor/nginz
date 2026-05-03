@@ -145,6 +145,52 @@ This sequence gives the best compound payoff:
 
 Together, those move Nginz much closer to both OpenResty-style flexibility and commercial-nginx-style gateway strength.
 
+## Milestone 2
+
+Milestone 2 turns the current roadmap analysis into a concrete scaffold-and-design pass for the next native platform modules.
+
+### Sprint 1 - upstream foundation
+
+1. **Upstream balancer + sticky scaffold**
+   - native Zig module scaffolded in-tree
+   - directive surface and README design documented
+   - positioned as the peer-lifecycle foundation for later dynamic upstream work
+
+2. **Dynamic upstreams scaffold**
+   - separate module from balancer work
+   - placeholder API surface and design documented
+   - explicitly dependent on the upstream balancer foundation rather than treated as parallel first implementation work
+
+### Sprint 2 - coordination and cache control
+
+3. **Worker event bus scaffold**
+   - native shared-memory/event primitive planned for cross-worker signaling
+   - intended to support njs integration, cache invalidation fanout, and runtime coordination
+
+4. **Selective cache-purge API scaffold**
+   - operator-facing cache invalidation surface
+   - positioned as complementary to `cache-tags`, not a replacement for it
+
+### Existing module scope adjustment
+
+5. **Healthcheck roadmap update**
+   - active HTTP checks already exist and should be treated as implemented scope
+   - the next milestone work is upstream-keyed health state, peer marking, and later slow-start/recovery behavior
+
+### Milestone 2 exclusions
+
+- **VTS** remains deferred for now because `prometheus` already covers most immediate observability needs.
+- **REST runtime API** remains an **njs/productization** target, not a new Zig module in this milestone.
+
+### Milestone 2 deliverable shape
+
+The goal of this milestone is not full feature completion. The goal is to land:
+
+- repo-consistent module directories under `src/modules/`
+- detailed README designs and directive plans
+- skeleton Zig modules wired into build/package/module registration paths
+- a corrected healthcheck roadmap that reflects active checks already being present
+
 ## What to avoid
 
 - do **not** start a parallel Lua ecosystem

@@ -13,7 +13,7 @@ We do not aim to replicate existing open-source nginx modules. If a C module sol
 
 ## Methodology
 
-This analysis is grounded in the [ngx-modules catalog](https://git.darkanchor.com/kaiwu/ngx-modules) which surveys **255 nginx modules** (140 native C, 115 Lua). Each candidate is evaluated against three criteria:
+This analysis is grounded in the [ngx-modules catalog]() which surveys **255 nginx modules** (140 native C, 115 Lua). Each candidate is evaluated against three criteria:
 
 1. **Commercial gap:** Is this a feature gate-kept behind nginx-plus or other commercial distributions?
 2. **C pain level:** Does the existing C implementation have known crash classes, memory-safety issues, or reliability problems that Zig's safety model directly addresses?
@@ -221,3 +221,55 @@ The two lists diverge at every key decision:
 | Worker event bus | Deferred | #4 priority |
 
 Neither is wrong — they serve different product strategies.
+
+## Audit (2026-05-03)
+
+### Decision
+
+**Partially agree.** The seven-item list is directionally strong as a gap analysis, but I do **not** agree that we should proceed to all seven as equal Zig module targets right now.
+
+The repo evidence supports a **phased subset**, not a blanket go-ahead:
+
+- **Proceed first (highest-value Zig work):**
+  1. **Upstream balancer + sticky**
+  2. **Dynamic upstreams** — but only after the balancer/peer-table foundation is stable
+- **Proceed, but narrowed to existing groundwork:**
+  3. **Active health checks + slow-start** should be treated as an extension of the existing `healthcheck` module, because active probing already exists; the missing commercial-grade piece is upstream peer marking and recovery behavior
+- **Proceed later (medium priority):**
+  4. **Worker event bus**
+  5. **Selective cache-purge API**
+- **Defer / reframe:**
+  6. **VTS** — defer; current `prometheus` coverage already handles most observability needs and this doc already ranks VTS lower
+  7. **REST runtime API** — reframe as **njs library / productization work**, not a Zig module
+
+### Reasons
+
+1. **The repo is mature enough for new modules, but not for all seven in parallel.**
+   Existing access/content/filter/upstream/shared-memory patterns are strong across the current module base, so the project is capable of substantial new work. But the most dangerous surface in this list is upstream peer lifecycle, and there is currently no existing module using nginx upstream `peer.get` / `peer.free` APIs. That makes broad-front execution the wrong risk posture.
+
+2. **Some of the listed “gaps” are already partially closed by the current repo.**
+   - Built-in **njs** already exists and is tested.
+   - **`js_shared_dict`** already exists through njs, which weakens any plan that assumes a native shared-state primitive must be built first.
+   - The **`healthcheck`** module already implements active probing, so the real missing work is not “health checks” in general but specifically upstream integration, peer marking, and slow-start semantics.
+   - **`prometheus`** already covers much of the observability story, which lowers the urgency of VTS.
+
+3. **The docs are using different strategy lenses and should not be merged into a single execution queue.**
+   `ROADMAP.md` mixes platformization and product breadth. This commercial-gaps note is trying to identify where Zig meaningfully improves on the open-source ecosystem. Those are useful perspectives, but they do not imply that every item here should become an immediate Zig build target.
+
+4. **The REST runtime API is explicitly not a Zig-module candidate.**
+   This document already says the runtime API is best done as an **njs library**. That is the correct framing and should stay explicit in any execution plan.
+
+5. **VTS is a reasonable idea, but not one of the next best uses of effort.**
+   It is a convenience/completeness feature, not the sharpest commercial gap, especially when upstream control, runtime traffic policy, and existing healthcheck work remain more strategic.
+
+### Recommended execution interpretation of this note
+
+If this document is kept as the commercial-gap reference, the practical takeaway should be:
+
+- **Go now:** upstream balancer + sticky
+- **Go next, dependent on that foundation:** dynamic upstreams
+- **Go as enhancement, not greenfield module:** healthcheck peer-marking + slow-start
+- **Go later:** worker event bus, selective cache-purge API
+- **Do not treat as current Zig-module work:** VTS, REST runtime API
+
+That keeps the core thesis of this document intact while aligning it with the actual repo state and avoiding duplicate work where the platform already has coverage.

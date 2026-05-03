@@ -139,6 +139,13 @@ KEEP_LOGS=1 ZIG_OPTIMIZE=ReleaseSafe bun test tests/acme/
 
 Test nginx.conf files should use `error_log logs/error.log debug;` for debugging.
 
+If a test nginx config uses custom variables or variable-backed headers/maps, add these in the `http {}` block to avoid the nginx startup warning about suboptimal variable hashing:
+
+```nginx
+variables_hash_max_size 2048;
+variables_hash_bucket_size 128;
+```
+
 
 ### Debugging
 

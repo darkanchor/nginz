@@ -1,16 +1,16 @@
 ## Health Check Module
 
-Passive/self-health endpoints for nginx with shared-memory aggregation and a minimal active HTTP probe.
+Passive/self-health endpoints for nginx with shared-memory aggregation and active HTTP checks, with the next scope focused on upstream peer-state integration.
 
 ### Status
 
-**Feature Ready (bounded scope)** - shared-memory request counters, shared readiness state, and a single module-global active HTTP probe are implemented.
+**Feature Ready (bounded scope)** - shared-memory request counters, shared readiness state, and active HTTP probing are implemented. The next planned scope is upstream-keyed health state, peer marking, and recovery/slow-start behavior.
 
 ### Features
 
 - **Shared-memory counters**: passive request and failure counts aggregate across nginx workers
 - **Shared readiness state**: `/ready` and `/health` read the same probe result from shared memory
-- **Active HTTP probing**: one worker periodically probes a configured `http://host:port/path` target
+- **Active HTTP probing**: one worker periodically probes a configured `http://host:port/path` target and shares the result across workers
 - **Threshold-based health transitions**: configurable consecutive fail/pass thresholds drive readiness
 - **JSON endpoints**: `/health`, `/healthz`, and `/ready` return machine-readable responses
 
@@ -42,7 +42,7 @@ Enable a readiness endpoint. When active probing is configured, readiness follow
 *syntax:* `health_probe http://host:port/path;`
 *context:* `location`
 
-Configure the module-global active probe target. The current implementation supports plain HTTP targets only.
+Configure the active probe target. The current implementation supports plain HTTP targets only and still applies one shared probe definition rather than upstream-keyed probe sets.
 
 #### health_probe_interval
 
@@ -152,26 +152,46 @@ These variables let `nginz-njs` scripted modules compose health-aware routing an
 - Passive `requests`, `failed`, and `success_rate` counters exclude the health endpoints themselves.
 - Active probe results are shared across workers, but only one worker performs the periodic probe loop.
 - Probe success currently means an HTTP status in the `2xx` or `3xx` range.
+- The current active-check implementation is intentionally scoped to readiness/state reporting rather than direct upstream peer control.
 
 ### Limitations
 
-- **Single module-global probe target**: the active probe configuration is shared by the module, not keyed per location/upstream.
+- **Shared probe scope**: active checks exist today, but the current configuration is still shared by the module instead of keyed per upstream peer set.
 - **HTTP only**: no HTTPS/TLS probing yet.
 - **No upstream peer marking**: probe failures affect module readiness endpoints only; upstream peers are not marked down in nginx.
 - **Best-effort timeout scope**: the configured probe timeout covers socket send/receive timeouts; full nonblocking connect/poll logic is not implemented.
 - **Reload/restart reset**: shared-memory state resets when the shared zone is recreated.
 
+### Planned Phases
+
+#### Phase 1 - current implemented scope
+
+- Shared-memory passive request/failure counters
+- Shared readiness/liveness endpoints
+- Active HTTP probe loop with fail/pass thresholds
+
+#### Phase 2 - upstream integration
+
+- Upstream-keyed probe definitions
+- Peer marking so unhealthy probes can influence upstream selection
+- Better per-upstream visibility rather than one shared probe state
+
+#### Phase 3 - recovery behavior
+
+- Slow-start / recovery ramp semantics
+- Richer match rules (headers/body/status policy)
+- HTTPS/TLS probing and expanded protocol coverage
+
 ### Future Enhancements
 
-- HTTPS probe support
-- Multiple keyed probe definitions
-- Richer match rules (headers/body)
 - Export probe metrics through the prometheus module
+- Event-bus integration for health-state fanout
+- Better operator introspection for peer transitions
 
 ### Documentation Audit Checklist
 
-- [x] Audit date: 2026-04-24
+- [x] Audit date: 2026-05-03
 - [x] Bun integration coverage exists at `tests/healthcheck/`.
-- [x] README now matches the implemented shared-memory passive counters, shared readiness state, and module-global active HTTP probe behavior.
+- [x] README now reflects that active checks are already implemented and that the missing roadmap work is upstream integration rather than probe existence.
 - [x] Variable integration coverage now verifies readiness/liveness/backend probe variables in both healthy and unhealthy shared-state paths.
 - [x] Remaining limitations are documented without claiming unsupported upstream marking or per-target feature matrices.
