@@ -1,4 +1,7 @@
+import { spawnSync } from "bun";
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { existsSync, mkdirSync, rmSync } from "fs";
+import { join } from "path";
 import {
   startNginz,
   stopNginz,
@@ -7,6 +10,51 @@ import {
 } from "../harness.js";
 
 const MODULE = "worker-events";
+
+function createConfigTestRuntime(name) {
+  const runtimeDir = join(process.cwd(), "tests", MODULE, `runtime-${name}`);
+  if (existsSync(runtimeDir)) {
+    rmSync(runtimeDir, { recursive: true });
+  }
+  mkdirSync(join(runtimeDir, "logs"), { recursive: true });
+  return runtimeDir;
+}
+
+function cleanupConfigTestRuntime(name) {
+  const runtimeDir = join(process.cwd(), "tests", MODULE, `runtime-${name}`);
+  if (existsSync(runtimeDir)) {
+    rmSync(runtimeDir, { recursive: true });
+  }
+}
+
+function expectConfigTestFailure(configName, expectedMessage) {
+  const runtimeName = `config-${configName.replace(/[^a-z0-9]/gi, "-")}`;
+  const runtimeDir = createConfigTestRuntime(runtimeName);
+
+  try {
+    const result = spawnSync({
+      cmd: [
+        "./zig-out/bin/nginz",
+        "-t",
+        "-c",
+        join(process.cwd(), "tests", MODULE, configName),
+        "-p",
+        runtimeDir,
+      ],
+      cwd: process.cwd(),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const stderr = new TextDecoder().decode(result.stderr ?? new Uint8Array());
+    const stdout = new TextDecoder().decode(result.stdout ?? new Uint8Array());
+    const output = `${stdout}\n${stderr}`;
+    expect(output).toContain("test failed");
+    expect(output).toContain(expectedMessage);
+  } finally {
+    cleanupConfigTestRuntime(runtimeName);
+  }
+}
 
 describe("worker-events Phase 1 - publish and inspect", () => {
   beforeAll(async () => {
@@ -55,6 +103,7 @@ describe("worker-events Phase 1 - publish and inspect", () => {
 
     const body = await res.json();
     expect(body.module).toBe("worker_events");
+    expect(body.channel).toBe("cache.invalidate");
     expect(body).toHaveProperty("oldest_generation");
     expect(body).toHaveProperty("newest_generation");
     expect(body).toHaveProperty("dropped_events");
@@ -162,6 +211,19 @@ describe("worker-events Phase 1 - publish and inspect", () => {
     expect(body.generation).toBeGreaterThan(0);
   });
 
+  test("POST rejects non-JSON content-type", async () => {
+    const res = await fetch(`${TEST_URL}/worker-events`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: JSON.stringify({ type: "wrong_media_type" }),
+    });
+
+    expect(res.status).toBe(415);
+    const body = await res.json();
+    expect(body.status).toBe("error");
+    expect(body.error).toBe("content-type must be application/json");
+  });
+
   // ── Sequence of publishes ───────────────────────────────────────────────
 
   test("generations increase monotonically", async () => {
@@ -228,12 +290,29 @@ describe("worker-events Phase 1 - publish and inspect", () => {
     const body = await res.json();
     // All events should have been published to this channel
     expect(body.events.length).toBeGreaterThanOrEqual(1);
+    expect(body.channel).toBe("cache.invalidate");
   });
 
   test("inspect with non-matching channel returns empty", async () => {
     const res = await fetch(`${TEST_URL}/worker-events?channel=nonexistent`);
     const body = await res.json();
+    expect(body.channel).toBe("nonexistent");
     expect(body.events).toEqual([]);
+  });
+
+  test("event types are JSON-escaped in inspect output", async () => {
+    const specialType = 'quote"slash\\newline\n';
+    const res = await fetch(`${TEST_URL}/worker-events`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: specialType, payload: "ok" }),
+    });
+    expect(res.status).toBe(200);
+
+    const inspect = await fetch(`${TEST_URL}/worker-events`);
+    expect(inspect.status).toBe(200);
+    const body = await inspect.json();
+    expect(body.events.some((e) => e.type === specialType)).toBe(true);
   });
 });
 
@@ -253,39 +332,7 @@ describe("worker-events Phase 1 - error config", () => {
     expect(await res.text()).toBe("ok");
   });
 
-  test("GET without zone still returns data from shared zone", async () => {
-    // No zone configured on this location, but the global zone is already
-    // created by the /small-ring location. The handler falls back to it.
-    const res = await fetch(`${TEST_URL}/no-zone`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    // May return events if another location published to the shared zone
-    expect(body).toHaveProperty("events");
-    expect(body.module).toBe("worker_events");
-  });
-
-  test("POST without zone returns error", async () => {
-    const res = await fetch(`${TEST_URL}/no-zone`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ type: "test" }),
-    });
-    // PUBLISH requires channel, which /no-zone has ("test")
-    // It publishes to the global shared zone
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.status).toBe("published");
-  });
-
-  test("GET small-ring returns events from shared zone", async () => {
-    const res = await fetch(`${TEST_URL}/small-ring`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    // Should contain events published from /no-zone above
-    expect(body.events.length).toBeGreaterThanOrEqual(1);
-  });
-
-  test("small ring publish and inspect works", async () => {
+  test("small ring publish and inspect works as an independent zone", async () => {
     const res = await fetch(`${TEST_URL}/small-ring`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -294,6 +341,84 @@ describe("worker-events Phase 1 - error config", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.status).toBe("published");
-    expect(body.generation).toBeGreaterThan(1);
+    expect(body.generation).toBe(1);
+
+    const inspect = await fetch(`${TEST_URL}/small-ring`);
+    expect(inspect.status).toBe(200);
+    const state = await inspect.json();
+    expect(state.zone).toBe("small");
+    expect(state.channel).toBe("test");
+    expect(state.events).toHaveLength(1);
+    expect(state.events[0].type).toBe("small_event");
+  });
+});
+
+describe("worker-events Phase 1 - config load validation", () => {
+  test("worker_events_api requires worker_events_zone", () => {
+    expectConfigTestFailure(
+      "nginx-missing-zone.conf",
+      "worker_events_api requires worker_events_zone",
+    );
+  });
+
+  test("worker_events_api requires worker_events_channel", () => {
+    expectConfigTestFailure(
+      "nginx-missing-channel.conf",
+      "worker_events_api requires worker_events_channel",
+    );
+  });
+
+  test("shared zones reject conflicting ring sizes at config load", () => {
+    expectConfigTestFailure(
+      "nginx-zone-size-conflict.conf",
+      'conflicts with already declared size',
+    );
+  });
+});
+
+describe("worker-events Phase 1 - multi-zone isolation", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-multizone.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("separate zones keep separate generation counters and events", async () => {
+    const aPub = await fetch(`${TEST_URL}/zone-a`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "a1", payload: "from-a" }),
+    });
+    const aBody = await aPub.json();
+    expect(aPub.status).toBe(200);
+    expect(aBody.generation).toBe(1);
+
+    const bPub = await fetch(`${TEST_URL}/zone-b`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "b1", payload: "from-b" }),
+    });
+    const bBody = await bPub.json();
+    expect(bPub.status).toBe(200);
+    expect(bBody.generation).toBe(1);
+
+    const aInspect = await fetch(`${TEST_URL}/zone-a`);
+    const aState = await aInspect.json();
+    expect(aState.zone).toBe("zone_a");
+    expect(aState.channel).toBe("shared");
+    expect(aState.capacity).toBe(4);
+    expect(aState.events).toHaveLength(1);
+    expect(aState.events[0].type).toBe("a1");
+
+    const bInspect = await fetch(`${TEST_URL}/zone-b`);
+    const bState = await bInspect.json();
+    expect(bState.zone).toBe("zone_b");
+    expect(bState.channel).toBe("shared");
+    expect(bState.capacity).toBe(16);
+    expect(bState.events).toHaveLength(1);
+    expect(bState.events[0].type).toBe("b1");
   });
 });

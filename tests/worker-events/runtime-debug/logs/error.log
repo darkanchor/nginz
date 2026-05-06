@@ -1,0 +1,2 @@
+2026/05/06 18:51:34 [debug] 2#0: ok
+2026/05/06 18:51:34 [emerg] 2#0: socket() 0.0.0.0:8888 failed (1: Operation not permitted)

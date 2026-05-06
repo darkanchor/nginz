@@ -1,0 +1,1 @@
+2026/05/06 19:17:20 [emerg] 2#0: "worker_events_ring_size" directive worker_events_api requires worker_events_zone in /home/kaiwu/Documents/gitea/nginz/tests/worker-events/nginx-missing-zone.conf:21

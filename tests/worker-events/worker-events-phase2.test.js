@@ -54,6 +54,7 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.events.length).toBeGreaterThanOrEqual(50);
+    expect(body.channel).toBe("fanout");
 
     // All events should be in generation order
     for (let i = 1; i < body.events.length; i++) {
@@ -95,6 +96,24 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
     const body = await res.json();
     // Ring is 256, we published 55 events - no overflow
     expect(body.dropped_events).toBe(0);
+  });
+
+  test("inspect does not silently truncate above 128 retained events", async () => {
+    for (let i = 0; i < 90; i++) {
+      const res = await fetch(`${TEST_URL}/worker-events`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "bulk", payload: String(i) }),
+      });
+      expect(res.status).toBe(200);
+    }
+
+    const res = await fetch(`${TEST_URL}/worker-events`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.events.length).toBe(145);
+    expect(body.oldest_generation).toBe(1);
+    expect(body.newest_generation).toBe(145);
   });
 });
 

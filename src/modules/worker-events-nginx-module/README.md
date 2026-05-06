@@ -4,7 +4,7 @@ Planned cross-worker event bus primitive for nginz-native and njs-integrated coo
 
 ### Status
 
-**All 3 phases complete** - shared-memory ring, cross-worker visibility, overflow semantics, publish authorization, and consumer-oriented introspection are implemented and tested (42 Bun tests).
+**Core Phases 1-3 implemented; consumer adoption still pending** - shared-memory ring, cross-worker visibility, overflow semantics, publish authorization, and introspection are implemented and tested. What is not done yet is milestone-2 consumer integration such as health-transition fanout or a first real cache/session consumer path.
 
 ### Purpose and Boundaries
 
@@ -41,17 +41,18 @@ This module should **not** own:
 - One fixed-size `WorkerEventEntry` per slot: generation, channel (≤64 bytes), type (≤64 bytes), payload (≤512 bytes), timestamp
 - Overwrite-oldest semantics: when ring is full, oldest entry is overwritten and `dropped_events` increments
 
-**Config validation (runtime):**
-- Missing zone: publish returns error; inspect returns empty ring
-- Missing channel: publish returns error
-- Invalid ring size (0 or too large for zone): falls back to capacity calculated from zone size
+**Config validation:**
+- `worker_events_api` requires both `worker_events_zone` and `worker_events_channel` at config load
+- conflicting shared-memory zone sizes fail config load via nginx shared-memory declaration rules
+- `worker_events_ring_size` must be a positive integer
+- `POST` requires `Content-Type: application/json`
 
 ### Test Coverage
 
-42 Bun tests across 3 test files covering all three phases:
+Worker-events now has 46 Bun tests across 3 test files, covering all three implementation phases plus config-load validation checks:
 
-- **Phase 1** (22 tests): publish, inspect, error handling, HEAD, 405, field validation, filtering, config edge cases
-- **Phase 2** (11 tests): multi-worker cross-worker visibility, overflow/dropped accounting, since/limit after wrap
+- **Phase 1** (25 tests): publish, inspect, error handling, HEAD, 405, field validation, filtering, content-type enforcement, config edge cases
+- **Phase 2** (12 tests): multi-worker cross-worker visibility, overflow/dropped accounting, since/limit after wrap
 - **Phase 3** (9 tests): publish authorization, introspection field completeness, `last_publish_msec` updates
 
 ### Directive Surface
@@ -127,7 +128,7 @@ Phase 1 should standardize one minimal event entry with fields equivalent to:
 | The scaffold control endpoint is explicitly unimplemented | `tests/worker-events/worker-events.test.js` | ~~Keep placeholder behavior explicit until Phase 1 publish/introspection replaces it~~ **DONE: Phase 1 replaced scaffold** |
 | Phase 1 introduces one bounded publish/introspection contract | Phase 1 TDD checklist (all checked) | Bun tests for single-event publish, inspect response, invalid config, and unaffected neighboring routes — **DONE** |
 | Phase 2 is not complete until cross-worker visibility is proven | Phase 2 TDD checklist | Multi-worker Bun tests for ordering, overflow, dropped-event accounting, and channel behavior |
-| Phase 3 is stable enough for njs/native consumers | Phase 3 TDD checklist | Integration coverage for one real consumer path and any publish authorization added |
+| Phase 3 is stable enough for njs/native consumers | Phase 3 TDD checklist | Publish authorization and inspect contract are covered; first real consumer integration is still pending |
 
 ### Planned Consumers
 
@@ -243,19 +244,21 @@ Stabilize the module for njs-facing and operator-facing use.
 **TDD checklist**
 
 - [x] Add a Bun test for unauthorized publish rejection once auth exists
-- [x] Add an integration test for one real consumer path, such as cache invalidation fanout
+- [ ] Add an integration test for one real consumer path, such as cache invalidation fanout
 - [x] Add a test for consumer lag / missed-generation reporting if exposed
 
 **Implementation checklist**
 
-- [x] Document and stabilize njs-facing event conventions
+- [x] Document and stabilize the module-local publish/inspect event contract
 - [x] Add publish authorization or operational guardrails
 - [x] Add consumer-oriented introspection for lag / missed events if needed
+- [ ] Wire one real native or njs consumer to prove the boundary
 
 **Exit criteria**
 
 - [x] The README defines enough publish/inspect fields and error responses for one consumer module or njs package to integrate directly
 - [x] Introspection exposes enough fields to diagnose publish failure, overflow, and missed-generation conditions without raw memory inspection
+- [ ] One real consumer path is implemented and tested end-to-end
 
 **Phase 3 implementation summary (2026-05-06)**
 
@@ -330,10 +333,10 @@ server {
 - [x] Scaffolded Zig module and README exist under `src/modules/worker-events-nginx-module/`.
 - [x] Placeholder API endpoint makes non-implemented state explicit.
 - [x] README now includes phased checked todos and binary exit criteria for implementation.
-- [x] Bun integration coverage exists at `tests/worker-events/` for placeholder JSON, `HEAD`, and unaffected-route behavior.
+- [x] Bun integration coverage exists at `tests/worker-events/` for publish, inspect, config-load validation, `HEAD`, and unaffected-route behavior.
 - [x] Current scaffold claims now trace to present tests and future phase-specific verification points.
 
-The `worker-events` module is meant to be a small cross-worker signaling primitive for nginx. In plain words: it is supposed to let one worker publish an event, and let other workers see that event, so modules do not have to rely on polling.
+The `worker-events` module is meant to be a small cross-worker signaling primitive for nginx. In plain words: it lets one worker publish an event, and lets other workers see that event, so modules do not have to rely on polling.
 
 So the design goal is not “business logic” and not “message queue.” It is closer to an internal event bus: publish something like “cache key X was purged” or “token Y was revoked,” and let other workers react.
 
@@ -362,7 +365,7 @@ The design centers on a bounded shared-memory ring. That means events are append
 
 The important choice here is that it is intentionally not trying to guarantee delivery. It is a best-effort coordination primitive for invalidation-class signals. If the ring overflows, that has to be visible and counted, not hidden.
 
-Right now it is still scaffolded. The code in [ngx_http_worker_events.zig]() parses config stubs and exposes a placeholder endpoint that just returns `501`. The test in [worker-events.test.js]() confirms exactly that.
+That scaffold stage is over. The current code in [ngx_http_worker_events.zig]() exposes a real bounded shared-memory publish/inspect endpoint with multi-worker tests, but it still stops short of proving one downstream consumer integration.
 
 The intended directives are:
 
