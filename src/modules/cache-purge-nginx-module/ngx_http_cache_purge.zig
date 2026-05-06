@@ -37,6 +37,8 @@ const MAX_URIS_PER_TAG: usize = 64;
 const MAX_TAG_LEN: usize = 64;
 const MAX_URI_LEN: usize = 256;
 const CACHE_TAGS_ZONE_SIZE: usize = 8 * 1024 * 1024;
+const CACHE_PURGE_DEFAULT_ZONE = "default";
+const CACHE_TAGS_CANONICAL_ZONE = "cache_tags_zone";
 
 const TagEntry = extern struct {
     tag: [MAX_TAG_LEN]u8,
@@ -127,6 +129,15 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     }
 
     if (c.*.api_enabled == 1) {
+        if (c.*.zone_name.len == 0 or c.*.zone_name.data == null) {
+            return @constCast("cache_purge_api requires cache_purge_zone");
+        }
+        const zone_name = core.slicify(u8, c.*.zone_name.data, c.*.zone_name.len);
+        if (!std.mem.eql(u8, zone_name, CACHE_PURGE_DEFAULT_ZONE) and
+            !std.mem.eql(u8, zone_name, CACHE_TAGS_CANONICAL_ZONE))
+        {
+            return @constCast("cache_purge_zone currently supports only default or cache_tags_zone");
+        }
         if (c.*.match_mode == .prefix) {
             return @constCast("cache_purge_match prefix is not yet implemented; use exact");
         }
@@ -344,7 +355,7 @@ fn purge_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         return;
     }
 
-    // Copy target strings to pool before freeing cjson
+    // Validate and copy target strings to pool before freeing cjson
     var tag_bufs: ?[*c]ngx_str_t = null;
     if (target_count > 0) {
         tag_bufs = core.castPtr(ngx_str_t, core.ngx_pcalloc(r.*.pool, target_count * @sizeOf(ngx_str_t)));
@@ -356,21 +367,34 @@ fn purge_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         for (0..target_count) |i| {
             const item = cjson.cJSON_GetArrayItem(targets_node, @intCast(i));
             if (item == core.nullptr(cjson.cJSON) or cjson.cJSON_IsString(item) != 1) {
-                tag_bufs.?[i] = ngx_null_str;
-                continue;
+                cj.free(json);
+                _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"cache_purge\",\"status\":\"error\",\"error\":\"each target must be a non-empty string\"}"));
+                http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+                return;
             }
             const tv = CJSON.stringValue(item) orelse {
-                tag_bufs.?[i] = ngx_null_str;
-                continue;
+                cj.free(json);
+                _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"cache_purge\",\"status\":\"error\",\"error\":\"each target must be a non-empty string\"}"));
+                http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+                return;
             };
             if (tv.len == 0 or tv.data == null) {
-                tag_bufs.?[i] = ngx_null_str;
-                continue;
+                cj.free(json);
+                _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"cache_purge\",\"status\":\"error\",\"error\":\"each target must be a non-empty string\"}"));
+                http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+                return;
             }
-            const len = @min(tv.len, MAX_TAG_LEN);
+            if (tv.len > MAX_TAG_LEN) {
+                cj.free(json);
+                _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"cache_purge\",\"status\":\"error\",\"error\":\"target too long: max 64 characters\"}"));
+                http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+                return;
+            }
+            const len = tv.len;
             const data = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, len)) orelse {
-                tag_bufs.?[i] = ngx_null_str;
-                continue;
+                cj.free(json);
+                http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+                return;
             };
             @memcpy(core.slicify(u8, data, len), tv.data[0..len]);
             tag_bufs.?[i] = ngx_str_t{ .data = data, .len = len };

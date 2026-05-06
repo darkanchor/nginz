@@ -4,7 +4,7 @@ Planned selective cache-purge API for operational cache invalidation beyond raw 
 
 ### Status
 
-**Planning / scaffolded** - module wiring and placeholder API surface exist. Selective invalidation behavior is not implemented yet.
+**Phase 1 and exact-match Phase 2 landed; advanced policy still pending** - the module now exposes a real `POST` JSON purge API and exact tag invalidation against the shared `cache-tags` metadata store. Prefix/glob matching and stronger authorization modes remain unimplemented and are rejected at config load.
 
 ### Purpose and Boundaries
 
@@ -23,19 +23,24 @@ This module should **not** own:
 - generic workflow orchestration
 - worker fanout as a Phase 1 requirement
 
-### Current Scaffold Behavior
+### Current Behavior
 
-- `cache_purge_api` installs a placeholder JSON endpoint that returns HTTP `501`.
-- Remaining directives reserve configuration names and store stub values for future implementation.
-- No invalidation, wildcard matching, or cache metadata management is active yet.
+- `cache_purge_api` installs a `POST`-only JSON purge endpoint.
+- Request body shape is `{"targets":["tag-a","tag-b"]}`.
+- Exact tag invalidation removes matching entries from the shared `cache-tags` metadata store and returns per-target accounting.
+- `cache_purge_match prefix|glob` and `cache_purge_authorize allowlist|signed-token` are parsed but rejected at config load because the implementation is not there yet.
+- `cache_purge_zone` is currently limited to the single cache-tags metadata store and only accepts `default` or `cache_tags_zone`.
 
-### Current Scaffold Test Coverage
+### Current Test Coverage
 
-`tests/cache-purge/cache-purge.test.js` currently proves:
+`tests/cache-purge/cache-purge.test.js` now proves:
 
-- the scaffold endpoint returns an explicit JSON `501 Not Implemented` response
-- `HEAD` requests behave deterministically on the placeholder endpoint
-- unrelated routes continue working while selective invalidation is still unimplemented
+- method and content-type enforcement on the purge endpoint
+- request-body and target validation
+- config-load rejection for missing/unsupported zone config and deferred modes
+- exact invalidation success, zero-hit behavior, and idempotent repeated purge
+- shared metadata behavior under `worker_processes 2`
+- unrelated routes continue working
 
 ### Directive Surface
 
@@ -114,7 +119,7 @@ Before Phase 1 closes, the README must name:
 
 | Requirement / claim | Evidence today | Required future evidence |
 |---|---|---|
-| The scaffold purge endpoint is explicitly unimplemented | `tests/cache-purge/cache-purge.test.js` | Keep placeholder behavior explicit until Phase 1 contract replacement lands |
+| The scaffold purge endpoint is explicitly unimplemented | `tests/cache-purge/cache-purge.test.js` | ~~Keep placeholder behavior explicit until Phase 1 contract replacement lands~~ **DONE: replaced with real POST contract** |
 | Phase 1 defines a stable API contract before invalidation logic | Phase 1 TDD checklist | Bun tests for allowed/rejected methods, config validation, and max-keys request validation |
 | Phase 2 exact invalidation is useful before broader matching modes | Phase 2 TDD checklist | Bun tests for exact invalidation, zero-hit behavior, optional prefix mode, and multi-worker metadata visibility |
 | Phase 3 fanout and stronger auth stay additive | Phase 3 TDD checklist | Integration coverage for signed-token or allowlist auth and worker-events fanout only if implemented |
@@ -135,18 +140,18 @@ Replace the placeholder endpoint with a stable request/response contract and req
 
 **TDD checklist**
 
-- [ ] Add a Bun test for allowed methods on the purge endpoint
-- [ ] Add a Bun test for rejected methods
-- [ ] Add a Bun test for invalid match mode / invalid auth mode handling
-- [ ] Add a Bun test for max-keys validation on incoming requests
-- [ ] Add a Bun test proving valid Phase 1 requests no longer return the scaffold `501` placeholder
+- [x] Add a Bun test for allowed methods on the purge endpoint
+- [x] Add a Bun test for rejected methods
+- [x] Add a Bun test for invalid match mode / invalid auth mode handling
+- [x] Add a Bun test for max-keys validation on incoming requests
+- [x] Add a Bun test proving valid Phase 1 requests no longer return the scaffold `501` placeholder
 
 **Implementation checklist**
 
-- [ ] Replace `501` with a stable validation-aware JSON API
-- [ ] Implement config parsing and validation for zone, match mode, auth mode, and max keys
-- [ ] Define the request schema and response schema explicitly in the README and tests
-- [ ] Emit deterministic error responses for bad requests
+- [x] Replace `501` with a stable validation-aware JSON API
+- [x] Implement config parsing and validation for zone, match mode, auth mode, and max keys
+- [x] Define the request schema and response schema explicitly in the README and tests
+- [x] Emit deterministic error responses for bad requests
 
 **Exit criteria**
 
@@ -168,23 +173,23 @@ Implement useful targeted invalidation with exact matching first, then prefix ma
 
 **TDD checklist**
 
-- [ ] Add a Bun test for exact-key or exact-tag invalidation success
-- [ ] Add a Bun test for zero-hit invalidation returning a stable response
+- [x] Add a Bun test for exact-key or exact-tag invalidation success
+- [x] Add a Bun test for zero-hit invalidation returning a stable response
 - [ ] Add a Bun test for prefix invalidation if prefix mode is enabled in this phase
-- [ ] Add a multi-worker test proving purge metadata visibility across workers
+- [x] Add a multi-worker test proving purge metadata visibility across workers
 
 **Implementation checklist**
 
-- [ ] Implement exact invalidation against named purge metadata
-- [ ] Enforce max-keys bounds during batch operations
+- [x] Implement exact invalidation against named purge metadata
+- [x] Enforce max-keys bounds during batch operations
 - [ ] Add prefix invalidation only after exact invalidation is stable
-- [ ] Return operator-usable result counts in the response body
+- [x] Return operator-usable result counts in the response body
 
 **Exit criteria**
 
-- Exact invalidation removes or marks invalid the targeted cache metadata and returns documented result counts
+- [x] Exact invalidation removes or marks invalid the targeted cache metadata and returns documented result counts
 - Prefix matching remains deferred unless Phase 2 implementation and tests explicitly add it
-- Multi-worker metadata behavior is verified before being called complete
+- [x] Multi-worker metadata behavior is verified before being called complete
 
 #### Phase 3 - Policy hardening and fanout
 
@@ -261,8 +266,8 @@ server {
     location /internal/cache-purge {
         cache_purge_api;
         cache_purge_zone default;
-        cache_purge_match prefix;
-        cache_purge_authorize allowlist;
+        cache_purge_match exact;
+        cache_purge_authorize off;
         cache_purge_max_keys 256;
     }
 }
@@ -278,9 +283,9 @@ server {
 
 - [x] Audit date: 2026-05-03
 - [x] Scaffolded Zig module and README exist under `src/modules/cache-purge-nginx-module/`.
-- [x] Placeholder API endpoint makes the non-implemented state explicit.
+- [x] Placeholder API endpoint was replaced by a real POST-based purge contract.
 - [x] README now includes phased checked todos and binary exit criteria for implementation.
-- [x] Bun integration coverage exists at `tests/cache-purge/` for placeholder JSON, `HEAD`, and unaffected-route behavior.
+- [x] Bun integration coverage exists at `tests/cache-purge/` for request validation, config-load validation, exact invalidation, multi-worker shared metadata, and unaffected-route behavior.
 - [x] Current scaffold claims now trace to present tests and future phase-specific verification points.
 
 The `cache-purge` module is meant to be the operator-facing way to invalidate cached content. In plain words: it is supposed to give you an API endpoint where you can say “remove these cached entries” without doing a blunt full cache clear.
@@ -301,7 +306,7 @@ So the shape is: expose a location, bind it to some purge metadata zone, choose 
 
 The important design choice is that it wants to start with exact matching first, then maybe prefix matching later, and treat glob matching as optional and probably late. That is the right order. Exact invalidation is much easier to make correct and bounded. Prefix can be justified. Glob can get expensive and ambiguous fast.
 
-Right now the module is still only scaffolded. The code in [ngx_http_cache_purge.zig]() stores stub config and returns a `501` placeholder JSON response. The test in [cache-purge.test.js]() only proves that placeholder behavior.
+The scaffold stage is over. The code in [ngx_http_cache_purge.zig]() now exposes a real POST-based exact invalidation API backed by the shared `cache-tags` metadata store, with config-time rejection for unsupported match/auth modes and multi-worker test coverage for shared metadata mutation.
 
 The real engineering challenges are mostly about metadata and correctness:
 

@@ -989,3 +989,126 @@ config-time hook installation
 ```
 
 That is why `upstream-balancer` is the central runtime join point, even though several other modules are easier to build first.
+
+## Integration Reminder
+
+The module-local work is now in better shape than the milestone-2 integration
+story. This section is here as a reminder of the remaining join points between
+modules so they do not get lost while individual modules look "done" in
+isolation.
+
+### Current module-local status
+
+- `healthcheck` is locally ready for reporting and probing.
+- `worker-events` is locally ready as a shared event-ring primitive.
+- `cache-purge` is locally ready for exact-match invalidation against the
+  current shared `cache-tags` metadata store.
+
+What remains is mostly integration, not standalone feature scaffolding.
+
+### Integration points still pending
+
+#### 1. `healthcheck` -> `upstream-balancer`
+
+This is the most important milestone-2 gap still open.
+
+`healthcheck` already knows how to:
+
+- keep shared readiness state
+- probe service-level targets
+- probe upstream-level targets
+- probe peer targets
+- expose health information to endpoints, metrics, and variables
+
+What it still does not do by itself:
+
+- mark nginx upstream peers down
+- exclude unhealthy peers from live peer selection
+- influence fallback or retry behavior during selection
+- coordinate slow-start recovery with actual traffic routing
+
+So the remaining work here is:
+
+- define the peer identity contract shared between `healthcheck` and
+  `upstream-balancer`
+- decide how balancer selection reads health state safely
+- decide what "unhealthy" means for peer exclusion versus degraded routing
+- wire slow-start recovery metadata into real peer weighting/eligibility
+
+This is the boundary where health reporting becomes health-aware routing.
+
+#### 2. `healthcheck` -> `worker-events`
+
+This is the transition-fanout gap.
+
+Today `healthcheck` stores shared state and every worker can read that state.
+That is already useful, but milestone 2 still expects a way for workers to
+notice important health transitions without relying only on later polling or
+incidental reads.
+
+The intended shape is narrow:
+
+- `healthcheck` remains the source of truth
+- `worker-events` carries "something changed" signals
+- consumers react by re-reading shared health state rather than trusting the
+  event payload as the truth itself
+
+The remaining work here is:
+
+- define event type names for health transitions
+- decide what minimal payload is safe and useful
+- publish events only on meaningful transitions, not every probe tick
+- document consumer expectations for re-reading shared state
+
+#### 3. `worker-events` -> first real consumer
+
+`worker-events` is now useful as a primitive, but milestone 2 is stronger if
+one real module actually consumes it.
+
+Likely first consumers:
+
+- `healthcheck` transition fanout
+- later cache invalidation fanout
+
+What is still missing:
+
+- one end-to-end integration that proves a producer emits events and another
+  module or worker consumes them correctly
+- integration tests that validate the boundary rather than only the event ring
+  itself
+
+Until this lands, `worker-events` should be treated as locally complete but not
+yet integration-proven.
+
+#### 4. `cache-purge` -> `worker-events` (optional later phase)
+
+This is not required for the current exact-match cache-purge milestone slice.
+
+`cache-purge` is already useful without event fanout because it mutates the
+shared purge metadata directly. But if later cache invalidation behavior needs
+workers to react faster or trigger follow-on work, `worker-events` is the
+intended additive mechanism.
+
+Important constraint:
+
+- do not make `worker-events` a prerequisite for truthful exact invalidation
+
+If this integration lands later, it should be framed as:
+
+- purge metadata mutation remains the source of truth
+- emitted events are notifications about the mutation
+- consumers re-read shared metadata if they need current state
+
+### Practical conclusion
+
+For milestone 2 planning purposes:
+
+- `healthcheck`, `worker-events`, and `cache-purge` are each locally ready in
+  their current narrowed scopes
+- the major remaining milestone-2 work is cross-module integration
+- the highest-priority integration is `healthcheck` feeding
+  `upstream-balancer`
+- the next clean integration is `healthcheck` publishing transitions over
+  `worker-events`
+- `cache-purge` fanout through `worker-events` is useful later, but not a
+  blocker for the current exact-match control-plane goal
