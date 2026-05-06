@@ -15,6 +15,7 @@ const check_layout = @import("project/build_check_layout.zig");
 
 const NGINX = "src/ngx/nginx.zig";
 const required_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
+const worker_events_test_file = "src/modules/worker-events-nginx-module/ngx_http_worker_events.zig";
 
 var modules = [_][]const u8{
     // Core modules
@@ -126,6 +127,11 @@ fn module_path(f: []const u8) PN {
     return PN{ .p = f[0..l], .n = f[l + 1 .. d] };
 }
 
+fn requires_worker_events_test_support(path: []const u8) bool {
+    return std.mem.eql(u8, path, "src/modules/cache-purge-nginx-module/ngx_http_cache_purge.zig") or
+        std.mem.eql(u8, path, "src/modules/healthcheck-nginx-module/ngx_http_healthcheck.zig");
+}
+
 pub fn build(b: *std.Build) void {
     comptime {
         if (builtin.zig_version.order(required_zig_version) != .eq) {
@@ -231,6 +237,19 @@ pub fn build(b: *std.Build) void {
     test_moduleslib.root_module.linkLibrary(httplib);
     test_step.dependOn(&test_moduleslib.step);
 
+    const worker_events_test_support = b.addObject(.{
+        .name = "ngx_http_worker_events_test_support",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/modules/worker-events-nginx-module/ngx_http_worker_events.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    worker_events_test_support.root_module.addIncludePath(b.path("src/ngx/"));
+    worker_events_test_support.root_module.addImport("ngx", nginx);
+    worker_events_test_support.root_module.addImport("ngx_libinjection", ngx_libinjection);
+
     for (tests) |case| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -255,6 +274,9 @@ pub fn build(b: *std.Build) void {
         t.root_module.linkLibrary(cjsonlib);
         t.root_module.linkLibrary(libinjectionlib);
         t.root_module.linkLibrary(test_moduleslib);
+        if (requires_worker_events_test_support(case) and !std.mem.eql(u8, case, worker_events_test_file)) {
+            t.root_module.addObject(worker_events_test_support);
+        }
         t.root_module.addIncludePath(b.path("src/ngx/"));
         t.root_module.addImport("ngx", nginx);
         t.root_module.addImport("ngx_libinjection", ngx_libinjection);
