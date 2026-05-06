@@ -5,6 +5,9 @@ const core = ngx.core;
 const conf = ngx.conf;
 const http = ngx.http;
 const buf = ngx.buf;
+const shm = ngx.shm;
+const string = ngx.string;
+const cjson = ngx.cjson;
 
 const NGX_OK = core.NGX_OK;
 const NGX_ERROR = core.NGX_ERROR;
@@ -21,23 +24,156 @@ const ngx_module_t = ngx.module.ngx_module_t;
 const ngx_http_module_t = http.ngx_http_module_t;
 const ngx_http_request_t = http.ngx_http_request_t;
 
-const ngx_string = ngx.string.ngx_string;
+const ngx_string = string.ngx_string;
+const ngx_null_str = string.ngx_null_str;
+const CJSON = cjson.CJSON;
 
 extern var ngx_http_core_module: ngx_module_t;
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const DEFAULT_RING_SIZE: ngx_uint_t = 1024;
+const MAX_CHANNEL_LEN: usize = 64;
+const MAX_TYPE_LEN: usize = 64;
+const MAX_PAYLOAD_LEN: usize = 512;
+
+// ── Shared-memory data structures (C ABI) ────────────────────────────────────
+
+const WorkerEventsStore = extern struct {
+    initialized: ngx_flag_t,
+    capacity: ngx_uint_t,
+    payload_max: ngx_uint_t,
+
+    next_generation: u64,
+    write_index: ngx_uint_t,
+    retained_count: ngx_uint_t,
+
+    oldest_generation: u64,
+    newest_generation: u64,
+    dropped_events: u64,
+
+    last_publish_msec: i64,
+};
+
+const WorkerEventEntry = extern struct {
+    generation: u64,
+    channel_len: u16,
+    type_len: u16,
+    payload_len: u32,
+    created_at_msec: i64,
+
+    channel: [MAX_CHANNEL_LEN]u8,
+    event_type: [MAX_TYPE_LEN]u8,
+    payload: [MAX_PAYLOAD_LEN]u8,
+};
+
+// ── Location config ──────────────────────────────────────────────────────────
+
 const worker_events_loc_conf = extern struct {
     api_enabled: ngx_flag_t,
-    zone: ngx_str_t,
-    channel: ngx_str_t,
+    zone_name: ngx_str_t,
+    default_channel: ngx_str_t,
     ring_size: ngx_uint_t,
+    publish_key: ngx_str_t,
 };
+
+// ── Global state ─────────────────────────────────────────────────────────────
+
+var worker_events_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_shm_zone_t);
+
+// ── Shared-memory helpers ────────────────────────────────────────────────────
+
+fn get_store() ?[*c]WorkerEventsStore {
+    if (worker_events_zone == core.nullptr(core.ngx_shm_zone_t)) return null;
+    return core.castPtr(WorkerEventsStore, worker_events_zone.*.data);
+}
+
+fn get_shpool() ?[*c]core.ngx_slab_pool_t {
+    const zone = worker_events_zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.shm.addr == null or zone.*.data == null) {
+        return null;
+    }
+    return core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr);
+}
+
+fn get_entries(store: [*c]WorkerEventsStore) [*c]WorkerEventEntry {
+    // Entries follow the store in the end-of-zone area.
+    const store_size = @sizeOf(WorkerEventsStore);
+    const base = @as([*]u8, @ptrCast(@alignCast(store)));
+    return @as([*c]WorkerEventEntry, @ptrCast(@alignCast(base + store_size)));
+}
+
+fn get_current_time_msec() i64 {
+    const tp = core.ngx_timeofday();
+    if (tp) |t| {
+        return @as(i64, @intCast(t.*.sec)) * 1000 + @as(i64, @intCast(t.*.msec));
+    }
+    return 0;
+}
+
+// ── Zone init callback ───────────────────────────────────────────────────────
+
+fn zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) callconv(.c) ngx_int_t {
+    if (data != null) {
+        zone.*.data = data;
+        return NGX_OK;
+    }
+
+    const shpool = core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr) orelse return NGX_ERROR;
+    if (shpool.*.data != null) {
+        zone.*.data = shpool.*.data;
+        return NGX_OK;
+    }
+
+    // Layout: [slab_pool][...free slab area (≥ 2 pages)...][store][entries...]
+    // Store and entries sit at end of zone, outside slab management.
+    // The slab pool remains available for nginx internals (mutex, etc.)
+    // but we never allocate from it.
+    const zone_size = zone.*.shm.size;
+    const store_size = @sizeOf(WorkerEventsStore);
+    const entry_size = @sizeOf(WorkerEventEntry);
+    const min_slab_area: usize = 8192; // 2 pages for slab internals
+
+    if (zone_size < @sizeOf(core.ngx_slab_pool_t) + min_slab_area + store_size + entry_size) {
+        return NGX_ERROR;
+    }
+
+    const available = zone_size - @sizeOf(core.ngx_slab_pool_t) - min_slab_area;
+    const capacity: ngx_uint_t = @intCast((available - store_size) / entry_size);
+    if (capacity == 0) {
+        return NGX_ERROR;
+    }
+
+    // Place store + entries at end of zone
+    const base = @as([*]u8, @ptrCast(@alignCast(shpool)));
+    const total_data = store_size + capacity * entry_size;
+    const data_start = base + zone_size - total_data;
+    const store = @as([*c]WorkerEventsStore, @ptrCast(@alignCast(data_start)));
+
+    store.*.initialized = 1;
+    store.*.capacity = capacity;
+    store.*.payload_max = MAX_PAYLOAD_LEN;
+    store.*.next_generation = 1;
+    store.*.write_index = 0;
+    store.*.retained_count = 0;
+    store.*.oldest_generation = 0;
+    store.*.newest_generation = 0;
+    store.*.dropped_events = 0;
+
+    shpool.*.data = store;
+    zone.*.data = store;
+    return NGX_OK;
+}
+
+// ── Location config lifecycle ────────────────────────────────────────────────
 
 fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     if (core.ngz_pcalloc_c(worker_events_loc_conf, cf.*.pool)) |p| {
         p.*.api_enabled = conf.NGX_CONF_UNSET;
-        p.*.zone = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
-        p.*.channel = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
+        p.*.zone_name = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
+        p.*.default_channel = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
         p.*.ring_size = 0;
+        p.*.publish_key = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
         return p;
     }
     return null;
@@ -55,16 +191,112 @@ fn merge_loc_conf(
     if (c.*.api_enabled == conf.NGX_CONF_UNSET) {
         c.*.api_enabled = if (prev.*.api_enabled == conf.NGX_CONF_UNSET) 0 else prev.*.api_enabled;
     }
-    if (c.*.zone.len == 0) c.*.zone = prev.*.zone;
-    if (c.*.channel.len == 0) c.*.channel = prev.*.channel;
+    if (c.*.zone_name.len == 0) c.*.zone_name = prev.*.zone_name;
+    if (c.*.default_channel.len == 0) c.*.default_channel = prev.*.default_channel;
     if (c.*.ring_size == 0) c.*.ring_size = prev.*.ring_size;
+    if (c.*.publish_key.len == 0) c.*.publish_key = prev.*.publish_key;
 
     return conf.NGX_CONF_OK;
 }
 
-fn send_placeholder_json(r: [*c]ngx_http_request_t, body: ngx_str_t) ngx_int_t {
+// ── JSON helpers ─────────────────────────────────────────────────────────────
+
+fn json_escape_len(src: []const u8) usize {
+    var len: usize = 0;
+    for (src) |c| {
+        switch (c) {
+            '"', '\\' => len += 2,
+            '\n' => len += 2,
+            '\r' => len += 2,
+            '\t' => len += 2,
+            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => len += 6,
+            else => len += 1,
+        }
+    }
+    return len;
+}
+
+fn json_escape_into(dst: []u8, src: []const u8) usize {
+    var pos: usize = 0;
+    for (src) |c| {
+        switch (c) {
+            '"' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = '"';
+                pos += 2;
+            },
+            '\\' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = '\\';
+                pos += 2;
+            },
+            '\n' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = 'n';
+                pos += 2;
+            },
+            '\r' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = 'r';
+                pos += 2;
+            },
+            '\t' => {
+                dst[pos] = '\\';
+                dst[pos + 1] = 't';
+                pos += 2;
+            },
+            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
+                const hex = "0123456789abcdef";
+                dst[pos] = '\\';
+                dst[pos + 1] = 'u';
+                dst[pos + 2] = '0';
+                dst[pos + 3] = '0';
+                dst[pos + 4] = hex[(c >> 4) & 0xF];
+                dst[pos + 5] = hex[c & 0xF];
+                pos += 6;
+            },
+            else => {
+                dst[pos] = c;
+                pos += 1;
+            },
+        }
+    }
+    return pos;
+}
+
+fn write_u64_into(out: []u8, value: u64) usize {
+    if (value == 0) {
+        out[0] = '0';
+        return 1;
+    }
+    var v = value;
+    var pos: usize = 0;
+    var tmp: [20]u8 = undefined;
+    while (v > 0) {
+        tmp[pos] = @as(u8, @intCast((v % 10) + '0'));
+        pos += 1;
+        v /= 10;
+    }
+    var i: usize = 0;
+    while (i < pos) : (i += 1) {
+        out[i] = tmp[pos - 1 - i];
+    }
+    return pos;
+}
+
+fn str_copy(dst: []u8, src: ngx_str_t) usize {
+    const len = @min(dst.len, src.len);
+    if (len > 0) {
+        @memcpy(dst[0..len], src.data[0..len]);
+    }
+    return len;
+}
+
+// ── Response helpers ─────────────────────────────────────────────────────────
+
+fn send_json_response(r: [*c]ngx_http_request_t, status: ngx_uint_t, body: ngx_str_t) ngx_int_t {
     const content_type = ngx_string("application/json");
-    r.*.headers_out.status = 501;
+    r.*.headers_out.status = status;
     r.*.headers_out.content_type = content_type;
     r.*.headers_out.content_type_len = content_type.len;
     r.*.headers_out.content_length_n = @intCast(body.len);
@@ -91,9 +323,484 @@ fn send_placeholder_json(r: [*c]ngx_http_request_t, body: ngx_str_t) ngx_int_t {
     return http.ngx_http_output_filter(r, chain);
 }
 
-export fn ngx_http_worker_events_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
-    return send_placeholder_json(r, ngx_string("{\"status\":\"not_implemented\",\"module\":\"worker_events\"}"));
+// ── GET / HEAD - Inspect handler ─────────────────────────────────────────────
+
+fn handle_inspect(r: [*c]ngx_http_request_t) ngx_int_t {
+    const lccf = core.castPtr(
+        worker_events_loc_conf,
+        conf.ngx_http_get_module_loc_conf(r, &ngx_http_worker_events_module),
+    ) orelse return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+    // Resolve filter parameters
+    var channel_filter: ngx_str_t = lccf.*.default_channel;
+    var since_generation: u64 = 0;
+    var limit_count: ngx_uint_t = 0;
+
+    // Parse query args for channel filter
+    if (r.*.args.len > 0) {
+        // Parse query params manually
+        const args = core.slicify(u8, r.*.args.data, r.*.args.len);
+        var pos: usize = 0;
+        while (pos < args.len) {
+            const key_start = pos;
+            while (pos < args.len and args[pos] != '=' and args[pos] != '&') : (pos += 1) {}
+            const key_end = pos;
+            var value_start: usize = pos;
+            var value_end: usize = pos;
+            if (pos < args.len and args[pos] == '=') {
+                pos += 1;
+                value_start = pos;
+                while (pos < args.len and args[pos] != '&') : (pos += 1) {}
+                value_end = pos;
+            }
+            if (pos < args.len and args[pos] == '&') pos += 1;
+
+            const key = args[key_start..key_end];
+            const value = args[value_start..value_end];
+
+            if (std.mem.eql(u8, key, "channel")) {
+                // Set channel filter from query
+                channel_filter.len = @intCast(value.len);
+                channel_filter.data = @constCast(value.ptr);
+            } else if (std.mem.eql(u8, key, "since")) {
+                since_generation = std.fmt.parseInt(u64, value, 10) catch 0;
+            } else if (std.mem.eql(u8, key, "limit")) {
+                limit_count = std.fmt.parseInt(ngx_uint_t, value, 10) catch 0;
+            }
+        }
+    }
+
+    // Access shared memory
+    const store = get_store() orelse {
+        const body = ngx_string("{\"module\":\"worker_events\",\"zone\":\"\",\"oldest_generation\":0,\"newest_generation\":0,\"dropped_events\":0,\"events\":[]}");
+        return send_json_response(r, http.NGX_HTTP_OK, body);
+    };
+
+    const shpool = get_shpool() orelse {
+        return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
+    };
+
+    // Lock and snapshot
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
+
+    const oldest_gen = store.*.oldest_generation;
+    const newest_gen = store.*.newest_generation;
+    const dropped = store.*.dropped_events;
+    const retained = store.*.retained_count;
+    const capacity = store.*.capacity;
+    const entries = get_entries(store);
+
+    // Collect matching events (local copy to avoid holding lock during JSON render)
+    var matched_buf: [128]WorkerEventEntry = undefined;
+    var matched_count: usize = 0;
+    const max_matched = @min(@as(usize, 128), capacity);
+
+    if (retained > 0) {
+        // Entries are at indices [0, retained) in ring order
+        // The ring starts at write_index (next insertion point) for oldest
+        var i: ngx_uint_t = 0;
+        while (i < retained and matched_count < max_matched) : (i += 1) {
+            // Ring is circular: write_index points to next slot, so oldest is at write_index (if full)
+            // or at 0 (if not yet wrapped)
+            var idx: ngx_uint_t = undefined;
+            if (retained == capacity) {
+                // Ring is full, oldest is at write_index
+                idx = (store.*.write_index + i) % capacity;
+            } else {
+                // Ring not full, oldest is at 0
+                idx = i;
+            }
+
+            const entry = &entries[idx];
+
+            // Apply channel filter
+            if (channel_filter.len > 0) {
+                if (entry.channel_len != channel_filter.len) {
+                    continue;
+                }
+                const ch_str = ngx_str_t{ .data = @constCast(&entry.channel), .len = entry.channel_len };
+                if (!string.eql(ch_str, channel_filter)) {
+                    continue;
+                }
+            }
+
+            // Apply since filter
+            if (since_generation > 0 and entry.generation <= since_generation) {
+                continue;
+            }
+
+            // Apply limit
+            if (limit_count > 0 and matched_count >= limit_count) {
+                break;
+            }
+
+            matched_buf[matched_count] = entry.*;
+            matched_count += 1;
+        }
+    }
+
+    // Render JSON response (unlocked)
+    // Estimate size: ~200 bytes overhead + matched_count * ~800 bytes
+    const est_size: usize = 256 + matched_count * 900;
+    const buf_mem_raw = core.ngx_pnalloc(r.*.pool, est_size) orelse return NGX_ERROR;
+    const buf_mem: [*c]u8 = @ptrCast(@alignCast(buf_mem_raw));
+    var w: [*]u8 = buf_mem;
+    const w_end = w + est_size;
+
+    // Helper to write a string safely
+    const append = struct {
+        fn f(p: *[*]u8, end: [*]u8, s: []const u8) void {
+            const rem = @intFromPtr(end) - @intFromPtr(p.*);
+            const n = @min(s.len, rem);
+            @memcpy(p.*[0..n], s[0..n]);
+            p.* += n;
+        }
+    }.f;
+
+    append(&w, w_end, "{\"module\":\"worker_events\",");
+    append(&w, w_end, "\"zone\":\"");
+    {
+        const zn = lccf.*.zone_name;
+        const n = @min(zn.len, @intFromPtr(w_end) - @intFromPtr(w));
+        if (n > 0) {
+            @memcpy(w[0..n], zn.data[0..n]);
+            w += n;
+        }
+    }
+    append(&w, w_end, "\",");
+    append(&w, w_end, "\"capacity\":");
+    {
+        var nbuf: [20]u8 = undefined;
+        const n = write_u64_into(&nbuf, capacity);
+        append(&w, w_end, nbuf[0..n]);
+    }
+    append(&w, w_end, ",\"oldest_generation\":");
+    {
+        var nbuf: [20]u8 = undefined;
+        const n = write_u64_into(&nbuf, oldest_gen);
+        append(&w, w_end, nbuf[0..n]);
+    }
+    append(&w, w_end, ",\"newest_generation\":");
+    {
+        var nbuf: [20]u8 = undefined;
+        const n = write_u64_into(&nbuf, newest_gen);
+        append(&w, w_end, nbuf[0..n]);
+    }
+    append(&w, w_end, ",\"dropped_events\":");
+    {
+        var nbuf: [20]u8 = undefined;
+        const n = write_u64_into(&nbuf, dropped);
+        append(&w, w_end, nbuf[0..n]);
+    }
+    append(&w, w_end, ",\"last_publish_msec\":");
+    {
+        var nbuf: [20]u8 = undefined;
+        const n = write_u64_into(&nbuf, @as(u64, @bitCast(store.*.last_publish_msec)));
+        append(&w, w_end, nbuf[0..n]);
+    }
+    append(&w, w_end, ",\"events\":[");
+
+    for (0..matched_count) |i| {
+        if (i > 0) append(&w, w_end, ",");
+        const entry = &matched_buf[i];
+        append(&w, w_end, "{\"generation\":");
+        {
+            var nbuf: [20]u8 = undefined;
+            const n = write_u64_into(&nbuf, entry.generation);
+            append(&w, w_end, nbuf[0..n]);
+        }
+        append(&w, w_end, ",\"type\":\"");
+        {
+            const n = @min(@min(entry.type_len, MAX_TYPE_LEN), @intFromPtr(w_end) - @intFromPtr(w));
+            @memcpy(w[0..n], entry.event_type[0..n]);
+            w += n;
+        }
+        append(&w, w_end, "\",\"payload\":\"");
+        // JSON-escape the payload
+        {
+            const pl = entry.payload[0..@min(entry.payload_len, MAX_PAYLOAD_LEN)];
+            const escaped_len = json_escape_len(pl);
+            const rem = @intFromPtr(w_end) - @intFromPtr(w);
+            if (escaped_len <= rem) {
+                const actual = json_escape_into(w[0..rem], pl);
+                w += actual;
+            }
+        }
+        append(&w, w_end, "\"}");
+    }
+
+    append(&w, w_end, "]}");
+
+    const body = ngx_str_t{
+        .data = buf_mem,
+        .len = @intCast(@intFromPtr(w) - @intFromPtr(buf_mem)),
+    };
+    return send_json_response(r, http.NGX_HTTP_OK, body);
 }
+
+// ── POST body handler (called after body is read) ───────────────────────────
+
+fn publish_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
+    // Read request body
+    const b0 = r.*.request_body == core.nullptr(http.ngx_http_request_body_t);
+    const b1 = r.*.request_body.*.bufs == core.nullptr(ngx_chain_t);
+    if (b0 or b1) {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"missing request body\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    const body_str = buf.ngz_chain_content(r.*.request_body.*.bufs, r.*.pool) catch {
+        _ = send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"failed to read body\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+
+    // Parse JSON
+    var cj = CJSON.init(r.*.pool);
+    const json = cj.decode(body_str) catch {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"invalid JSON\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    };
+    defer cj.free(json);
+
+    // Extract "type" (required)
+    const type_node = cjson.cJSON_GetObjectItem(json, "type");
+    if (type_node == core.nullptr(cjson.cJSON) or cjson.cJSON_IsString(type_node) != 1) {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"missing or invalid 'type' field\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    const type_str = CJSON.stringValue(type_node) orelse ngx_null_str;
+    if (type_str.len == 0 or type_str.len > MAX_TYPE_LEN) {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"'type' must be 1-64 characters\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    // Extract "payload" (optional, fallback to empty string)
+    var payload_str: ngx_str_t = ngx_null_str;
+    if (cjson.cJSON_GetObjectItem(json, "payload")) |pl| {
+        if (cjson.cJSON_IsString(pl) == 1) {
+            payload_str = CJSON.stringValue(pl) orelse ngx_null_str;
+        }
+    }
+    if (payload_str.len > MAX_PAYLOAD_LEN) {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"payload too large\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    // Get location config for channel
+    const lccf = core.castPtr(
+        worker_events_loc_conf,
+        conf.ngx_http_get_module_loc_conf(r, &ngx_http_worker_events_module),
+    ) orelse {
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+
+    const channel_str = lccf.*.default_channel;
+    if (channel_str.len == 0 or channel_str.len > MAX_CHANNEL_LEN) {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"channel not configured\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    // Publish to shared ring
+    const store = get_store() orelse {
+        _ = send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"shared zone not initialized\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+
+    const shpool = get_shpool() orelse {
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
+
+    const entries = get_entries(store);
+    const generation = store.*.next_generation;
+    const write_idx = store.*.write_index;
+    const capacity = store.*.capacity;
+
+    // Check for overflow before writing
+    if (store.*.retained_count == capacity) {
+        // Ring is full - oldest entry will be overwritten
+        store.*.dropped_events += 1;
+        if (store.*.oldest_generation == 0) {
+            store.*.oldest_generation = entries[write_idx].generation;
+        }
+        // Advance oldest_generation to the generation being overwritten
+        store.*.oldest_generation = entries[write_idx].generation + 1;
+    }
+
+    // Write the entry
+    const entry = &entries[write_idx];
+    entry.*.generation = generation;
+    entry.*.created_at_msec = get_current_time_msec();
+
+    // Copy channel
+    entry.*.channel_len = @intCast(@min(channel_str.len, MAX_CHANNEL_LEN));
+    @memset(&entry.*.channel, 0);
+    _ = str_copy(&entry.*.channel, channel_str);
+
+    // Copy type
+    entry.*.type_len = @intCast(@min(type_str.len, MAX_TYPE_LEN));
+    @memset(&entry.*.event_type, 0);
+    _ = str_copy(&entry.*.event_type, type_str);
+
+    // Copy payload
+    entry.*.payload_len = @intCast(@min(payload_str.len, MAX_PAYLOAD_LEN));
+    @memset(&entry.*.payload, 0);
+    _ = str_copy(&entry.*.payload, payload_str);
+
+    // Advance indices
+    store.*.write_index = (write_idx + 1) % capacity;
+    store.*.next_generation = generation + 1;
+    store.*.newest_generation = generation;
+    store.*.last_publish_msec = entry.*.created_at_msec;
+    if (store.*.retained_count < capacity) {
+        store.*.retained_count += 1;
+    }
+    if (store.*.oldest_generation == 0) {
+        store.*.oldest_generation = generation;
+    }
+
+    // Build success response
+    // Estimate max size: ~150 bytes
+    const resp_size: usize = 256;
+    const resp_mem_raw = core.ngx_pnalloc(r.*.pool, resp_size) orelse {
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+    const resp_mem: [*c]u8 = @ptrCast(@alignCast(resp_mem_raw));
+    var w2: [*]u8 = resp_mem;
+
+    const append2 = struct {
+        fn f(p: *[*]u8, s: []const u8) void {
+            @memcpy(p.*[0..s.len], s[0..s.len]);
+            p.* += s.len;
+        }
+    }.f;
+
+    append2(&w2, "{\"module\":\"worker_events\",\"status\":\"published\",\"zone\":\"");
+    {
+        const n = @min(lccf.*.zone_name.len, MAX_CHANNEL_LEN);
+        if (n > 0) {
+            @memcpy(w2[0..n], lccf.*.zone_name.data[0..n]);
+            w2 += n;
+        }
+    }
+    append2(&w2, "\",\"channel\":\"");
+    {
+        const n = @min(channel_str.len, MAX_CHANNEL_LEN);
+        if (n > 0) {
+            @memcpy(w2[0..n], channel_str.data[0..n]);
+            w2 += n;
+        }
+    }
+    append2(&w2, "\",\"generation\":");
+    {
+        var nbuf: [20]u8 = undefined;
+        const n = write_u64_into(&nbuf, generation);
+        @memcpy(w2[0..n], nbuf[0..n]);
+        w2 += n;
+    }
+    append2(&w2, "}");
+
+    const resp_body = ngx_str_t{
+        .data = resp_mem,
+        .len = @intCast(@intFromPtr(w2) - @intFromPtr(resp_mem)),
+    };
+    _ = send_json_response(r, http.NGX_HTTP_OK, resp_body);
+    http.ngx_http_finalize_request(r, NGX_OK);
+}
+
+// ── POST - Publish handler ───────────────────────────────────────────────────
+
+fn handle_publish(r: [*c]ngx_http_request_t) ngx_int_t {
+    // Validate config first (cheap checks before body read)
+    const lccf = core.castPtr(
+        worker_events_loc_conf,
+        conf.ngx_http_get_module_loc_conf(r, &ngx_http_worker_events_module),
+    ) orelse return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+    if (lccf.*.default_channel.len == 0) {
+        return send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"channel not configured\"}"));
+    }
+
+    if (worker_events_zone == core.nullptr(core.ngx_shm_zone_t)) {
+        return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"shared zone not configured\"}"));
+    }
+
+    // Check publish authorization
+    if (lccf.*.publish_key.len > 0) {
+        const authorized = check_publish_auth(r, lccf);
+        if (!authorized) {
+            return send_json_response(r, http.NGX_HTTP_UNAUTHORIZED, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"unauthorized: invalid publish key\"}"));
+        }
+    }
+
+    // Read request body asynchronously
+    const rc = http.ngx_http_read_client_request_body(r, publish_body_handler);
+    if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) {
+        return rc;
+    }
+    return core.NGX_DONE;
+}
+
+fn check_publish_auth(r: [*c]ngx_http_request_t, lccf: [*c]worker_events_loc_conf) bool {
+    // Check query param ?key=...
+    if (r.*.args.len > 0) {
+        const args = core.slicify(u8, r.*.args.data, r.*.args.len);
+        var pos: usize = 0;
+        while (pos < args.len) {
+            const key_start = pos;
+            while (pos < args.len and args[pos] != '=' and args[pos] != '&') : (pos += 1) {}
+            const key_end = pos;
+            var value_start: usize = pos;
+            var value_end: usize = pos;
+            if (pos < args.len and args[pos] == '=') {
+                pos += 1;
+                value_start = pos;
+                while (pos < args.len and args[pos] != '&') : (pos += 1) {}
+                value_end = pos;
+            }
+            if (pos < args.len and args[pos] == '&') pos += 1;
+
+            const key = args[key_start..key_end];
+            if (std.mem.eql(u8, key, "key")) {
+                const value = args[value_start..value_end];
+                if (value.len == lccf.*.publish_key.len and std.mem.eql(u8, value, core.slicify(u8, lccf.*.publish_key.data, lccf.*.publish_key.len))) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+// ── Main handler ─────────────────────────────────────────────────────────────
+
+export fn ngx_http_worker_events_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    if (r.*.method == http.NGX_HTTP_GET or r.*.method == http.NGX_HTTP_HEAD) {
+        return handle_inspect(r);
+    }
+    if (r.*.method == http.NGX_HTTP_POST) {
+        return handle_publish(r);
+    }
+    return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"method not allowed\"}"));
+}
+
+// ── Directive handlers ───────────────────────────────────────────────────────
 
 fn ngx_conf_set_worker_events_api(
     cf: [*c]ngx_conf_t,
@@ -122,7 +829,13 @@ fn ngx_conf_set_worker_events_zone(
     if (core.castPtr(worker_events_loc_conf, loc)) |lccf| {
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
-            lccf.*.zone = arg.*;
+            lccf.*.zone_name = arg.*;
+
+            // If ring_size is already set, create zone now.
+            // Otherwise, zone creation is deferred to ring_size handler.
+            if (lccf.*.ring_size > 0 and lccf.*.zone_name.len > 0 and worker_events_zone == core.nullptr(core.ngx_shm_zone_t)) {
+                create_shared_zone(cf, lccf);
+            }
         }
     }
     return conf.NGX_CONF_OK;
@@ -137,7 +850,7 @@ fn ngx_conf_set_worker_events_channel(
     if (core.castPtr(worker_events_loc_conf, loc)) |lccf| {
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
-            lccf.*.channel = arg.*;
+            lccf.*.default_channel = arg.*;
         }
     }
     return conf.NGX_CONF_OK;
@@ -154,14 +867,68 @@ fn ngx_conf_set_worker_events_ring_size(
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             const slice = core.slicify(u8, arg.*.data, arg.*.len);
             lccf.*.ring_size = std.fmt.parseInt(ngx_uint_t, slice, 10) catch 0;
+
+            // If zone_name was already set before ring_size, create zone now.
+            if (lccf.*.ring_size > 0 and lccf.*.zone_name.len > 0 and worker_events_zone == core.nullptr(core.ngx_shm_zone_t)) {
+                create_shared_zone(cf, lccf);
+            }
         }
     }
     return conf.NGX_CONF_OK;
 }
 
+fn ngx_conf_set_worker_events_publish_key(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(worker_events_loc_conf, loc)) |lccf| {
+        var i: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
+            lccf.*.publish_key = arg.*;
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
+fn create_shared_zone(cf: [*c]ngx_conf_t, lccf: [*c]worker_events_loc_conf) void {
+    var rs = lccf.*.ring_size;
+    if (rs == 0) {
+        rs = DEFAULT_RING_SIZE;
+    }
+
+    const entry_size = @sizeOf(WorkerEventEntry);
+    const store_size = @sizeOf(WorkerEventsStore);
+    // Zone layout: [slab_pool][...free slab area (2 pages)...][store][entries...]
+    const min_slab_area: usize = 8192;
+    const data_size = store_size + rs * entry_size;
+    const zone_size = @sizeOf(core.ngx_slab_pool_t) + min_slab_area + data_size;
+
+    if (lccf.*.zone_name.len > 0) {
+        const name_ptr: [*c]ngx_str_t = @constCast(&lccf.*.zone_name);
+        const zone = shm.ngx_shared_memory_add(cf, name_ptr, zone_size, @constCast(&ngx_http_worker_events_module));
+        if (zone != core.nullptr(core.ngx_shm_zone_t)) {
+            zone.*.init = zone_init;
+            worker_events_zone = zone;
+        }
+    }
+}
+
+// ── Postconfiguration ────────────────────────────────────────────────────────
+
+fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
+    _ = cf;
+    // Validate zone consistency if api is enabled
+    // (More validation can be added here in later phases)
+    return NGX_OK;
+}
+
+// ── Module exports ───────────────────────────────────────────────────────────
+
 export const ngx_http_worker_events_module_ctx = ngx_http_module_t{
     .preconfiguration = null,
-    .postconfiguration = null,
+    .postconfiguration = postconfiguration,
     .create_main_conf = null,
     .init_main_conf = null,
     .create_srv_conf = null,
@@ -199,6 +966,14 @@ export const ngx_http_worker_events_commands = [_]ngx_command_t{
         .name = ngx_string("worker_events_ring_size"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
         .set = ngx_conf_set_worker_events_ring_size,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("worker_events_publish_key"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = ngx_conf_set_worker_events_publish_key,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,
