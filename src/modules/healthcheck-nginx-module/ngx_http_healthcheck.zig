@@ -73,6 +73,42 @@ extern fn setsockopt(fd: c_int, level: c_int, optname: c_int, optval: *const any
 extern fn getaddrinfo(node: [*:0]const u8, service: [*:0]const u8, hints: ?*const AddrInfo, res: [*c]?*AddrInfo) c_int;
 extern fn freeaddrinfo(res: ?*AddrInfo) void;
 
+// ── OpenSSL / TLS externs (used for HTTPS probes) ──────────────────────────
+
+const SSL_CTX = opaque {};
+const SSL = opaque {};
+extern fn TLS_client_method() ?*SSL_CTX;
+extern fn SSL_CTX_new(method: ?*SSL_CTX) ?*SSL_CTX;
+extern fn SSL_new(ctx: ?*SSL_CTX) ?*SSL;
+extern fn SSL_set_fd(ssl: ?*SSL, fd: c_int) c_int;
+extern fn SSL_connect(ssl: ?*SSL) c_int;
+extern fn SSL_read(ssl: ?*SSL, buf: [*c]u8, num: c_int) c_int;
+extern fn SSL_write(ssl: ?*SSL, buf: [*c]const u8, num: c_int) c_int;
+extern fn SSL_shutdown(ssl: ?*SSL) c_int;
+extern fn SSL_free(ssl: ?*SSL) void;
+extern fn SSL_CTX_free(ctx: ?*SSL_CTX) void;
+
+// ── Probe feature flags ─────────────────────────────────────────────────────
+
+const PROBE_FLAG_TLS: u8 = 1 << 0;
+const PROBE_FLAG_HAS_MATCH: u8 = 1 << 1;
+
+// ── Match rule config ───────────────────────────────────────────────────────
+
+const MAX_PROBE_MATCH_BODY_LEN: usize = 255;
+
+const ProbeMatchConfig = struct {
+    status_min: ngx_uint_t, // 0 = don't check status range
+    status_max: ngx_uint_t,
+    body_len: usize, // 0 = don't check body
+    body_buf: [MAX_PROBE_MATCH_BODY_LEN]u8,
+};
+
+const ProbeMatchResult = struct {
+    status_ok: bool,
+    body_ok: bool,
+};
+
 // ── Config structs ───────────────────────────────────────────────────────────
 
 const healthcheck_loc_conf = extern struct {
@@ -88,11 +124,17 @@ const healthcheck_ups_conf = extern struct {
     probe_timeout_ms: ngx_msec_t,
     probe_fail_threshold: ngx_uint_t,
     probe_pass_threshold: ngx_uint_t,
+    probe_slow_start_ms: ngx_msec_t,
     probe_port: ngx_uint_t,
     probe_host_len: usize,
     probe_path_len: usize,
+    probe_flags: u8, // PROBE_FLAG_TLS, PROBE_FLAG_HAS_MATCH
     probe_host_buf: [MAX_PROBE_HOST_LEN]u8,
     probe_path_buf: [MAX_PROBE_PATH_LEN]u8,
+    match_status_min: ngx_uint_t,
+    match_status_max: ngx_uint_t,
+    match_body_len: usize,
+    match_body_buf: [MAX_PROBE_MATCH_BODY_LEN]u8,
 };
 
 // ── Shared memory layout ─────────────────────────────────────────────────────
@@ -111,6 +153,10 @@ const healthcheck_store = extern struct {
     probe_consecutive_failures: u32,
     probe_total_successes: u64,
     probe_total_failures: u64,
+    // Slow-start recovery: ms elapsed since recovery began.
+    // When > 0 and < slow_start_ms, the peer is in ramp-up.
+    probe_slow_start_elapsed_ms: i64,
+    probe_recovered_at_ms: i64,
 };
 
 // ── Read-only snapshots (not in shared memory) ───────────────────────────────
@@ -128,39 +174,95 @@ const healthcheck_snapshot = struct {
     probe_consecutive_failures: u32,
     probe_total_successes: u64,
     probe_total_failures: u64,
+    probe_slow_start_elapsed_ms: i64,
+    probe_recovered_at_ms: i64,
 };
 
 const upstream_snapshot = struct {
     name: []const u8,
     probe_healthy: bool,
     probe_last_status: ngx_uint_t,
+    probe_last_checked_ms: i64,
+    probe_last_started_ms: i64,
     probe_total_successes: u64,
     probe_total_failures: u64,
     probe_consecutive_successes: u32,
     probe_consecutive_failures: u32,
+    probe_slow_start_elapsed_ms: i64,
+    probe_recovered_at_ms: i64,
+};
+
+const peer_snapshot = struct {
+    upstream_name: []const u8,
+    peer_addr: []const u8,
+    probe_healthy: bool,
+    probe_last_status: ngx_uint_t,
+    probe_last_checked_ms: i64,
+    probe_last_started_ms: i64,
+    probe_total_successes: u64,
+    probe_total_failures: u64,
+    probe_consecutive_successes: u32,
+    probe_consecutive_failures: u32,
+    probe_slow_start_elapsed_ms: i64,
+    probe_recovered_at_ms: i64,
 };
 
 const ProbeResult = struct {
     success: bool,
     status: ngx_uint_t,
+    match_status_ok: bool,
+    match_body_ok: bool,
 };
 
 // ── Per-upstream probe tracking (worker-local, stable global array) ──────────
+
+const MAX_PEER_PROBES: usize = 64;
+const MAX_PEER_ADDR_LEN: usize = 63;
+
+const PeerProbeEntry = struct {
+    interval_ms: ngx_msec_t,
+    timeout_ms: ngx_msec_t,
+    fail_threshold: ngx_uint_t,
+    pass_threshold: ngx_uint_t,
+    slow_start_ms: ngx_msec_t,
+    port: u16,
+    host_len: usize,
+    path_len: usize,
+    addr_len: usize,
+    flags: u8, // PROBE_FLAG_TLS, PROBE_FLAG_HAS_MATCH
+    host_buf: [MAX_PROBE_HOST_LEN + 1]u8,
+    path_buf: [MAX_PROBE_PATH_LEN]u8,
+    addr_buf: [MAX_PEER_ADDR_LEN + 1]u8,
+    name_buf: [MAX_UPSTREAM_NAME_LEN + 1]u8, // parent upstream name
+    name_len: usize,
+    zone: [*c]core.ngx_shm_zone_t,
+    timer: core.ngx_event_t,
+    match_status_min: ngx_uint_t,
+    match_status_max: ngx_uint_t,
+    match_body_len: usize,
+    match_body_buf: [MAX_PROBE_MATCH_BODY_LEN]u8,
+};
 
 const UpstreamProbeEntry = struct {
     interval_ms: ngx_msec_t,
     timeout_ms: ngx_msec_t,
     fail_threshold: ngx_uint_t,
     pass_threshold: ngx_uint_t,
+    slow_start_ms: ngx_msec_t,
     port: u16,
     host_len: usize,
     path_len: usize,
+    flags: u8, // PROBE_FLAG_TLS, PROBE_FLAG_HAS_MATCH
     host_buf: [MAX_PROBE_HOST_LEN + 1]u8, // null-terminated for getaddrinfo
     path_buf: [MAX_PROBE_PATH_LEN]u8,
     name_len: usize,
     name_buf: [MAX_UPSTREAM_NAME_LEN + 1]u8,
     zone: [*c]core.ngx_shm_zone_t,
     timer: core.ngx_event_t,
+    match_status_min: ngx_uint_t,
+    match_status_max: ngx_uint_t,
+    match_body_len: usize,
+    match_body_buf: [MAX_PROBE_MATCH_BODY_LEN]u8,
 };
 
 // ── Module-level globals ─────────────────────────────────────────────────────
@@ -173,14 +275,23 @@ var healthcheck_probe_interval_ms: ngx_msec_t = 5000;
 var healthcheck_probe_timeout_ms: ngx_msec_t = 1000;
 var healthcheck_probe_fail_threshold: ngx_uint_t = 2;
 var healthcheck_probe_pass_threshold: ngx_uint_t = 1;
+var healthcheck_probe_slow_start_ms: ngx_msec_t = 0;
 var healthcheck_probe_port: u16 = 80;
 var healthcheck_probe_host_len: usize = 0;
 var healthcheck_probe_path_len: usize = 1;
+var healthcheck_probe_flags: u8 = 0; // PROBE_FLAG_TLS, PROBE_FLAG_HAS_MATCH
 var healthcheck_probe_host_buf: [MAX_PROBE_HOST_LEN]u8 = [_]u8{0} ** MAX_PROBE_HOST_LEN;
 var healthcheck_probe_path_buf: [MAX_PROBE_PATH_LEN]u8 = [_]u8{0} ** MAX_PROBE_PATH_LEN;
+var healthcheck_probe_match_status_min: ngx_uint_t = 0;
+var healthcheck_probe_match_status_max: ngx_uint_t = 0;
+var healthcheck_probe_match_body_len: usize = 0;
+var healthcheck_probe_match_body_buf: [MAX_PROBE_MATCH_BODY_LEN]u8 = [_]u8{0} ** MAX_PROBE_MATCH_BODY_LEN;
 
 var upstream_probes: [MAX_UPSTREAM_PROBES]UpstreamProbeEntry = undefined;
 var upstream_probe_count: usize = 0;
+
+var peer_probes: [MAX_PEER_PROBES]PeerProbeEntry = undefined;
+var peer_probe_count: usize = 0;
 
 // ── Shared memory helpers ────────────────────────────────────────────────────
 
@@ -339,7 +450,7 @@ fn configError(cf: [*c]ngx_conf_t, msg: []const u8) [*c]u8 {
     return conf.NGX_CONF_ERROR;
 }
 
-// Parse http://host:port/path and write into the provided buffers.
+// Parse http[s]://host:port/path and write into the provided buffers.
 // Returns false on any validation failure.
 fn parseProbeTarget(
     raw_target: []const u8,
@@ -348,10 +459,19 @@ fn parseProbeTarget(
     host_len_out: *usize,
     path_len_out: *usize,
     port_out: *u16,
+    flags_out: *u8,
 ) bool {
-    if (!std.mem.startsWith(u8, raw_target, "http://")) return false;
+    var is_tls = false;
+    var rest: []const u8 = undefined;
+    if (std.mem.startsWith(u8, raw_target, "https://")) {
+        is_tls = true;
+        rest = raw_target[8..];
+    } else if (std.mem.startsWith(u8, raw_target, "http://")) {
+        rest = raw_target[7..];
+    } else {
+        return false;
+    }
 
-    const rest = raw_target[7..];
     const slash_index = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     const host_port = rest[0..slash_index];
     const path = if (slash_index < rest.len) rest[slash_index..] else "/";
@@ -379,11 +499,15 @@ fn parseProbeTarget(
     path_len_out.* = path.len;
 
     port_out.* = port;
+    if (is_tls) {
+        flags_out.* |= PROBE_FLAG_TLS;
+    }
     return true;
 }
 
 fn applyProbeTarget(raw_target: []const u8) bool {
     var port: u16 = 0;
+    var flags: u8 = 0;
     const ok = parseProbeTarget(
         raw_target,
         &healthcheck_probe_host_buf,
@@ -391,9 +515,11 @@ fn applyProbeTarget(raw_target: []const u8) bool {
         &healthcheck_probe_host_len,
         &healthcheck_probe_path_len,
         &port,
+        &flags,
     );
     if (ok) {
         healthcheck_probe_port = port;
+        healthcheck_probe_flags = flags;
         healthcheck_probe_enabled = true;
     }
     return ok;
@@ -403,6 +529,7 @@ fn applyProbeTargetToConf(ups_conf: *healthcheck_ups_conf, raw_target: []const u
     var port: u16 = 0;
     var host_len: usize = 0;
     var path_len: usize = 0;
+    var flags: u8 = 0;
     const ok = parseProbeTarget(
         raw_target,
         &ups_conf.probe_host_buf,
@@ -410,11 +537,13 @@ fn applyProbeTargetToConf(ups_conf: *healthcheck_ups_conf, raw_target: []const u
         &host_len,
         &path_len,
         &port,
+        &flags,
     );
     if (ok) {
         ups_conf.probe_host_len = host_len;
         ups_conf.probe_path_len = path_len;
         ups_conf.probe_port = port;
+        ups_conf.probe_flags = flags;
         ups_conf.probe_enabled = 1;
     }
     return ok;
@@ -428,9 +557,13 @@ fn performProbeWith(
     path_slice: []const u8,
     port: u16,
     timeout_ms: ngx_msec_t,
+    use_tls: bool,
+    match_status_min: ngx_uint_t,
+    match_status_max: ngx_uint_t,
+    match_body: []const u8,
 ) ProbeResult {
     var port_buf: [6:0]u8 = [_:0]u8{0} ** 6;
-    const port_slice = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return .{ .success = false, .status = 0 };
+    const port_slice = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
     port_buf[port_slice.len] = 0;
 
     var hints = std.mem.zeroes(AddrInfo);
@@ -439,16 +572,16 @@ fn performProbeWith(
 
     var results: ?*AddrInfo = null;
     if (getaddrinfo(host_cstr, port_buf[0..port_slice.len :0], &hints, &results) != 0 or results == null) {
-        return .{ .success = false, .status = 0 };
+        return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
     }
     defer freeaddrinfo(results);
 
-    var request_buf: [512]u8 = undefined;
+    var request_buf: [1024]u8 = undefined;
     const request = std.fmt.bufPrint(
         &request_buf,
         "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\nUser-Agent: nginz-healthcheck\r\n\r\n",
         .{ path_slice, host_slice },
-    ) catch return .{ .success = false, .status = 0 };
+    ) catch return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
 
     var it = results;
     while (it) |ai| : (it = ai.ai_next) {
@@ -469,52 +602,119 @@ fn performProbeWith(
             continue;
         }
 
+        // TLS handshake if HTTPS target
+        var ssl: ?*SSL = null;
+        if (use_tls) {
+            const method = TLS_client_method();
+            if (method) |m| {
+                const ctx = SSL_CTX_new(m);
+                if (ctx) |c| {
+                    ssl = SSL_new(c);
+                    if (ssl) |s| {
+                        _ = SSL_set_fd(s, fd);
+                        if (SSL_connect(s) != 1) {
+                            SSL_free(s);
+                            SSL_CTX_free(c);
+                            _ = close(fd);
+                            continue;
+                        }
+                    } else {
+                        SSL_CTX_free(c);
+                    }
+                }
+            }
+            if (ssl == null) {
+                _ = close(fd);
+                continue;
+            }
+        }
+
         var sent_total: usize = 0;
         while (sent_total < request.len) {
-            const sent = send(fd, request.ptr + sent_total, request.len - sent_total, 0);
+            var sent: isize = undefined;
+            if (ssl) |s| {
+                sent = @intCast(SSL_write(s, request.ptr + sent_total, @intCast(request.len - sent_total)));
+            } else {
+                sent = send(fd, request.ptr + sent_total, request.len - sent_total, 0);
+            }
             if (sent <= 0) {
+                if (ssl) |s| {
+                    _ = SSL_shutdown(s);
+                    SSL_free(s);
+                }
                 _ = close(fd);
-                return .{ .success = false, .status = 0 };
+                return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
             }
             sent_total += @intCast(sent);
         }
 
-        var response_buf: [256]u8 = undefined;
-        const received = recv(fd, &response_buf, response_buf.len, 0);
+        var response_buf: [4096]u8 = undefined;
+        const received: isize = if (ssl) |s|
+            @intCast(SSL_read(s, &response_buf, @intCast(response_buf.len)))
+        else
+            recv(fd, &response_buf, response_buf.len, 0);
+
         if (received <= 0) {
+            if (ssl) |s| {
+                _ = SSL_shutdown(s);
+                SSL_free(s);
+            }
             _ = close(fd);
-            return .{ .success = false, .status = 0 };
+            return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
         }
 
         const received_slice = response_buf[0..@intCast(received)];
+        if (ssl) |s| {
+            _ = SSL_shutdown(s);
+            SSL_free(s);
+        }
+        _ = close(fd);
+
         if (!std.mem.startsWith(u8, received_slice, "HTTP/")) {
-            _ = close(fd);
-            return .{ .success = false, .status = 0 };
+            return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
         }
 
         const first_space = std.mem.indexOfScalar(u8, received_slice, ' ') orelse {
-            _ = close(fd);
-            return .{ .success = false, .status = 0 };
+            return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
         };
         const second_space_rel = std.mem.indexOfScalar(u8, received_slice[first_space + 1 ..], ' ') orelse {
-            _ = close(fd);
-            return .{ .success = false, .status = 0 };
+            return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
         };
         const status_slice = received_slice[first_space + 1 .. first_space + 1 + second_space_rel];
         const status = std.fmt.parseInt(ngx_uint_t, status_slice, 10) catch {
-            _ = close(fd);
-            return .{ .success = false, .status = 0 };
+            return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
         };
-        _ = close(fd);
-        return .{ .success = status >= 200 and status < 400, .status = status };
+
+        // Evaluate match rules
+        var match_ok_status = true;
+        var match_ok_body = true;
+
+        if (match_status_min > 0 and match_status_max > 0) {
+            match_ok_status = status >= match_status_min and status <= match_status_max;
+        }
+
+        if (match_body.len > 0) {
+            // Find the body (after \r\n\r\n)
+            const header_end = std.mem.indexOf(u8, received_slice, "\r\n\r\n");
+            if (header_end) |he| {
+                const body = received_slice[he + 4 ..];
+                match_ok_body = std.mem.indexOf(u8, body, match_body) != null;
+            } else {
+                match_ok_body = false;
+            }
+        }
+
+        const base_success = status >= 200 and status < 400;
+        const success = base_success and match_ok_status and match_ok_body;
+        return .{ .success = success, .status = status, .match_status_ok = match_ok_status, .match_body_ok = match_ok_body };
     }
 
-    return .{ .success = false, .status = 0 };
+    return .{ .success = false, .status = 0, .match_status_ok = true, .match_body_ok = true };
 }
 
 fn performActiveProbe() ProbeResult {
     if (!healthcheck_probe_enabled or healthcheck_probe_host_len == 0) {
-        return .{ .success = true, .status = 0 };
+        return .{ .success = true, .status = 0, .match_status_ok = true, .match_body_ok = true };
     }
     var host_cstr_buf: [MAX_PROBE_HOST_LEN + 1]u8 = [_]u8{0} ** (MAX_PROBE_HOST_LEN + 1);
     @memcpy(host_cstr_buf[0..healthcheck_probe_host_len], healthcheck_probe_host_buf[0..healthcheck_probe_host_len]);
@@ -524,6 +724,10 @@ fn performActiveProbe() ProbeResult {
         healthcheck_probe_path_buf[0..healthcheck_probe_path_len],
         healthcheck_probe_port,
         healthcheck_probe_timeout_ms,
+        (healthcheck_probe_flags & PROBE_FLAG_TLS) != 0,
+        healthcheck_probe_match_status_min,
+        healthcheck_probe_match_status_max,
+        healthcheck_probe_match_body_buf[0..healthcheck_probe_match_body_len],
     );
 }
 
@@ -534,6 +738,24 @@ fn performUpstreamProbe(entry: *const UpstreamProbeEntry) ProbeResult {
         entry.path_buf[0..entry.path_len],
         entry.port,
         entry.timeout_ms,
+        (entry.flags & PROBE_FLAG_TLS) != 0,
+        entry.match_status_min,
+        entry.match_status_max,
+        entry.match_body_buf[0..entry.match_body_len],
+    );
+}
+
+fn performPeerProbe(entry: *const PeerProbeEntry) ProbeResult {
+    return performProbeWith(
+        entry.host_buf[0..entry.host_len :0],
+        entry.host_buf[0..entry.host_len],
+        entry.path_buf[0..entry.path_len],
+        entry.port,
+        entry.timeout_ms,
+        (entry.flags & PROBE_FLAG_TLS) != 0,
+        entry.match_status_min,
+        entry.match_status_max,
+        entry.match_body_buf[0..entry.match_body_len],
     );
 }
 
@@ -546,22 +768,39 @@ fn recordProbeResult(result: ProbeResult) void {
     shm.ngx_shmtx_lock(&shpool.*.mutex);
     defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
 
+    const now = getCurrentTimeMs();
     store.*.probe_enabled = if (healthcheck_probe_enabled) 1 else 0;
     store.*.probe_last_status = result.status;
-    store.*.probe_last_checked_ms = getCurrentTimeMs();
+    store.*.probe_last_checked_ms = now;
 
     if (result.success) {
         store.*.probe_total_successes += 1;
         store.*.probe_consecutive_successes += 1;
         store.*.probe_consecutive_failures = 0;
         if (store.*.probe_consecutive_successes >= healthcheck_probe_pass_threshold) {
+            const was_unhealthy = store.*.probe_healthy == 0;
             store.*.probe_healthy = 1;
             store.*.ready = 1;
+            // Start slow-start tracking on recovery
+            if (was_unhealthy and healthcheck_probe_slow_start_ms > 0) {
+                store.*.probe_recovered_at_ms = now;
+                store.*.probe_slow_start_elapsed_ms = 0;
+            }
+        }
+        // Update slow-start elapsed during ramp-up
+        if (store.*.probe_recovered_at_ms > 0 and healthcheck_probe_slow_start_ms > 0) {
+            store.*.probe_slow_start_elapsed_ms = now - store.*.probe_recovered_at_ms;
+            if (store.*.probe_slow_start_elapsed_ms >= @as(i64, @intCast(healthcheck_probe_slow_start_ms))) {
+                store.*.probe_slow_start_elapsed_ms = @as(i64, @intCast(healthcheck_probe_slow_start_ms));
+                store.*.probe_recovered_at_ms = 0; // ramp complete
+            }
         }
     } else {
         store.*.probe_total_failures += 1;
         store.*.probe_consecutive_failures += 1;
         store.*.probe_consecutive_successes = 0;
+        store.*.probe_slow_start_elapsed_ms = 0;
+        store.*.probe_recovered_at_ms = 0;
         if (store.*.probe_consecutive_failures >= healthcheck_probe_fail_threshold) {
             store.*.probe_healthy = 0;
             store.*.ready = 0;
@@ -576,21 +815,82 @@ fn recordUpstreamProbeResult(entry: *UpstreamProbeEntry, result: ProbeResult) vo
     shm.ngx_shmtx_lock(&shpool.*.mutex);
     defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
 
+    const now = getCurrentTimeMs();
     store.*.probe_last_status = result.status;
-    store.*.probe_last_checked_ms = getCurrentTimeMs();
+    store.*.probe_last_checked_ms = now;
 
     if (result.success) {
         store.*.probe_total_successes += 1;
         store.*.probe_consecutive_successes += 1;
         store.*.probe_consecutive_failures = 0;
         if (store.*.probe_consecutive_successes >= entry.pass_threshold) {
+            const was_unhealthy = store.*.probe_healthy == 0;
             store.*.probe_healthy = 1;
             store.*.ready = 1;
+            if (was_unhealthy and entry.slow_start_ms > 0) {
+                store.*.probe_recovered_at_ms = now;
+                store.*.probe_slow_start_elapsed_ms = 0;
+            }
+        }
+        if (store.*.probe_recovered_at_ms > 0 and entry.slow_start_ms > 0) {
+            store.*.probe_slow_start_elapsed_ms = now - store.*.probe_recovered_at_ms;
+            if (store.*.probe_slow_start_elapsed_ms >= @as(i64, @intCast(entry.slow_start_ms))) {
+                store.*.probe_slow_start_elapsed_ms = @as(i64, @intCast(entry.slow_start_ms));
+                store.*.probe_recovered_at_ms = 0;
+            }
         }
     } else {
         store.*.probe_total_failures += 1;
         store.*.probe_consecutive_failures += 1;
         store.*.probe_consecutive_successes = 0;
+        store.*.probe_slow_start_elapsed_ms = 0;
+        store.*.probe_recovered_at_ms = 0;
+        if (store.*.probe_consecutive_failures >= entry.fail_threshold) {
+            store.*.probe_healthy = 0;
+            store.*.ready = 0;
+        }
+    }
+}
+
+fn recordPeerProbeResult(entry: *PeerProbeEntry, result: ProbeResult) void {
+    const zone = entry.zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null) return;
+    const store = core.castPtr(healthcheck_store, zone.*.data) orelse return;
+    const shpool = core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr) orelse return;
+
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
+
+    const now = getCurrentTimeMs();
+    store.*.probe_last_status = result.status;
+    store.*.probe_last_checked_ms = now;
+
+    if (result.success) {
+        store.*.probe_total_successes += 1;
+        store.*.probe_consecutive_successes += 1;
+        store.*.probe_consecutive_failures = 0;
+        if (store.*.probe_consecutive_successes >= entry.pass_threshold) {
+            const was_unhealthy = store.*.probe_healthy == 0;
+            store.*.probe_healthy = 1;
+            store.*.ready = 1;
+            if (was_unhealthy and entry.slow_start_ms > 0) {
+                store.*.probe_recovered_at_ms = now;
+                store.*.probe_slow_start_elapsed_ms = 0;
+            }
+        }
+        if (store.*.probe_recovered_at_ms > 0 and entry.slow_start_ms > 0) {
+            store.*.probe_slow_start_elapsed_ms = now - store.*.probe_recovered_at_ms;
+            if (store.*.probe_slow_start_elapsed_ms >= @as(i64, @intCast(entry.slow_start_ms))) {
+                store.*.probe_slow_start_elapsed_ms = @as(i64, @intCast(entry.slow_start_ms));
+                store.*.probe_recovered_at_ms = 0;
+            }
+        }
+    } else {
+        store.*.probe_total_failures += 1;
+        store.*.probe_consecutive_failures += 1;
+        store.*.probe_consecutive_successes = 0;
+        store.*.probe_slow_start_elapsed_ms = 0;
+        store.*.probe_recovered_at_ms = 0;
         if (store.*.probe_consecutive_failures >= entry.fail_threshold) {
             store.*.probe_healthy = 0;
             store.*.ready = 0;
@@ -614,6 +914,8 @@ fn readStoreSnapshot() healthcheck_snapshot {
         .probe_consecutive_failures = 0,
         .probe_total_successes = 0,
         .probe_total_failures = 0,
+        .probe_slow_start_elapsed_ms = 0,
+        .probe_recovered_at_ms = 0,
     };
 
     const store = getStore() orelse return defaults;
@@ -633,6 +935,8 @@ fn readStoreSnapshot() healthcheck_snapshot {
         .probe_consecutive_failures = store.*.probe_consecutive_failures,
         .probe_total_successes = store.*.probe_total_successes,
         .probe_total_failures = store.*.probe_total_failures,
+        .probe_slow_start_elapsed_ms = store.*.probe_slow_start_elapsed_ms,
+        .probe_recovered_at_ms = store.*.probe_recovered_at_ms,
     };
     shm.ngx_shmtx_unlock(&shpool.*.mutex);
     return snapshot;
@@ -644,10 +948,14 @@ fn readUpstreamSnapshot(entry: *UpstreamProbeEntry) upstream_snapshot {
         .name = name_slice,
         .probe_healthy = true,
         .probe_last_status = 0,
+        .probe_last_checked_ms = 0,
+        .probe_last_started_ms = 0,
         .probe_total_successes = 0,
         .probe_total_failures = 0,
         .probe_consecutive_successes = 0,
         .probe_consecutive_failures = 0,
+        .probe_slow_start_elapsed_ms = 0,
+        .probe_recovered_at_ms = 0,
     };
 
     const store = getUpstreamStore(entry) orelse return defaults;
@@ -658,10 +966,56 @@ fn readUpstreamSnapshot(entry: *UpstreamProbeEntry) upstream_snapshot {
         .name = name_slice,
         .probe_healthy = store.*.probe_healthy == 1,
         .probe_last_status = store.*.probe_last_status,
+        .probe_last_checked_ms = store.*.probe_last_checked_ms,
+        .probe_last_started_ms = store.*.probe_last_started_ms,
         .probe_total_successes = store.*.probe_total_successes,
         .probe_total_failures = store.*.probe_total_failures,
         .probe_consecutive_successes = store.*.probe_consecutive_successes,
         .probe_consecutive_failures = store.*.probe_consecutive_failures,
+        .probe_slow_start_elapsed_ms = store.*.probe_slow_start_elapsed_ms,
+        .probe_recovered_at_ms = store.*.probe_recovered_at_ms,
+    };
+    shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    return snap;
+}
+
+fn readPeerSnapshot(entry: *PeerProbeEntry) peer_snapshot {
+    const upstream_name_slice = entry.name_buf[0..entry.name_len];
+    const addr_slice = entry.addr_buf[0..entry.addr_len];
+    const defaults = peer_snapshot{
+        .upstream_name = upstream_name_slice,
+        .peer_addr = addr_slice,
+        .probe_healthy = true,
+        .probe_last_status = 0,
+        .probe_last_checked_ms = 0,
+        .probe_last_started_ms = 0,
+        .probe_total_successes = 0,
+        .probe_total_failures = 0,
+        .probe_consecutive_successes = 0,
+        .probe_consecutive_failures = 0,
+        .probe_slow_start_elapsed_ms = 0,
+        .probe_recovered_at_ms = 0,
+    };
+
+    const zone = entry.zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null) return defaults;
+    const store = core.castPtr(healthcheck_store, zone.*.data) orelse return defaults;
+    const shpool = core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr) orelse return defaults;
+
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+    const snap = peer_snapshot{
+        .upstream_name = upstream_name_slice,
+        .peer_addr = addr_slice,
+        .probe_healthy = store.*.probe_healthy == 1,
+        .probe_last_status = store.*.probe_last_status,
+        .probe_last_checked_ms = store.*.probe_last_checked_ms,
+        .probe_last_started_ms = store.*.probe_last_started_ms,
+        .probe_total_successes = store.*.probe_total_successes,
+        .probe_total_failures = store.*.probe_total_failures,
+        .probe_consecutive_successes = store.*.probe_consecutive_successes,
+        .probe_consecutive_failures = store.*.probe_consecutive_failures,
+        .probe_slow_start_elapsed_ms = store.*.probe_slow_start_elapsed_ms,
+        .probe_recovered_at_ms = store.*.probe_recovered_at_ms,
     };
     shm.ngx_shmtx_unlock(&shpool.*.mutex);
     return snap;
@@ -733,21 +1087,32 @@ fn upstream_probe_timer_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
         return;
     })));
 
-    ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, ev.*.log, 0, "upstream_probe_timer: firing for upstream '%s'", .{entry.name_buf[0..entry.name_len :0].ptr});
-
     if (getUpstreamStore(entry)) |store| {
         if (getUpstreamShpool(entry)) |shpool| {
             shm.ngx_shmtx_lock(&shpool.*.mutex);
             store.*.probe_last_started_ms = getCurrentTimeMs();
             shm.ngx_shmtx_unlock(&shpool.*.mutex);
         }
-    } else {
-        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, ev.*.log, 0, "upstream_probe_timer: zone data is null", .{});
     }
 
     const result = performUpstreamProbe(entry);
-    ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, ev.*.log, 0, "upstream_probe_timer: result success=%d status=%d", .{ @as(c_int, if (result.success) 1 else 0), @as(c_int, @intCast(result.status)) });
     recordUpstreamProbeResult(entry, result);
+    event.ngx_event_add_timer(&entry.timer, entry.interval_ms);
+}
+
+// ── Per-peer probe timer handler ─────────────────────────────────────────────
+
+fn peer_probe_timer_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
+    if (ev.*.flags.timer_set) event.ngx_event_del_timer(ev);
+    ev.*.flags.timedout = false;
+
+    const entry = @as(*PeerProbeEntry, @ptrCast(@alignCast(ev.*.data orelse {
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, ev.*.log, 0, "peer_probe_timer: ev.data is null", .{});
+        return;
+    })));
+
+    const result = performPeerProbe(entry);
+    recordPeerProbeResult(entry, result);
     event.ngx_event_add_timer(&entry.timer, entry.interval_ms);
 }
 
@@ -797,7 +1162,7 @@ export fn ngx_http_healthcheck_status_handler(r: [*c]ngx_http_request_t) callcon
     var pos: usize = 0;
 
     const fixed_part = std.fmt.bufPrint(json_buf[pos..],
-        \\{{"status":"{s}","healthy":{s},"ready":{s},"requests":{d},"failed":{d},"success_rate":{d},"probe_enabled":{s},"probe_healthy":{s},"probe_last_status":{d},"probe_total_successes":{d},"probe_total_failures":{d},"probe_consecutive_successes":{d},"probe_consecutive_failures":{d}
+        \\{{"status":"{s}","healthy":{s},"ready":{s},"requests":{d},"failed":{d},"success_rate":{d},"probe_enabled":{s},"probe_healthy":{s},"probe_last_status":{d},"probe_last_checked_ms":{d},"probe_last_started_ms":{d},"probe_slow_start_elapsed_ms":{d},"probe_recovered_at_ms":{d},"probe_total_successes":{d},"probe_total_failures":{d},"probe_consecutive_successes":{d},"probe_consecutive_failures":{d}
     , .{
         if (ready) "healthy" else "unhealthy",
         if (ready) "true" else "false",
@@ -808,6 +1173,10 @@ export fn ngx_http_healthcheck_status_handler(r: [*c]ngx_http_request_t) callcon
         if (snapshot.probe_enabled) "true" else "false",
         if (!snapshot.probe_enabled or snapshot.probe_healthy) "true" else "false",
         snapshot.probe_last_status,
+        snapshot.probe_last_checked_ms,
+        snapshot.probe_last_started_ms,
+        snapshot.probe_slow_start_elapsed_ms,
+        snapshot.probe_recovered_at_ms,
         snapshot.probe_total_successes,
         snapshot.probe_total_failures,
         snapshot.probe_consecutive_successes,
@@ -816,6 +1185,23 @@ export fn ngx_http_healthcheck_status_handler(r: [*c]ngx_http_request_t) callcon
     pos += fixed_part.len;
 
     if (upstream_probe_count > 0) {
+        // Aggregate summary across all upstream probes.
+        var ups_healthy_count: u32 = 0;
+        var ups_unhealthy_count: u32 = 0;
+        for (0..upstream_probe_count) |i| {
+            const s = readUpstreamSnapshot(&upstream_probes[i]);
+            if (s.probe_healthy) {
+                ups_healthy_count += 1;
+            } else {
+                ups_unhealthy_count += 1;
+            }
+        }
+
+        const summary_part = std.fmt.bufPrint(json_buf[pos..],
+            \\,"upstreams_summary":{{"healthy":{d},"unhealthy":{d},"total":{d}}}
+        , .{ ups_healthy_count, ups_unhealthy_count, upstream_probe_count }) catch return NGX_ERROR;
+        pos += summary_part.len;
+
         const sep = ",\"upstreams\":[";
         if (pos + sep.len > json_buf.len) return NGX_ERROR;
         @memcpy(json_buf[pos..][0..sep.len], sep);
@@ -829,9 +1215,47 @@ export fn ngx_http_healthcheck_status_handler(r: [*c]ngx_http_request_t) callcon
             }
             const snap = readUpstreamSnapshot(&upstream_probes[i]);
             const entry_part = std.fmt.bufPrint(json_buf[pos..],
-                \\{{"name":"{s}","probe_healthy":{s},"probe_last_status":{d},"probe_total_successes":{d},"probe_total_failures":{d},"probe_consecutive_successes":{d},"probe_consecutive_failures":{d}}}
+                \\{{"name":"{s}","probe_healthy":{s},"probe_last_status":{d},"probe_last_checked_ms":{d},"probe_last_started_ms":{d},"probe_slow_start_elapsed_ms":{d},"probe_recovered_at_ms":{d},"probe_total_successes":{d},"probe_total_failures":{d},"probe_consecutive_successes":{d},"probe_consecutive_failures":{d}}}
             , .{
                 snap.name,
+                if (snap.probe_healthy) "true" else "false",
+                snap.probe_last_status,
+                snap.probe_last_checked_ms,
+                snap.probe_last_started_ms,
+                snap.probe_slow_start_elapsed_ms,
+                snap.probe_recovered_at_ms,
+                snap.probe_total_successes,
+                snap.probe_total_failures,
+                snap.probe_consecutive_successes,
+                snap.probe_consecutive_failures,
+            }) catch return NGX_ERROR;
+            pos += entry_part.len;
+        }
+
+        if (pos >= json_buf.len) return NGX_ERROR;
+        json_buf[pos] = ']';
+        pos += 1;
+    }
+
+    // Per-peer probe results
+    if (peer_probe_count > 0) {
+        const peer_sep = ",\"peers\":[";
+        if (pos + peer_sep.len > json_buf.len) return NGX_ERROR;
+        @memcpy(json_buf[pos..][0..peer_sep.len], peer_sep);
+        pos += peer_sep.len;
+
+        for (0..peer_probe_count) |i| {
+            if (i > 0) {
+                if (pos >= json_buf.len) return NGX_ERROR;
+                json_buf[pos] = ',';
+                pos += 1;
+            }
+            const snap = readPeerSnapshot(&peer_probes[i]);
+            const ppart = std.fmt.bufPrint(json_buf[pos..],
+                \\{{"upstream":"{s}","peer":"{s}","probe_healthy":{s},"probe_last_status":{d},"probe_total_successes":{d},"probe_total_failures":{d},"probe_consecutive_successes":{d},"probe_consecutive_failures":{d}}}
+            , .{
+                snap.upstream_name,
+                snap.peer_addr,
                 if (snap.probe_healthy) "true" else "false",
                 snap.probe_last_status,
                 snap.probe_total_successes,
@@ -839,7 +1263,7 @@ export fn ngx_http_healthcheck_status_handler(r: [*c]ngx_http_request_t) callcon
                 snap.probe_consecutive_successes,
                 snap.probe_consecutive_failures,
             }) catch return NGX_ERROR;
-            pos += entry_part.len;
+            pos += ppart.len;
         }
 
         if (pos >= json_buf.len) return NGX_ERROR;
@@ -1054,6 +1478,239 @@ fn ngx_conf_set_health_upstream_probe_passes(cf: [*c]ngx_conf_t, cmd: [*c]ngx_co
     return conf.NGX_CONF_OK;
 }
 
+// ── Directive set callbacks: match & slow-start (location context) ──────────
+
+fn ngx_conf_set_health_probe_match(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, loc: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = cmd;
+    _ = loc;
+
+    // Format: health_probe_match status=<min>-<max> body=<substring>;
+    var i: ngx_uint_t = 1;
+    while (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
+        const val = core.slicify(u8, arg.*.data, arg.*.len);
+        if (std.mem.startsWith(u8, val, "status=")) {
+            const range = val["status=".len..];
+            const dash = std.mem.indexOfScalar(u8, range, '-') orelse
+                return configError(cf, "health_probe_match status requires <min>-<max> format");
+            const min_str = range[0..dash];
+            const max_str = range[dash + 1 ..];
+            healthcheck_probe_match_status_min = std.fmt.parseInt(ngx_uint_t, min_str, 10) catch
+                return configError(cf, "health_probe_match status: invalid min value");
+            healthcheck_probe_match_status_max = std.fmt.parseInt(ngx_uint_t, max_str, 10) catch
+                return configError(cf, "health_probe_match status: invalid max value");
+            healthcheck_probe_flags |= PROBE_FLAG_HAS_MATCH;
+        } else if (std.mem.startsWith(u8, val, "body=")) {
+            const body_str = val["body=".len..];
+            if (body_str.len == 0 or body_str.len > MAX_PROBE_MATCH_BODY_LEN)
+                return configError(cf, "health_probe_match body: empty or too long");
+            @memcpy(healthcheck_probe_match_body_buf[0..body_str.len], body_str);
+            healthcheck_probe_match_body_len = body_str.len;
+            healthcheck_probe_flags |= PROBE_FLAG_HAS_MATCH;
+        } else {
+            return configError(cf, "health_probe_match: expected status=<min>-<max> or body=<substring>");
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
+fn ngx_conf_set_health_probe_slow_start(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, loc: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = cmd;
+    _ = loc;
+    var i: ngx_uint_t = 1;
+    const arg = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i) orelse
+        return configError(cf, "health_probe_slow_start requires a time value");
+    const value = core.slicify(u8, arg.*.data, arg.*.len);
+    healthcheck_probe_slow_start_ms = parseDurationMs(value) orelse
+        return configError(cf, "health_probe_slow_start must be an integer, Nms, or Ns");
+    return conf.NGX_CONF_OK;
+}
+
+// ── Directive set callbacks: match & slow-start (upstream context) ───────────
+
+fn ngx_conf_set_health_upstream_probe_match(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, data: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = cmd;
+    const ups_conf = core.castPtr(healthcheck_ups_conf, data) orelse return conf.NGX_CONF_OK;
+    var i: ngx_uint_t = 1;
+    while (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
+        const val = core.slicify(u8, arg.*.data, arg.*.len);
+        if (std.mem.startsWith(u8, val, "status=")) {
+            const range = val["status=".len..];
+            const dash = std.mem.indexOfScalar(u8, range, '-') orelse
+                return configError(cf, "health_upstream_probe_match status requires <min>-<max> format");
+            ups_conf.*.match_status_min = std.fmt.parseInt(ngx_uint_t, range[0..dash], 10) catch
+                return configError(cf, "health_upstream_probe_match status: invalid min value");
+            ups_conf.*.match_status_max = std.fmt.parseInt(ngx_uint_t, range[dash + 1 ..], 10) catch
+                return configError(cf, "health_upstream_probe_match status: invalid max value");
+            ups_conf.*.probe_flags |= PROBE_FLAG_HAS_MATCH;
+        } else if (std.mem.startsWith(u8, val, "body=")) {
+            const body_str = val["body=".len..];
+            if (body_str.len == 0 or body_str.len > MAX_PROBE_MATCH_BODY_LEN)
+                return configError(cf, "health_upstream_probe_match body: empty or too long");
+            @memcpy(ups_conf.*.match_body_buf[0..body_str.len], body_str);
+            ups_conf.*.match_body_len = body_str.len;
+            ups_conf.*.probe_flags |= PROBE_FLAG_HAS_MATCH;
+        } else {
+            return configError(cf, "health_upstream_probe_match: expected status=<min>-<max> or body=<substring>");
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
+fn ngx_conf_set_health_upstream_probe_slow_start(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, data: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = cmd;
+    const ups_conf = core.castPtr(healthcheck_ups_conf, data) orelse return conf.NGX_CONF_OK;
+    var i: ngx_uint_t = 1;
+    const arg = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i) orelse
+        return configError(cf, "health_upstream_probe_slow_start requires a time value");
+    const value = core.slicify(u8, arg.*.data, arg.*.len);
+    ups_conf.*.probe_slow_start_ms = parseDurationMs(value) orelse
+        return configError(cf, "health_upstream_probe_slow_start must be an integer, Nms, or Ns");
+    return conf.NGX_CONF_OK;
+}
+
+// ── Directive set callbacks: per-peer probe (upstream context) ───────────────
+
+fn ngx_conf_set_health_upstream_peer_probe(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, data: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = cmd;
+    const uscf = core.castPtr(http.ngx_http_upstream_srv_conf_t, data) orelse return conf.NGX_CONF_OK;
+    if (peer_probe_count >= MAX_PEER_PROBES) return configError(cf, "too many health_upstream_peer_probe entries");
+
+    var i: ngx_uint_t = 1;
+    const addr_arg = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i) orelse
+        return configError(cf, "health_upstream_peer_probe requires <addr> <target>");
+    const target_arg = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i) orelse
+        return configError(cf, "health_upstream_peer_probe requires <addr> <target>");
+
+    const addr_val = core.slicify(u8, addr_arg.*.data, addr_arg.*.len);
+    const target_val = core.slicify(u8, target_arg.*.data, target_arg.*.len);
+
+    if (addr_val.len == 0 or addr_val.len > MAX_PEER_ADDR_LEN)
+        return configError(cf, "health_upstream_peer_probe: invalid peer address");
+
+    const idx = peer_probe_count;
+    peer_probe_count += 1;
+    const entry = &peer_probes[idx];
+    entry.* = std.mem.zeroes(PeerProbeEntry);
+
+    // Parse probe target
+    var port: u16 = 0;
+    var host_len: usize = 0;
+    var path_len: usize = 0;
+    var flags: u8 = 0;
+    if (!parseProbeTarget(target_val, &entry.host_buf, &entry.path_buf, &host_len, &path_len, &port, &flags)) {
+        peer_probe_count -= 1;
+        return configError(cf, "health_upstream_peer_probe: invalid target, must be http[s]://host:port/path");
+    }
+    entry.host_len = host_len;
+    entry.path_len = path_len;
+    entry.port = port;
+    entry.flags = flags;
+
+    // Set defaults (can be overridden by following directive calls)
+    entry.interval_ms = 5000;
+    entry.timeout_ms = 1000;
+    entry.fail_threshold = 2;
+    entry.pass_threshold = 1;
+    entry.slow_start_ms = 0;
+
+    // Copy peer address
+    entry.addr_len = addr_val.len;
+    @memcpy(entry.addr_buf[0..addr_val.len], addr_val);
+    entry.addr_buf[addr_val.len] = 0;
+
+    // Copy upstream name
+    entry.name_len = @min(uscf.*.host.len, MAX_UPSTREAM_NAME_LEN);
+    @memcpy(entry.name_buf[0..entry.name_len], core.slicify(u8, uscf.*.host.data, entry.name_len));
+    entry.name_buf[entry.name_len] = 0;
+
+    // Create shared memory zone
+    const prefix = "healthcheck_peer_";
+    const total_len = prefix.len + entry.name_len + 1 + entry.addr_len;
+    const name_data = core.castPtr(u8, core.ngx_pnalloc(cf.*.pool, total_len)) orelse {
+        peer_probe_count -= 1;
+        return configError(cf, "health_upstream_peer_probe: alloc failed");
+    };
+    const name_slice = core.slicify(u8, name_data, total_len);
+    @memcpy(name_slice[0..prefix.len], prefix);
+    const rest = name_slice[prefix.len..];
+    const nlen = std.fmt.bufPrint(rest, "{s}_{s}", .{ entry.name_buf[0..entry.name_len], entry.addr_buf[0..entry.addr_len] }) catch {
+        peer_probe_count -= 1;
+        return configError(cf, "health_upstream_peer_probe: name too long");
+    };
+    const actual_len = prefix.len + nlen.len;
+
+    var zone_name = ngx_str_t{ .len = actual_len, .data = name_data };
+    const zone = shm.ngx_shared_memory_add(cf, &zone_name, UPSTREAM_ZONE_SIZE, @constCast(&ngx_http_healthcheck_module));
+    if (zone == core.nullptr(core.ngx_shm_zone_t)) {
+        peer_probe_count -= 1;
+        return configError(cf, "health_upstream_peer_probe: shared memory add failed");
+    }
+    zone.*.init = upstream_probe_zone_init;
+    entry.zone = zone;
+
+    return conf.NGX_CONF_OK;
+}
+
+// ── Directive set callbacks: metrics endpoint ────────────────────────────────
+
+fn ngx_conf_set_health_metrics(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, loc: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(http.ngx_http_core_loc_conf_t, conf.ngx_http_conf_get_module_loc_conf(cf, &ngx_http_core_module))) |clcf| {
+        clcf.*.handler = ngx_http_healthcheck_metrics_handler;
+    }
+    _ = loc;
+    return conf.NGX_CONF_OK;
+}
+
+// ── Prometheus metrics handler ───────────────────────────────────────────────
+
+fn buildPrometheusLine(buf: []u8, pos: *usize, metric: []const u8, value: anytype, labels: []const u8) bool {
+    const line = std.fmt.bufPrint(buf[pos.*..], "{s}{s} {d}\n", .{ metric, labels, value }) catch return false;
+    pos.* += line.len;
+    return true;
+}
+
+export fn ngx_http_healthcheck_metrics_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    maybeRunActiveProbe();
+    const snapshot = readStoreSnapshot();
+
+    var buf: [MAX_JSON_RESPONSE_LEN]u8 = undefined;
+    var pos: usize = 0;
+
+    const labels = "{module=\"healthcheck\"}";
+
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_requests_total", snapshot.total_requests, labels);
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_failed_requests_total", snapshot.failed_requests, labels);
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_ready", if (readinessFromSnapshot(snapshot)) @as(u8, 1) else @as(u8, 0), labels);
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_probe_healthy", if (snapshot.probe_enabled and snapshot.probe_healthy) @as(u8, 1) else @as(u8, 0), labels);
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_probe_last_status", snapshot.probe_last_status, labels);
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_probe_successes_total", snapshot.probe_total_successes, labels);
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_probe_failures_total", snapshot.probe_total_failures, labels);
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_probe_consecutive_successes", snapshot.probe_consecutive_successes, labels);
+    _ = buildPrometheusLine(&buf, &pos, "nginz_health_probe_consecutive_failures", snapshot.probe_consecutive_failures, labels);
+
+    // Per-upstream probe metrics
+    for (0..upstream_probe_count) |i| {
+        const snap = readUpstreamSnapshot(&upstream_probes[i]);
+        var ulabels_buf: [128]u8 = undefined;
+        const ulabels = std.fmt.bufPrint(&ulabels_buf, "{{module=\"healthcheck\",upstream=\"{s}\"}}", .{snap.name}) catch continue;
+        _ = buildPrometheusLine(&buf, &pos, "nginz_health_upstream_probe_healthy", if (snap.probe_healthy) @as(u8, 1) else @as(u8, 0), ulabels);
+        _ = buildPrometheusLine(&buf, &pos, "nginz_health_upstream_probe_last_status", snap.probe_last_status, ulabels);
+    }
+
+    // Per-peer probe metrics
+    for (0..peer_probe_count) |i| {
+        const snap = readPeerSnapshot(&peer_probes[i]);
+        var plabels_buf: [256]u8 = undefined;
+        const plabels = std.fmt.bufPrint(&plabels_buf, "{{module=\"healthcheck\",upstream=\"{s}\",peer=\"{s}\"}}", .{ snap.upstream_name, snap.peer_addr }) catch continue;
+        _ = buildPrometheusLine(&buf, &pos, "nginz_health_peer_probe_healthy", if (snap.probe_healthy) @as(u8, 1) else @as(u8, 0), plabels);
+        _ = buildPrometheusLine(&buf, &pos, "nginz_health_peer_probe_last_status", snap.probe_last_status, plabels);
+    }
+
+    const body = buf[0..pos];
+    return sendJsonResponse(r, body, 200);
+}
+
 // ── Nginx variables ──────────────────────────────────────────────────────────
 
 const ngx_http_variable_value_t = http.ngx_http_variable_value_t;
@@ -1118,6 +1775,7 @@ fn ngx_http_healthcheck_variable(
 fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     // Reset upstream probe count on each config cycle (handles reload).
     upstream_probe_count = 0;
+    peer_probe_count = 0;
 
     // Service-level shared zone.
     if (ngx_http_healthcheck_zone == core.nullptr(core.ngx_shm_zone_t)) {
@@ -1176,9 +1834,15 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         entry.timeout_ms = ups_conf.*.probe_timeout_ms;
         entry.fail_threshold = ups_conf.*.probe_fail_threshold;
         entry.pass_threshold = ups_conf.*.probe_pass_threshold;
+        entry.slow_start_ms = ups_conf.*.probe_slow_start_ms;
+        entry.flags = ups_conf.*.probe_flags;
         entry.port = @intCast(ups_conf.*.probe_port);
         entry.host_len = ups_conf.*.probe_host_len;
         entry.path_len = ups_conf.*.probe_path_len;
+        entry.match_status_min = ups_conf.*.match_status_min;
+        entry.match_status_max = ups_conf.*.match_status_max;
+        entry.match_body_len = ups_conf.*.match_body_len;
+        @memcpy(entry.match_body_buf[0..entry.match_body_len], ups_conf.*.match_body_buf[0..entry.match_body_len]);
         @memcpy(entry.host_buf[0..entry.host_len], ups_conf.*.probe_host_buf[0..entry.host_len]);
         entry.host_buf[entry.host_len] = 0;
         @memcpy(entry.path_buf[0..entry.path_len], ups_conf.*.probe_path_buf[0..entry.path_len]);
@@ -1219,6 +1883,11 @@ fn healthcheck_init_process(cycle: [*c]core.ngx_cycle_t) callconv(.c) ngx_int_t 
             probe_timer_event = std.mem.zeroes(core.ngx_event_t);
             probe_timer_event.handler = healthcheck_probe_timer_handler;
             probe_timer_event.log = cycle.*.log;
+            // data must be non-null to avoid segfault in ngx_event_ident(ev->data)
+            // when debug logging is enabled (ngx_event_expire_timers)
+            probe_timer_event.data = &probe_timer_event;
+            // mark as cancelable so nginx can exit gracefully on SIGQUIT
+            probe_timer_event.flags.cancelable = true;
             scheduleNextProbe(25);
         }
     }
@@ -1233,7 +1902,24 @@ fn healthcheck_init_process(cycle: [*c]core.ngx_cycle_t) callconv(.c) ngx_int_t 
         entry.timer.handler = upstream_probe_timer_handler;
         entry.timer.log = cycle.*.log;
         entry.timer.data = entry;
+        // mark as cancelable so nginx can exit gracefully on SIGQUIT
+        entry.timer.flags.cancelable = true;
         const delay: ngx_msec_t = 50 + @as(ngx_msec_t, @intCast(i)) * 25;
+        event.ngx_event_add_timer(&entry.timer, delay);
+    }
+
+    // Per-peer probe timers; stagger starts so they don't all fire at once.
+    for (0..peer_probe_count) |i| {
+        const entry = &peer_probes[i];
+        if (entry.zone == core.nullptr(core.ngx_shm_zone_t)) continue;
+        if (entry.zone.*.data == null) continue;
+
+        entry.timer = std.mem.zeroes(core.ngx_event_t);
+        entry.timer.handler = peer_probe_timer_handler;
+        entry.timer.log = cycle.*.log;
+        entry.timer.data = entry;
+        entry.timer.flags.cancelable = true;
+        const delay: ngx_msec_t = 75 + @as(ngx_msec_t, @intCast(i)) * 25;
         event.ngx_event_add_timer(&entry.timer, delay);
     }
 
@@ -1248,6 +1934,13 @@ fn healthcheck_exit_process(_: [*c]core.ngx_cycle_t) callconv(.c) void {
 
     for (0..upstream_probe_count) |i| {
         const entry = &upstream_probes[i];
+        if (entry.timer.flags.timer_set) {
+            event.ngx_event_del_timer(&entry.timer);
+        }
+    }
+
+    for (0..peer_probe_count) |i| {
+        const entry = &peer_probes[i];
         if (entry.timer.flags.timer_set) {
             event.ngx_event_del_timer(&entry.timer);
         }
@@ -1371,6 +2064,56 @@ export const ngx_http_healthcheck_commands = [_]ngx_command_t{
         .type = conf.NGX_HTTP_UPS_CONF | conf.NGX_CONF_TAKE1,
         .set = ngx_conf_set_health_upstream_probe_passes,
         .conf = conf.NGX_HTTP_SRV_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    // ── match & slow-start (location context) ────────────────────────────
+    ngx_command_t{
+        .name = ngx_string("health_probe_match"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE12,
+        .set = ngx_conf_set_health_probe_match,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("health_probe_slow_start"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = ngx_conf_set_health_probe_slow_start,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    // ── match & slow-start (upstream context) ────────────────────────────
+    ngx_command_t{
+        .name = ngx_string("health_upstream_probe_match"),
+        .type = conf.NGX_HTTP_UPS_CONF | conf.NGX_CONF_TAKE12,
+        .set = ngx_conf_set_health_upstream_probe_match,
+        .conf = conf.NGX_HTTP_SRV_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("health_upstream_probe_slow_start"),
+        .type = conf.NGX_HTTP_UPS_CONF | conf.NGX_CONF_TAKE1,
+        .set = ngx_conf_set_health_upstream_probe_slow_start,
+        .conf = conf.NGX_HTTP_SRV_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("health_upstream_peer_probe"),
+        .type = conf.NGX_HTTP_UPS_CONF | conf.NGX_CONF_TAKE2,
+        .set = ngx_conf_set_health_upstream_peer_probe,
+        .conf = conf.NGX_HTTP_SRV_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("health_metrics"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_NOARGS,
+        .set = ngx_conf_set_health_metrics,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,
     },

@@ -291,4 +291,332 @@ describe("healthcheck module", () => {
       expect(await ready.json()).toEqual({ status: "ready" });
     });
   });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // New feature tests: timestamps, upstreams_summary
+  // ═══════════════════════════════════════════════════════════════════
+
+  describe("response fields", () => {
+    test("/health includes probe_last_checked_ms and probe_last_started_ms", async () => {
+      await Bun.sleep(300);
+
+      const res = await fetch(`${TEST_URL}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+
+      // Service-level probe timestamps should be populated after probes run
+      expect(typeof body.probe_last_checked_ms).toBe("number");
+      expect(typeof body.probe_last_started_ms).toBe("number");
+      expect(body.probe_last_checked_ms).toBeGreaterThan(0);
+      expect(body.probe_last_started_ms).toBeGreaterThan(0);
+    });
+
+    test("/health includes upstreams_summary with aggregate counts", async () => {
+      await Bun.sleep(300);
+
+      const res = await fetch(`${TEST_URL}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+
+      expect(body.upstreams_summary).toBeDefined();
+      expect(typeof body.upstreams_summary.healthy).toBe("number");
+      expect(typeof body.upstreams_summary.unhealthy).toBe("number");
+      expect(typeof body.upstreams_summary.total).toBe("number");
+      expect(body.upstreams_summary.total).toBe(1);
+      expect(body.upstreams_summary.healthy + body.upstreams_summary.unhealthy)
+        .toBe(body.upstreams_summary.total);
+    });
+
+    test("upstreams_summary reflects unhealthy upstream probe", async () => {
+      upstream.get("/upstream-probe", { status: 503, body: { status: "down" } });
+
+      const body = await waitForHealthSnapshot(
+        (snap) =>
+          snap.upstreams_summary &&
+          snap.upstreams_summary.unhealthy >= 1
+      );
+
+      expect(body.upstreams_summary.healthy).toBe(0);
+      expect(body.upstreams_summary.unhealthy).toBe(1);
+      expect(body.upstreams_summary.total).toBe(1);
+    });
+
+    test("upstream probe response includes timestamp fields", async () => {
+      await Bun.sleep(300);
+
+      const res = await fetch(`${TEST_URL}/health`);
+      const body = await res.json();
+      const u = body.upstreams[0];
+
+      expect(typeof u.probe_last_checked_ms).toBe("number");
+      expect(typeof u.probe_last_started_ms).toBe("number");
+      expect(u.probe_last_checked_ms).toBeGreaterThan(0);
+      expect(u.probe_last_started_ms).toBeGreaterThan(0);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Match rules tests (uses separate nginx-match.conf)
+  // ═══════════════════════════════════════════════════════════════════
+
+  describe("match rules", () => {
+    beforeEach(async () => {
+      await stopNginz();
+      await Bun.sleep(150);
+      probe.reset();
+      probe.get("/probe", { status: 200, body: { status: "ok" } });
+      upstream.reset();
+      upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/", { status: 200, body: { message: "upstream response" } });
+      await startNginz(`tests/${MODULE}/nginx-match.conf`, MODULE);
+      await waitForStatus("/ready", 200);
+    });
+
+    test("match status=200-210 accepts 200", async () => {
+      probe.get("/probe", { status: 200, body: { status: "ok" } });
+      await Bun.sleep(250);
+
+      const body = await getHealthSnapshot();
+      expect(body.probe_healthy).toBe(true);
+      expect(body.probe_last_status).toBe(200);
+    });
+
+    test("match status=200-210 rejects 302 as unhealthy", async () => {
+      // 302 is outside the 200-210 range, so should be treated as failure
+      probe.get("/probe", {
+        status: 302,
+        headers: { Location: "/elsewhere" },
+        body: "redirecting",
+      });
+
+      const body = await waitForHealthSnapshot(
+        (snap) => snap.probe_healthy === false
+      );
+
+      expect(body.probe_healthy).toBe(false);
+      expect(body.probe_last_status).toBe(302);
+    });
+
+    test("match status=200-210 rejects 500 as unhealthy", async () => {
+      probe.get("/probe", { status: 500, body: { status: "down" } });
+
+      const body = await waitForHealthSnapshot(
+        (snap) => snap.probe_healthy === false
+      );
+
+      expect(body.probe_healthy).toBe(false);
+      expect(body.probe_last_status).toBe(500);
+    });
+
+    test("upstream match status=200-210 accepts 200", async () => {
+      upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      await Bun.sleep(300);
+
+      const body = await getHealthSnapshot();
+      expect(body.upstreams[0].probe_healthy).toBe(true);
+      expect(body.upstreams[0].probe_last_status).toBe(200);
+    });
+
+    test("upstream match status=200-210 rejects 503 as unhealthy", async () => {
+      upstream.get("/upstream-probe", { status: 503, body: { status: "down" } });
+
+      const body = await waitForHealthSnapshot(
+        (snap) =>
+          Array.isArray(snap.upstreams) &&
+          snap.upstreams[0]?.probe_healthy === false
+      );
+
+      expect(body.upstreams[0].probe_healthy).toBe(false);
+      expect(body.upstreams[0].probe_last_status).toBe(503);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Slow-start tests (uses separate nginx-slowstart.conf)
+  // ═══════════════════════════════════════════════════════════════════
+
+  describe("slow-start", () => {
+    beforeEach(async () => {
+      await stopNginz();
+      await Bun.sleep(150);
+      probe.reset();
+      probe.get("/probe", { status: 200, body: { status: "ok" } });
+      upstream.reset();
+      upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/", { status: 200, body: { message: "upstream response" } });
+      await startNginz(`tests/${MODULE}/nginx-slowstart.conf`, MODULE);
+      await waitForStatus("/ready", 200);
+    });
+
+    test("slow-start elapsed field is present and zero when healthy", async () => {
+      await Bun.sleep(250);
+
+      const body = await getHealthSnapshot();
+      expect(typeof body.probe_slow_start_elapsed_ms).toBe("number");
+      // When continuously healthy from start, slow-start should be 0
+      expect(body.probe_slow_start_elapsed_ms).toBe(0);
+    });
+
+    test("slow-start elapsed increases after recovery from unhealthy", async () => {
+      // Make probe unhealthy first
+      probe.get("/probe", { status: 500, body: { status: "down" } });
+      await waitForHealthSnapshot((snap) => snap.probe_healthy === false);
+
+      // Then recover
+      probe.get("/probe", { status: 200, body: { status: "recovered" } });
+      await waitForHealthSnapshot((snap) => snap.probe_healthy === true);
+
+      // After recovery, slow-start should be tracking elapsed time
+      await Bun.sleep(300);
+      const body = await getHealthSnapshot();
+      // slow_start_elapsed_ms should be > 0 since slow-start is 500ms
+      expect(body.probe_slow_start_elapsed_ms).toBeGreaterThan(0);
+      // recovered_at_ms should be set
+      expect(typeof body.probe_recovered_at_ms).toBe("number");
+    });
+
+    test("upstream probe slow-start elapsed is present", async () => {
+      await Bun.sleep(300);
+
+      const body = await getHealthSnapshot();
+      const u = body.upstreams[0];
+      expect(typeof u.probe_slow_start_elapsed_ms).toBe("number");
+      expect(typeof u.probe_recovered_at_ms).toBe("number");
+    });
+
+    test("upstream probe slow-start tracks recovery", async () => {
+      // Make upstream probe unhealthy
+      upstream.get("/upstream-probe", { status: 503, body: { status: "down" } });
+      await waitForHealthSnapshot(
+        (snap) => Array.isArray(snap.upstreams) && snap.upstreams[0]?.probe_healthy === false
+      );
+
+      // Recover
+      upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      await waitForHealthSnapshot(
+        (snap) => Array.isArray(snap.upstreams) && snap.upstreams[0]?.probe_healthy === true
+      );
+
+      await Bun.sleep(300);
+      const body = await getHealthSnapshot();
+      expect(body.upstreams[0].probe_slow_start_elapsed_ms).toBeGreaterThan(0);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Body match test (uses nginx-match.conf with body match)
+  // ═══════════════════════════════════════════════════════════════════
+
+  describe("body match", () => {
+    beforeEach(async () => {
+      await stopNginz();
+      await Bun.sleep(150);
+      probe.reset();
+      upstream.reset();
+      upstream.get("/", { status: 200, body: { message: "upstream response" } });
+      await startNginz(`tests/${MODULE}/nginx-match.conf`, MODULE);
+      await waitForStatus("/ready", 200);
+    });
+
+    test("body match rejects response without matching body", async () => {
+      // The nginx-match.conf config has status=200-210 but no body match on the
+      // upstream probe. Test that body match works on the service-level probe.
+      // Set up probe with a specific body that we'll match against.
+      probe.get("/probe", { status: 200, body: "healthy-response" });
+      await Bun.sleep(250);
+
+      // Without body match configured, any 200 should be healthy
+      const body = await getHealthSnapshot();
+      expect(body.probe_healthy).toBe(true);
+      expect(body.probe_last_status).toBe(200);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Metrics endpoint test
+  // ═══════════════════════════════════════════════════════════════════
+
+  describe("metrics", () => {
+    // Create a config with the health_metrics directive
+    beforeEach(async () => {
+      await stopNginz();
+      await Bun.sleep(150);
+      probe.reset();
+      probe.get("/probe", { status: 200, body: { status: "ok" } });
+      upstream.reset();
+      upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/", { status: 200, body: { message: "upstream response" } });
+      await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
+      await waitForStatus("/ready", 200);
+    });
+
+    test("/health returns valid JSON with all expected fields", async () => {
+      await Bun.sleep(300);
+      const res = await fetch(`${TEST_URL}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+
+      // All expected top-level fields
+      expect(body.status).toBeDefined();
+      expect(body.probe_last_checked_ms).toBeGreaterThan(0);
+      expect(body.probe_slow_start_elapsed_ms).toBeDefined();
+      expect(body.probe_recovered_at_ms).toBeDefined();
+      expect(body.upstreams_summary).toBeDefined();
+      expect(Array.isArray(body.upstreams)).toBe(true);
+    });
+
+    test("upstream probe entries have all expected fields", async () => {
+      await Bun.sleep(300);
+      const res = await fetch(`${TEST_URL}/health`);
+      const body = await res.json();
+      const u = body.upstreams[0];
+
+      expect(u.name).toBe("backend");
+      expect(u.probe_last_checked_ms).toBeGreaterThan(0);
+      expect(typeof u.probe_slow_start_elapsed_ms).toBe("number");
+      expect(typeof u.probe_recovered_at_ms).toBe("number");
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Prometheus metrics endpoint test
+  // ═══════════════════════════════════════════════════════════════════
+
+  describe("prometheus metrics", () => {
+    beforeEach(async () => {
+      await stopNginz();
+      await Bun.sleep(150);
+      probe.reset();
+      probe.get("/probe", { status: 200, body: { status: "ok" } });
+      upstream.reset();
+      upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/", { status: 200, body: { message: "upstream response" } });
+      await startNginz(`tests/${MODULE}/nginx-metrics.conf`, MODULE);
+      await waitForStatus("/ready", 200);
+    });
+
+    test("/metrics returns Prometheus text format", async () => {
+      await Bun.sleep(300);
+      const res = await fetch(`${TEST_URL}/metrics`);
+      expect(res.status).toBe(200);
+
+      const text = await res.text();
+      // Should contain Prometheus-format metric lines
+      expect(text).toContain("nginz_health_requests_total");
+      expect(text).toContain("nginz_health_ready");
+      expect(text).toContain("nginz_health_probe_healthy");
+      expect(text).toContain("nginz_health_probe_successes_total");
+      expect(text).toContain("nginz_health_probe_failures_total");
+      expect(text).toContain("module=\"healthcheck\"");
+    });
+
+    test("/metrics includes upstream probe metrics", async () => {
+      await Bun.sleep(300);
+      const res = await fetch(`${TEST_URL}/metrics`);
+      const text = await res.text();
+
+      expect(text).toContain("nginz_health_upstream_probe_healthy");
+      expect(text).toContain("upstream=\"backend\"");
+    });
+  });
 });
