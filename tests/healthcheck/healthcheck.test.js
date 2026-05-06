@@ -75,6 +75,7 @@ describe("healthcheck module", () => {
     probe.get("/probe", { status: 200, body: { status: "ok" } });
     upstream.reset();
     upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+    upstream.get("/peer-probe", { status: 200, body: { status: "ok" } });
     upstream.get("/", { status: 200, body: { message: "upstream response" } });
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
     await waitForStatus("/ready", 200);
@@ -367,6 +368,7 @@ describe("healthcheck module", () => {
       probe.get("/probe", { status: 200, body: { status: "ok" } });
       upstream.reset();
       upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/peer-probe", { status: 200, body: { status: "ok" } });
       upstream.get("/", { status: 200, body: { message: "upstream response" } });
       await startNginz(`tests/${MODULE}/nginx-match.conf`, MODULE);
       await waitForStatus("/ready", 200);
@@ -443,6 +445,7 @@ describe("healthcheck module", () => {
       probe.get("/probe", { status: 200, body: { status: "ok" } });
       upstream.reset();
       upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/peer-probe", { status: 200, body: { status: "ok" } });
       upstream.get("/", { status: 200, body: { message: "upstream response" } });
       await startNginz(`tests/${MODULE}/nginx-slowstart.conf`, MODULE);
       await waitForStatus("/ready", 200);
@@ -513,6 +516,7 @@ describe("healthcheck module", () => {
       await Bun.sleep(150);
       probe.reset();
       upstream.reset();
+      upstream.get("/peer-probe", { status: 200, body: { status: "ok" } });
       upstream.get("/", { status: 200, body: { message: "upstream response" } });
       await startNginz(`tests/${MODULE}/nginx-match.conf`, MODULE);
       await waitForStatus("/ready", 200);
@@ -545,6 +549,7 @@ describe("healthcheck module", () => {
       probe.get("/probe", { status: 200, body: { status: "ok" } });
       upstream.reset();
       upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/peer-probe", { status: 200, body: { status: "ok" } });
       upstream.get("/", { status: 200, body: { message: "upstream response" } });
       await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
       await waitForStatus("/ready", 200);
@@ -590,6 +595,7 @@ describe("healthcheck module", () => {
       probe.get("/probe", { status: 200, body: { status: "ok" } });
       upstream.reset();
       upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/peer-probe", { status: 200, body: { status: "ok" } });
       upstream.get("/", { status: 200, body: { message: "upstream response" } });
       await startNginz(`tests/${MODULE}/nginx-metrics.conf`, MODULE);
       await waitForStatus("/ready", 200);
@@ -599,6 +605,7 @@ describe("healthcheck module", () => {
       await Bun.sleep(300);
       const res = await fetch(`${TEST_URL}/metrics`);
       expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/plain");
 
       const text = await res.text();
       // Should contain Prometheus-format metric lines
@@ -617,6 +624,45 @@ describe("healthcheck module", () => {
 
       expect(text).toContain("nginz_health_upstream_probe_healthy");
       expect(text).toContain("upstream=\"backend\"");
+    });
+  });
+
+  describe("peer probes", () => {
+    beforeEach(async () => {
+      await stopNginz();
+      await Bun.sleep(150);
+      probe.reset();
+      probe.get("/probe", { status: 200, body: { status: "ok" } });
+      upstream.reset();
+      upstream.get("/peer-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/", { status: 200, body: { message: "upstream response" } });
+      await startNginz(`tests/${MODULE}/nginx-peer.conf`, MODULE);
+      await waitForStatus("/ready", 200);
+    });
+
+    test("/health includes configured peer probe results", async () => {
+      const body = await waitForHealthSnapshot(
+        (snap) =>
+          Array.isArray(snap.peers) &&
+          snap.peers.length === 1 &&
+          snap.peers[0]?.probe_total_successes > 0
+      );
+
+      expect(body.peers[0].upstream).toBe("backend");
+      expect(body.peers[0].peer).toBe("127.0.0.1:19002");
+      expect(body.peers[0].probe_healthy).toBe(true);
+      expect(upstream.getRequestsFor("/peer-probe", "GET").length).toBeGreaterThan(0);
+    });
+
+    test("/metrics includes peer probe metrics", async () => {
+      await Bun.sleep(300);
+      const res = await fetch(`${TEST_URL}/metrics`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("text/plain");
+
+      const text = await res.text();
+      expect(text).toContain("nginz_health_peer_probe_healthy");
+      expect(text).toContain("peer=\"127.0.0.1:19002\"");
     });
   });
 });

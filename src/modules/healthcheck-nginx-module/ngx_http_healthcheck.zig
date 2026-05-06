@@ -1118,22 +1118,22 @@ fn peer_probe_timer_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
 
 // ── JSON response helpers ────────────────────────────────────────────────────
 
-fn sendJsonResponse(r: [*c]ngx_http_request_t, json: []const u8, status: ngx_uint_t) ngx_int_t {
-    r.*.headers_out.content_type = ngx_str_t{ .len = 16, .data = @constCast("application/json") };
-    r.*.headers_out.content_type_len = 16;
+fn sendResponse(r: [*c]ngx_http_request_t, body: []const u8, content_type: []const u8, status: ngx_uint_t) ngx_int_t {
+    r.*.headers_out.content_type = ngx_str_t{ .len = content_type.len, .data = @constCast(content_type.ptr) };
+    r.*.headers_out.content_type_len = @intCast(content_type.len);
     r.*.headers_out.status = status;
-    r.*.headers_out.content_length_n = @intCast(json.len);
+    r.*.headers_out.content_length_n = @intCast(body.len);
 
     const rc = http.ngx_http_send_header(r);
     if (rc == NGX_ERROR or rc > NGX_OK) return rc;
 
     const b = core.castPtr(ngx.buf.ngx_buf_t, core.ngx_pcalloc(r.*.pool, @sizeOf(ngx.buf.ngx_buf_t))) orelse return NGX_ERROR;
-    const data = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, json.len)) orelse return NGX_ERROR;
+    const data = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, body.len)) orelse return NGX_ERROR;
 
-    @memcpy(core.slicify(u8, data, json.len), json);
+    @memcpy(core.slicify(u8, data, body.len), body);
 
     b.*.pos = data;
-    b.*.last = data + json.len;
+    b.*.last = data + body.len;
     b.*.flags.memory = true;
     b.*.flags.last_buf = true;
     b.*.flags.last_in_chain = true;
@@ -1142,6 +1142,10 @@ fn sendJsonResponse(r: [*c]ngx_http_request_t, json: []const u8, status: ngx_uin
     out.buf = b;
     out.next = null;
     return http.ngx_http_output_filter(r, &out);
+}
+
+fn sendJsonResponse(r: [*c]ngx_http_request_t, json: []const u8, status: ngx_uint_t) ngx_int_t {
+    return sendResponse(r, json, "application/json", status);
 }
 
 // ── HTTP handlers ────────────────────────────────────────────────────────────
@@ -1572,7 +1576,9 @@ fn ngx_conf_set_health_upstream_probe_slow_start(cf: [*c]ngx_conf_t, cmd: [*c]ng
 
 fn ngx_conf_set_health_upstream_peer_probe(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, data: ?*anyopaque) callconv(.c) [*c]u8 {
     _ = cmd;
-    const uscf = core.castPtr(http.ngx_http_upstream_srv_conf_t, data) orelse return conf.NGX_CONF_OK;
+    _ = data;
+    const uscf = core.castPtr(http.ngx_http_upstream_srv_conf_t, conf.ngx_http_conf_get_module_srv_conf(cf, &ngx_http_upstream_module)) orelse
+        return configError(cf, "health_upstream_peer_probe: upstream context unavailable");
     if (peer_probe_count >= MAX_PEER_PROBES) return configError(cf, "too many health_upstream_peer_probe entries");
 
     var i: ngx_uint_t = 1;
@@ -1708,7 +1714,7 @@ export fn ngx_http_healthcheck_metrics_handler(r: [*c]ngx_http_request_t) callco
     }
 
     const body = buf[0..pos];
-    return sendJsonResponse(r, body, 200);
+    return sendResponse(r, body, "text/plain; version=0.0.4", 200);
 }
 
 // ── Nginx variables ──────────────────────────────────────────────────────────
@@ -1772,10 +1778,15 @@ fn ngx_http_healthcheck_variable(
 
 // ── Module init ──────────────────────────────────────────────────────────────
 
-fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
-    // Reset upstream probe count on each config cycle (handles reload).
+fn preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
+    _ = cf;
+    // Reset per-config-cycle globals before directive parsing starts.
     upstream_probe_count = 0;
     peer_probe_count = 0;
+    return NGX_OK;
+}
+
+fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
 
     // Service-level shared zone.
     if (ngx_http_healthcheck_zone == core.nullptr(core.ngx_shm_zone_t)) {
@@ -1950,7 +1961,7 @@ fn healthcheck_exit_process(_: [*c]core.ngx_cycle_t) callconv(.c) void {
 // ── Module registration ──────────────────────────────────────────────────────
 
 export const ngx_http_healthcheck_module_ctx = ngx_http_module_t{
-    .preconfiguration = null,
+    .preconfiguration = preconfiguration,
     .postconfiguration = postconfiguration,
     .create_main_conf = null,
     .init_main_conf = null,

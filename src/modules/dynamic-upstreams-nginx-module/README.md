@@ -56,6 +56,11 @@ This module should **not** own:
 - `project/build_package.zig`
 - nginx request handling: location-scoped content handler serving a JSON control endpoint
 
+### Milestone 2 Reminder
+
+- `dynamic-upstreams` is not the direct blocker for current healthcheck completeness, but its snapshot/peer-identity contract must stay compatible with future health-aware peer filtering in `upstream-balancer`.
+- When health-aware drain/remove behavior is added later, document it as an explicit cross-module contract with `healthcheck` and `upstream-balancer`, not as implicit mutation from this module.
+
 ### Data Model and Config
 
 #### Planned location config shape

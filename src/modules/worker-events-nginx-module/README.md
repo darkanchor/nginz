@@ -118,6 +118,12 @@ Phase 1 should standardize one minimal event entry with fields equivalent to:
 - session or token revocation propagation
 - dynamic upstream / health state notifications
 
+### Milestone 2 Reminder
+
+- `healthcheck` already maintains shared probe state without this module, but milestone 2 still expects a later fanout path for health transitions.
+- When `healthcheck` integrates here, the goal is notification/coherency, not ownership of probe truth. `worker-events` should carry “state changed” signals, while `healthcheck` remains the source of health state.
+- Keep the first health-related contract narrow: enough event metadata for another worker to notice a transition and re-read shared health state.
+
 ### Phase Plan
 
 #### Phase 1 - Shared primitive and publish path
@@ -196,6 +202,7 @@ Stabilize the module for njs-facing and operator-facing use.
 - njs subscription conventions belong here, not earlier
 - Publish authorization and endpoint hardening should be explicit
 - Keep consumer integration light enough that modules can adopt it incrementally
+- `healthcheck` transition fanout is an expected early native consumer once the shared ring semantics are stable.
 
 **TDD checklist**
 

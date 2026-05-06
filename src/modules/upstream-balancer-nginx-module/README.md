@@ -56,6 +56,12 @@ This module should **not** own:
 - nginx upstream peer hook surface: wrap `ngx_http_upstream_peer_t` callback ownership explicitly rather than introducing a parallel routing path
 - future consumers: `dynamic-upstreams`, `healthcheck`
 
+### Milestone 2 Reminder
+
+- `healthcheck` probing/reporting is already implemented separately, but milestone 2 is not complete until this module can consume documented peer-health input and apply it during peer selection.
+- The missing healthcheck integration here is selection-time behavior only: skip unhealthy peers, define fallback semantics, and document what happens while a peer is in slow-start recovery.
+- Do not duplicate probing logic in this module; consume `healthcheck` state through a narrow contract instead.
+
 ### Data Model and Config
 
 #### Planned upstream config shape
@@ -188,6 +194,7 @@ Harden the selection path for future dynamic upstream work and operational visib
 - Define the peer identity contract that `dynamic-upstreams` must preserve
 - Keep observability light but useful: hit/miss counters or debug traces are enough for the first useful version
 - Document how health-marked or drained peers should be handled once other modules integrate
+- This phase should also close the milestone-2 gap where `healthcheck` state exists but does not yet influence live peer selection.
 
 **TDD checklist**
 
