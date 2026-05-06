@@ -13,6 +13,7 @@ const MODULE = "healthcheck";
 
 let mocks;
 let probe;
+let upstream;
 
 async function waitForStatus(path, status, timeout = 4000) {
   const started = Date.now();
@@ -53,6 +54,7 @@ describe("healthcheck module", () => {
   beforeAll(async () => {
     mocks = createMockManager();
     probe = mocks.add("probe", createHTTPMock(MOCK_PORTS.HTTP));
+    upstream = mocks.add("upstream", createHTTPMock(MOCK_PORTS.HTTP_UPSTREAM_1));
   });
 
   afterAll(async () => {
@@ -71,6 +73,9 @@ describe("healthcheck module", () => {
     await Bun.sleep(150);
     probe.reset();
     probe.get("/probe", { status: 200, body: { status: "ok" } });
+    upstream.reset();
+    upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+    upstream.get("/", { status: 200, body: { message: "upstream response" } });
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
     await waitForStatus("/ready", 200);
   });
@@ -218,5 +223,72 @@ describe("healthcheck module", () => {
     const res = await fetch(`${TEST_URL}/`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("Hello World");
+  });
+
+  describe("upstream probe", () => {
+    test("/health includes upstream section with backend probe state", async () => {
+      await Bun.sleep(300);
+
+      const res = await fetch(`${TEST_URL}/health`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+
+      expect(Array.isArray(body.upstreams)).toBe(true);
+      expect(body.upstreams.length).toBe(1);
+
+      const u = body.upstreams[0];
+      expect(u.name).toBe("backend");
+      expect(u.probe_healthy).toBe(true);
+      expect(u.probe_last_status).toBe(200);
+      expect(u.probe_total_successes).toBeGreaterThan(0);
+      expect(u.probe_total_failures).toBe(0);
+      expect(upstream.getRequestsFor("/upstream-probe", "GET").length).toBeGreaterThan(0);
+    });
+
+    test("upstream probe failure is reflected in /health upstreams section", async () => {
+      upstream.get("/upstream-probe", { status: 503, body: { status: "down" } });
+
+      const body = await waitForHealthSnapshot(
+        (snap) =>
+          Array.isArray(snap.upstreams) &&
+          snap.upstreams.length === 1 &&
+          snap.upstreams[0].probe_healthy === false
+      );
+
+      expect(body.upstreams[0].name).toBe("backend");
+      expect(body.upstreams[0].probe_healthy).toBe(false);
+      expect(body.upstreams[0].probe_last_status).toBe(503);
+      expect(body.upstreams[0].probe_total_failures).toBeGreaterThan(0);
+    });
+
+    test("upstream probe recovery is reflected after passing probes", async () => {
+      upstream.get("/upstream-probe", { status: 503, body: { status: "down" } });
+      await waitForHealthSnapshot(
+        (snap) => Array.isArray(snap.upstreams) && snap.upstreams[0]?.probe_healthy === false
+      );
+
+      upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      const body = await waitForHealthSnapshot(
+        (snap) =>
+          Array.isArray(snap.upstreams) &&
+          snap.upstreams[0]?.probe_healthy === true &&
+          snap.upstreams[0]?.probe_consecutive_successes >= 2
+      );
+
+      expect(body.upstreams[0].probe_healthy).toBe(true);
+      expect(body.upstreams[0].probe_consecutive_successes).toBeGreaterThanOrEqual(2);
+    });
+
+    test("upstream probe failure does not affect service-level readiness", async () => {
+      upstream.get("/upstream-probe", { status: 503, body: { status: "down" } });
+      await waitForHealthSnapshot(
+        (snap) => Array.isArray(snap.upstreams) && snap.upstreams[0]?.probe_healthy === false
+      );
+
+      // Service-level readiness depends only on health_probe, not upstream probes
+      const ready = await fetch(`${TEST_URL}/ready`);
+      expect(ready.status).toBe(200);
+      expect(await ready.json()).toEqual({ status: "ready" });
+    });
   });
 });
