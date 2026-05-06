@@ -1039,7 +1039,15 @@ This is the boundary where health reporting becomes health-aware routing.
 
 #### 2. `healthcheck` -> `worker-events`
 
-This is the transition-fanout gap.
+This is no longer a pure gap. A first integration slice has landed and is now
+test-backed:
+
+- service-level health transitions publish worker-events notifications
+- steady-state healthy probes do not emit duplicate transition events
+- the event payload is narrow and points consumers back toward shared health
+  state rather than replacing it
+
+What is still pending is the broader version of that integration.
 
 Today `healthcheck` stores shared state and every worker can read that state.
 That is already useful, but milestone 2 still expects a way for workers to
@@ -1055,49 +1063,72 @@ The intended shape is narrow:
 
 The remaining work here is:
 
-- define event type names for health transitions
-- decide what minimal payload is safe and useful
-- publish events only on meaningful transitions, not every probe tick
+- extend transition fanout beyond service-level readiness if upstream-level or
+  peer-level transitions also need notifications
+- decide whether per-upstream or per-peer transition events are required for
+  later balancer coordination
 - document consumer expectations for re-reading shared state
+
+So this integration is **partially landed and integration-tested**, not wholly
+pending.
 
 #### 3. `worker-events` -> first real consumer
 
-`worker-events` is now useful as a primitive, but milestone 2 is stronger if
-one real module actually consumes it.
+This is no longer missing.
 
-Likely first consumers:
+The latest integration tests now prove real consumers:
 
 - `healthcheck` transition fanout
-- later cache invalidation fanout
+- `cache-purge` exact invalidation notifications
 
-What is still missing:
+That means `worker-events` is no longer only locally complete; it is now
+integration-proven for at least two producer boundaries.
 
-- one end-to-end integration that proves a producer emits events and another
-  module or worker consumes them correctly
-- integration tests that validate the boundary rather than only the event ring
-  itself
-
-Until this lands, `worker-events` should be treated as locally complete but not
-yet integration-proven.
+What still remains is deeper consumer breadth, not the first-consumer proof.
 
 #### 4. `cache-purge` -> `worker-events` (optional later phase)
 
-This is not required for the current exact-match cache-purge milestone slice.
+This has now landed for the current exact-match slice.
 
-`cache-purge` is already useful without event fanout because it mutates the
-shared purge metadata directly. But if later cache invalidation behavior needs
-workers to react faster or trigger follow-on work, `worker-events` is the
-intended additive mechanism.
+The integration tests prove:
+
+- successful exact purges emit one worker-events notification per mutated target
+- zero-hit purges do not emit notifications
+- mixed hit/miss batches emit notifications only for the targets that actually
+  mutated shared metadata
 
 Important constraint:
 
 - do not make `worker-events` a prerequisite for truthful exact invalidation
 
-If this integration lands later, it should be framed as:
+That constraint is still respected in the implementation:
 
 - purge metadata mutation remains the source of truth
 - emitted events are notifications about the mutation
 - consumers re-read shared metadata if they need current state
+
+What remains here is only later-scope work such as broader matching modes or
+more advanced consumer reactions.
+
+### Integration tests now enabled
+
+The following cross-module tests are now present and should be considered part
+of the milestone-2 integration evidence:
+
+- `healthcheck` -> `worker-events`
+  - service transition to unhealthy emits one event
+  - recovery emits one follow-up transition event
+  - steady healthy probe loops do not emit duplicates
+
+- `cache-purge` -> `worker-events`
+  - successful exact purge emits one event per successful target
+  - zero-hit purge emits no event
+  - mixed hit/miss purge emits events only for the mutated targets
+
+- `cache-purge` shared metadata under `worker_processes 2`
+  - exact invalidation mutates shared `cache-tags` metadata consistently
+  - sibling tags survive unrelated purges
+  - shared metadata can be repopulated and purged again after mutation
 
 ### Practical conclusion
 
@@ -1105,10 +1136,12 @@ For milestone 2 planning purposes:
 
 - `healthcheck`, `worker-events`, and `cache-purge` are each locally ready in
   their current narrowed scopes
-- the major remaining milestone-2 work is cross-module integration
+- several milestone-2 integrations are now already test-backed
 - the highest-priority integration is `healthcheck` feeding
   `upstream-balancer`
-- the next clean integration is `healthcheck` publishing transitions over
-  `worker-events`
-- `cache-purge` fanout through `worker-events` is useful later, but not a
-  blocker for the current exact-match control-plane goal
+- `healthcheck` publishing service transitions over `worker-events` is already
+  landed; broader health fanout scope may still expand later
+- `cache-purge` fanout through `worker-events` is already landed for exact
+  successful purges
+- the main remaining milestone-2 integration gap is still the
+  `healthcheck` -> `upstream-balancer` boundary

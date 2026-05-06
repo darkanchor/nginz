@@ -64,6 +64,30 @@ async function purge(targets) {
   });
 }
 
+async function getWorkerEvents(channel = "cache", since = null) {
+  const params = new URLSearchParams({ channel });
+  if (since != null) {
+    params.set("since", String(since));
+  }
+  const res = await fetch(`${TEST_URL}/worker-events?${params.toString()}`);
+  expect(res.status).toBe(200);
+  return res.json();
+}
+
+async function waitForWorkerEvents(predicate, channel = "cache", timeout = 4000, since = null) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeout) {
+    const body = await getWorkerEvents(channel, since);
+    if (predicate(body)) {
+      return body;
+    }
+    await Bun.sleep(75);
+  }
+
+  throw new Error(`Timed out waiting for worker-events on channel ${channel}`);
+}
+
 describe("cache-purge Phase 1 - API contract", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
@@ -261,6 +285,46 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
     expect(body.results).toHaveLength(2);
   });
 
+  test("re-registers a purged tag and allows it to be purged again", async () => {
+    await purge(["user-123"]);
+
+    await fetch(`${TEST_URL}/api`);
+
+    const firstPurge = await purge(["user-123"]);
+    expect(firstPurge.status).toBe(200);
+    const firstBody = await firstPurge.json();
+    expect(firstBody.requested).toBe(1);
+    expect(firstBody.purged).toBeGreaterThan(0);
+    expect(firstBody.missing).toBe(0);
+
+    await fetch(`${TEST_URL}/api`);
+
+    const secondPurge = await purge(["user-123"]);
+    expect(secondPurge.status).toBe(200);
+    const secondBody = await secondPurge.json();
+    expect(secondBody.requested).toBe(1);
+    expect(secondBody.purged).toBeGreaterThan(0);
+    expect(secondBody.missing).toBe(0);
+  });
+
+  test("duplicate targets in one batch are accounted for deterministically", async () => {
+    await purge(["user-123"]);
+    await fetch(`${TEST_URL}/api`);
+
+    const res = await purge(["user-123", "user-123"]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.requested).toBe(2);
+    expect(body.purged).toBeGreaterThan(0);
+    expect(body.missing).toBe(1);
+    expect(body.rejected).toBe(0);
+    expect(body.results).toHaveLength(2);
+    expect(body.results[0].target).toBe("user-123");
+    expect(body.results[0].purged).toBeGreaterThan(0);
+    expect(body.results[1].target).toBe("user-123");
+    expect(body.results[1].purged).toBe(0);
+  });
+
   test("other routes remain available", async () => {
     const res = await fetch(`${TEST_URL}/`);
     expect(res.status).toBe(200);
@@ -299,5 +363,126 @@ describe("cache-purge Phase 2 - shared metadata with 2 workers", () => {
     expect(body.requested).toBe(2);
     expect(body.purged).toBe(0);
     expect(body.missing).toBe(2);
+  });
+
+  test("purging one tag does not remove sibling tags from shared metadata", async () => {
+    await purge(["user-123", "product-456"]);
+    await fetch(`${TEST_URL}/api`);
+
+    const firstRes = await purge(["user-123"]);
+    expect(firstRes.status).toBe(200);
+    const firstBody = await firstRes.json();
+    expect(firstBody.requested).toBe(1);
+    expect(firstBody.purged).toBeGreaterThan(0);
+    expect(firstBody.missing).toBe(0);
+
+    const secondRes = await purge(["product-456"]);
+    expect(secondRes.status).toBe(200);
+    const secondBody = await secondRes.json();
+    expect(secondBody.requested).toBe(1);
+    expect(secondBody.purged).toBeGreaterThan(0);
+    expect(secondBody.missing).toBe(0);
+  });
+
+  test("shared metadata can be repopulated after a 2-worker purge", async () => {
+    await purge(["user-123", "product-456"]);
+    await fetch(`${TEST_URL}/api`);
+
+    const firstPurge = await purge(["user-123", "product-456"]);
+    expect(firstPurge.status).toBe(200);
+    const firstBody = await firstPurge.json();
+    expect(firstBody.requested).toBe(2);
+    expect(firstBody.purged).toBeGreaterThanOrEqual(2);
+    expect(firstBody.missing).toBe(0);
+
+    await Promise.all(
+      Array.from({ length: 8 }, () => fetch(`${TEST_URL}/api`)),
+    );
+
+    const secondPurge = await purge(["user-123", "product-456"]);
+    expect(secondPurge.status).toBe(200);
+    const secondBody = await secondPurge.json();
+    expect(secondBody.requested).toBe(2);
+    expect(secondBody.purged).toBeGreaterThanOrEqual(2);
+    expect(secondBody.missing).toBe(0);
+
+    const finalPurge = await purge(["user-123", "product-456"]);
+    expect(finalPurge.status).toBe(200);
+    const finalBody = await finalPurge.json();
+    expect(finalBody.requested).toBe(2);
+    expect(finalBody.purged).toBe(0);
+    expect(finalBody.missing).toBe(2);
+  });
+});
+
+describe("cache-purge Phase 3 - worker-events notifications", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-worker-events.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("successful purge emits one event per successful target", async () => {
+    await fetch(`${TEST_URL}/api`);
+    const before = await getWorkerEvents();
+
+    const res = await purge(["user-123", "product-456"]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.purged).toBeGreaterThanOrEqual(2);
+
+    const events = await waitForWorkerEvents(
+      (state) => state.events.length === 2,
+      "cache",
+      4000,
+      before.newest_generation,
+    );
+    expect(events.events.map((event) => event.type)).toEqual(["purged", "purged"]);
+    const payloads = events.events.map((event) => JSON.parse(event.payload));
+    expect(payloads).toEqual([
+      expect.objectContaining({ match: "exact", target: "user-123" }),
+      expect.objectContaining({ match: "exact", target: "product-456" }),
+    ]);
+    expect(payloads[0].purged).toBeGreaterThan(0);
+    expect(payloads[1].purged).toBeGreaterThan(0);
+  });
+
+  test("zero-hit purge does not emit worker-events notifications", async () => {
+    const before = await getWorkerEvents();
+    const res = await purge(["missing-tag"]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.purged).toBe(0);
+
+    await Bun.sleep(250);
+    const events = await getWorkerEvents("cache", before.newest_generation);
+    expect(events.events).toEqual([]);
+  });
+
+  test("mixed hit-miss purge emits notifications only for mutated targets", async () => {
+    await fetch(`${TEST_URL}/api`);
+    const before = await getWorkerEvents();
+
+    const res = await purge(["user-123", "missing-tag"]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.requested).toBe(2);
+    expect(body.missing).toBe(1);
+
+    const events = await waitForWorkerEvents(
+      (state) => state.events.length === 1,
+      "cache",
+      4000,
+      before.newest_generation,
+    );
+    expect(events.events[0].type).toBe("purged");
+    const payload = JSON.parse(events.events[0].payload);
+    expect(payload).toEqual(
+      expect.objectContaining({ match: "exact", target: "user-123" }),
+    );
+    expect(payload.purged).toBeGreaterThan(0);
   });
 });

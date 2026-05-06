@@ -28,6 +28,13 @@ const NArray = ngx.array.NArray;
 extern var ngx_http_core_module: ngx_module_t;
 extern var ngx_http_upstream_module: ngx_module_t;
 extern var ngx_worker: ngx_uint_t;
+extern var ngx_http_worker_events_default_zone: [*c]core.ngx_shm_zone_t;
+extern fn ngx_http_worker_events_publish_internal(
+    zone: [*c]core.ngx_shm_zone_t,
+    channel_str: ngx_str_t,
+    type_str: ngx_str_t,
+    payload_str: ngx_str_t,
+) callconv(.c) ngx_int_t;
 
 const HEALTHCHECK_ZONE_SIZE: usize = 64 * 1024;
 const UPSTREAM_ZONE_SIZE: usize = 32 * 1024;
@@ -115,6 +122,7 @@ const healthcheck_loc_conf = extern struct {
     status_enabled: ngx_flag_t,
     liveness_enabled: ngx_flag_t,
     readiness_enabled: ngx_flag_t,
+    worker_events_channel: ngx_str_t,
 };
 
 // Per-upstream probe config stored in upstream {} srv_conf.
@@ -286,6 +294,7 @@ var healthcheck_probe_match_status_min: ngx_uint_t = 0;
 var healthcheck_probe_match_status_max: ngx_uint_t = 0;
 var healthcheck_probe_match_body_len: usize = 0;
 var healthcheck_probe_match_body_buf: [MAX_PROBE_MATCH_BODY_LEN]u8 = [_]u8{0} ** MAX_PROBE_MATCH_BODY_LEN;
+var healthcheck_worker_events_channel: ngx_str_t = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
 
 var upstream_probes: [MAX_UPSTREAM_PROBES]UpstreamProbeEntry = undefined;
 var upstream_probe_count: usize = 0;
@@ -326,6 +335,23 @@ fn getCurrentTimeMs() i64 {
         return @as(i64, @intCast(t.*.sec)) * 1000 + @as(i64, @intCast(t.*.msec));
     }
     return 0;
+}
+
+fn publishHealthTransition(healthy: bool, status: ngx_uint_t, checked_at_ms: i64) void {
+    const zone = ngx_http_worker_events_default_zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
+    if (healthcheck_worker_events_channel.len == 0 or healthcheck_worker_events_channel.data == null) return;
+
+    const event_type = ngx_string("transition");
+    var payload_buf: [192]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"scope\":\"service\",\"healthy\":{s},\"status\":{d},\"checked_at_msec\":{d}}}",
+        .{ if (healthy) "true" else "false", status, checked_at_ms },
+    ) catch return;
+
+    const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
+    _ = ngx_http_worker_events_publish_internal(zone, healthcheck_worker_events_channel, event_type, payload_str);
 }
 
 // ── Zone init callbacks ──────────────────────────────────────────────────────
@@ -385,6 +411,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.status_enabled = 0;
         p.*.liveness_enabled = 0;
         p.*.readiness_enabled = 0;
+        p.*.worker_events_channel = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
         return p;
     }
     return null;
@@ -402,6 +429,7 @@ fn merge_loc_conf(
     if (c.*.status_enabled == 0) c.*.status_enabled = prev.*.status_enabled;
     if (c.*.liveness_enabled == 0) c.*.liveness_enabled = prev.*.liveness_enabled;
     if (c.*.readiness_enabled == 0) c.*.readiness_enabled = prev.*.readiness_enabled;
+    if (c.*.worker_events_channel.len == 0) c.*.worker_events_channel = prev.*.worker_events_channel;
 
     return conf.NGX_CONF_OK;
 }
@@ -764,9 +792,12 @@ fn performPeerProbe(entry: *const PeerProbeEntry) ProbeResult {
 fn recordProbeResult(result: ProbeResult) void {
     const store = getStore() orelse return;
     const shpool = getShpool() orelse return;
+    var emit_transition = false;
+    var transition_healthy = false;
+    const transition_status: ngx_uint_t = result.status;
+    var transition_checked_at: i64 = 0;
 
     shm.ngx_shmtx_lock(&shpool.*.mutex);
-    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
 
     const now = getCurrentTimeMs();
     store.*.probe_enabled = if (healthcheck_probe_enabled) 1 else 0;
@@ -781,6 +812,11 @@ fn recordProbeResult(result: ProbeResult) void {
             const was_unhealthy = store.*.probe_healthy == 0;
             store.*.probe_healthy = 1;
             store.*.ready = 1;
+            if (was_unhealthy) {
+                emit_transition = true;
+                transition_healthy = true;
+                transition_checked_at = now;
+            }
             // Start slow-start tracking on recovery
             if (was_unhealthy and healthcheck_probe_slow_start_ms > 0) {
                 store.*.probe_recovered_at_ms = now;
@@ -802,9 +838,21 @@ fn recordProbeResult(result: ProbeResult) void {
         store.*.probe_slow_start_elapsed_ms = 0;
         store.*.probe_recovered_at_ms = 0;
         if (store.*.probe_consecutive_failures >= healthcheck_probe_fail_threshold) {
+            const was_healthy = store.*.probe_healthy == 1;
             store.*.probe_healthy = 0;
             store.*.ready = 0;
+            if (was_healthy) {
+                emit_transition = true;
+                transition_healthy = false;
+                transition_checked_at = now;
+            }
         }
+    }
+
+    shm.ngx_shmtx_unlock(&shpool.*.mutex);
+
+    if (emit_transition) {
+        publishHealthTransition(transition_healthy, transition_status, transition_checked_at);
     }
 }
 
@@ -1351,6 +1399,18 @@ fn ngx_conf_set_health_readiness(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, loc
         lccf.*.readiness_enabled = 1;
         if (core.castPtr(http.ngx_http_core_loc_conf_t, conf.ngx_http_conf_get_module_loc_conf(cf, &ngx_http_core_module))) |clcf| {
             clcf.*.handler = ngx_http_healthcheck_readiness_handler;
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
+fn ngx_conf_set_health_worker_events_channel(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, loc: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(healthcheck_loc_conf, loc)) |lccf| {
+        var i: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
+            lccf.*.worker_events_channel = arg.*;
+            healthcheck_worker_events_channel = arg.*;
         }
     }
     return conf.NGX_CONF_OK;
@@ -2033,6 +2093,14 @@ export const ngx_http_healthcheck_commands = [_]ngx_command_t{
         .name = ngx_string("health_probe_passes"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
         .set = ngx_conf_set_health_probe_passes,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("health_worker_events_channel"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = ngx_conf_set_health_worker_events_channel,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,

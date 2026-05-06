@@ -50,6 +50,37 @@ async function waitForHealthSnapshot(predicate, timeout = 4000) {
   throw new Error("Timed out waiting for /health snapshot predicate");
 }
 
+async function getWorkerEvents(channel = "health") {
+  const res = await fetch(`${TEST_URL}/worker-events?channel=${encodeURIComponent(channel)}`);
+  expect(res.status).toBe(200);
+  return res.json();
+}
+
+async function waitForWorkerEvents(predicate, channel = "health", timeout = 4000) {
+  const started = Date.now();
+
+  while (Date.now() - started < timeout) {
+    const body = await getWorkerEvents(channel);
+    if (predicate(body)) {
+      return body;
+    }
+    await Bun.sleep(75);
+  }
+
+  throw new Error(`Timed out waiting for worker-events on channel ${channel}`);
+}
+
+async function fetchMany(path, count, batchSize = 8) {
+  let completed = 0;
+  while (completed < count) {
+    const size = Math.min(batchSize, count - completed);
+    const responses = await Promise.all(
+      Array.from({ length: size }, () => fetch(`${TEST_URL}${path}`)),
+    );
+    completed += responses.length;
+  }
+}
+
 describe("healthcheck module", () => {
   beforeAll(async () => {
     mocks = createMockManager();
@@ -130,21 +161,20 @@ describe("healthcheck module", () => {
   test("passive request and failure counters aggregate across workers", async () => {
     const successCount = 40;
     const failureCount = 12;
+    const before = await getHealthSnapshot();
 
-    await Promise.all(
-      Array.from({ length: successCount }, () => fetch(`${TEST_URL}/`))
+    await fetchMany("/", successCount, 8);
+    await fetchMany("/fail", failureCount, 6);
+
+    const body = await waitForHealthSnapshot(
+      (snapshot) =>
+        snapshot.requests >= before.requests + successCount + failureCount &&
+        snapshot.failed >= before.failed + failureCount,
+      4000,
     );
 
-    await Promise.all(
-      Array.from({ length: failureCount }, () => fetch(`${TEST_URL}/fail`))
-    );
-
-    const res = await fetch(`${TEST_URL}/health`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-
-    expect(body.requests).toBeGreaterThanOrEqual(successCount + failureCount);
-    expect(body.failed).toBeGreaterThanOrEqual(failureCount);
+    expect(body.requests).toBeGreaterThanOrEqual(before.requests + successCount + failureCount);
+    expect(body.failed).toBeGreaterThanOrEqual(before.failed + failureCount);
     expect(body.success_rate).toBeLessThan(100);
   });
 
@@ -663,6 +693,56 @@ describe("healthcheck module", () => {
       const text = await res.text();
       expect(text).toContain("nginz_health_peer_probe_healthy");
       expect(text).toContain("peer=\"127.0.0.1:19002\"");
+    });
+  });
+
+  describe("worker-events integration", () => {
+    beforeEach(async () => {
+      await stopNginz();
+      await Bun.sleep(150);
+      probe.reset();
+      probe.get("/probe", { status: 200, body: { status: "ok" } });
+      upstream.reset();
+      upstream.get("/upstream-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/peer-probe", { status: 200, body: { status: "ok" } });
+      upstream.get("/", { status: 200, body: { message: "upstream response" } });
+      await startNginz(`tests/${MODULE}/nginx-worker-events.conf`, MODULE);
+      await waitForStatus("/ready", 200);
+    });
+
+    test("health transitions publish worker-events notifications", async () => {
+      const initialEvents = await getWorkerEvents();
+      expect(initialEvents.events).toEqual([]);
+
+      probe.get("/probe", { status: 500, body: { status: "down" } });
+      await waitForStatus("/ready", 503);
+
+      const unhealthyEvents = await waitForWorkerEvents(
+        (body) => body.events.some((event) => {
+          if (event.type !== "transition") return false;
+          const payload = JSON.parse(event.payload);
+          return payload.scope === "service" && payload.healthy === false && payload.status === 500;
+        }),
+      );
+      expect(unhealthyEvents.events).toHaveLength(1);
+
+      probe.get("/probe", { status: 200, body: { status: "recovered" } });
+      await waitForStatus("/ready", 200);
+
+      const recoveredEvents = await waitForWorkerEvents(
+        (body) => body.events.some((event) => {
+          if (event.type !== "transition") return false;
+          const payload = JSON.parse(event.payload);
+          return payload.scope === "service" && payload.healthy === true && payload.status === 200;
+        }),
+      );
+      expect(recoveredEvents.events).toHaveLength(2);
+    });
+
+    test("steady-state healthy probes do not emit duplicate worker-events", async () => {
+      await Bun.sleep(350);
+      const events = await getWorkerEvents();
+      expect(events.events).toEqual([]);
     });
   });
 });

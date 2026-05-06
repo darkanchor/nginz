@@ -37,6 +37,8 @@ const MAX_CHANNEL_LEN: usize = 64;
 const MAX_TYPE_LEN: usize = 64;
 const MAX_PAYLOAD_LEN: usize = 512;
 
+export var ngx_http_worker_events_default_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_shm_zone_t);
+
 // ── Shared-memory data structures (C ABI) ────────────────────────────────────
 
 const WorkerEventsStore = extern struct {
@@ -105,6 +107,85 @@ fn get_current_time_msec() i64 {
         return @as(i64, @intCast(t.*.sec)) * 1000 + @as(i64, @intCast(t.*.msec));
     }
     return 0;
+}
+
+const PublishWriteResult = struct {
+    generation: u64,
+    created_at_msec: i64,
+};
+
+fn valid_publish_str(value: ngx_str_t, max_len: usize, allow_empty: bool) bool {
+    if (value.data == null) return allow_empty and value.len == 0;
+    if (value.len == 0) return allow_empty;
+    return value.len <= max_len;
+}
+
+fn publish_to_ring(
+    zone: [*c]core.ngx_shm_zone_t,
+    channel_str: ngx_str_t,
+    type_str: ngx_str_t,
+    payload_str: ngx_str_t,
+) ?PublishWriteResult {
+    if (!valid_publish_str(channel_str, MAX_CHANNEL_LEN, false)) return null;
+    if (!valid_publish_str(type_str, MAX_TYPE_LEN, false)) return null;
+    if (!valid_publish_str(payload_str, MAX_PAYLOAD_LEN, true)) return null;
+
+    const store = get_store(zone) orelse return null;
+    const shpool = get_shpool(zone) orelse return null;
+
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
+
+    const entries = get_entries(store);
+    const generation = store.*.next_generation;
+    const write_idx = store.*.write_index;
+    const capacity = store.*.capacity;
+
+    if (store.*.retained_count == capacity) {
+        store.*.dropped_events += 1;
+        if (store.*.oldest_generation == 0) {
+            store.*.oldest_generation = entries[write_idx].generation;
+        }
+        store.*.oldest_generation = entries[write_idx].generation + 1;
+    }
+
+    const entry = &entries[write_idx];
+    entry.*.generation = generation;
+    entry.*.created_at_msec = get_current_time_msec();
+
+    entry.*.channel_len = @intCast(@min(channel_str.len, MAX_CHANNEL_LEN));
+    @memset(&entry.*.channel, 0);
+    _ = str_copy(&entry.*.channel, channel_str);
+
+    entry.*.type_len = @intCast(@min(type_str.len, MAX_TYPE_LEN));
+    @memset(&entry.*.event_type, 0);
+    _ = str_copy(&entry.*.event_type, type_str);
+
+    entry.*.payload_len = @intCast(@min(payload_str.len, MAX_PAYLOAD_LEN));
+    @memset(&entry.*.payload, 0);
+    _ = str_copy(&entry.*.payload, payload_str);
+
+    store.*.write_index = (write_idx + 1) % capacity;
+    store.*.next_generation = generation + 1;
+    store.*.newest_generation = generation;
+    store.*.last_publish_msec = entry.*.created_at_msec;
+    if (store.*.retained_count < capacity) {
+        store.*.retained_count += 1;
+    }
+    if (store.*.oldest_generation == 0) {
+        store.*.oldest_generation = generation;
+    }
+
+    return .{ .generation = generation, .created_at_msec = entry.*.created_at_msec };
+}
+
+export fn ngx_http_worker_events_publish_internal(
+    zone: [*c]core.ngx_shm_zone_t,
+    channel_str: ngx_str_t,
+    type_str: ngx_str_t,
+    payload_str: ngx_str_t,
+) callconv(.c) ngx_int_t {
+    return if (publish_to_ring(zone, channel_str, type_str, payload_str) != null) NGX_OK else NGX_ERROR;
 }
 
 // ── Zone init callback ───────────────────────────────────────────────────────
@@ -661,69 +742,12 @@ fn publish_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         return;
     }
 
-    // Publish to shared ring
     const zone = lccf.*.zone;
-    const store = get_store(zone) orelse {
+    const publish_result = publish_to_ring(zone, channel_str, type_str, payload_str) orelse {
         _ = send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_string("{\"module\":\"worker_events\",\"status\":\"error\",\"error\":\"shared zone not initialized\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     };
-
-    const shpool = get_shpool(zone) orelse {
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    };
-
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
-    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
-
-    const entries = get_entries(store);
-    const generation = store.*.next_generation;
-    const write_idx = store.*.write_index;
-    const capacity = store.*.capacity;
-
-    // Check for overflow before writing
-    if (store.*.retained_count == capacity) {
-        // Ring is full - oldest entry will be overwritten
-        store.*.dropped_events += 1;
-        if (store.*.oldest_generation == 0) {
-            store.*.oldest_generation = entries[write_idx].generation;
-        }
-        // Advance oldest_generation to the generation being overwritten
-        store.*.oldest_generation = entries[write_idx].generation + 1;
-    }
-
-    // Write the entry
-    const entry = &entries[write_idx];
-    entry.*.generation = generation;
-    entry.*.created_at_msec = get_current_time_msec();
-
-    // Copy channel
-    entry.*.channel_len = @intCast(@min(channel_str.len, MAX_CHANNEL_LEN));
-    @memset(&entry.*.channel, 0);
-    _ = str_copy(&entry.*.channel, channel_str);
-
-    // Copy type
-    entry.*.type_len = @intCast(@min(type_str.len, MAX_TYPE_LEN));
-    @memset(&entry.*.event_type, 0);
-    _ = str_copy(&entry.*.event_type, type_str);
-
-    // Copy payload
-    entry.*.payload_len = @intCast(@min(payload_str.len, MAX_PAYLOAD_LEN));
-    @memset(&entry.*.payload, 0);
-    _ = str_copy(&entry.*.payload, payload_str);
-
-    // Advance indices
-    store.*.write_index = (write_idx + 1) % capacity;
-    store.*.next_generation = generation + 1;
-    store.*.newest_generation = generation;
-    store.*.last_publish_msec = entry.*.created_at_msec;
-    if (store.*.retained_count < capacity) {
-        store.*.retained_count += 1;
-    }
-    if (store.*.oldest_generation == 0) {
-        store.*.oldest_generation = generation;
-    }
 
     // Build success response
     // Estimate max size: ~150 bytes
@@ -761,7 +785,7 @@ fn publish_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     append2(&w2, "\",\"generation\":");
     {
         var nbuf: [20]u8 = undefined;
-        const n = write_u64_into(&nbuf, generation);
+        const n = write_u64_into(&nbuf, publish_result.generation);
         @memcpy(w2[0..n], nbuf[0..n]);
         w2 += n;
     }
@@ -975,6 +999,7 @@ fn create_shared_zone(cf: [*c]ngx_conf_t, lccf: [*c]worker_events_loc_conf) [*c]
         const zone = shm.ngx_shared_memory_add(cf, name_ptr, zone_size, @constCast(&ngx_http_worker_events_module));
         if (zone != core.nullptr(core.ngx_shm_zone_t)) {
             zone.*.init = zone_init;
+            ngx_http_worker_events_default_zone = zone;
             return zone;
         }
     }

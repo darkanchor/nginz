@@ -29,6 +29,13 @@ const ngx_null_str = string.ngx_null_str;
 const CJSON = cjson.CJSON;
 
 extern var ngx_http_core_module: ngx_module_t;
+extern var ngx_http_worker_events_default_zone: [*c]core.ngx_shm_zone_t;
+extern fn ngx_http_worker_events_publish_internal(
+    zone: [*c]core.ngx_shm_zone_t,
+    channel_str: ngx_str_t,
+    type_str: ngx_str_t,
+    payload_str: ngx_str_t,
+) callconv(.c) ngx_int_t;
 
 // ── Shared metadata model — must match cache-tags exactly ─────────────────────
 
@@ -95,6 +102,7 @@ const cache_purge_loc_conf = extern struct {
     match_mode: MatchMode,
     auth_mode: AuthMode,
     max_keys: ngx_uint_t,
+    worker_events_channel: ngx_str_t,
 };
 
 fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
@@ -104,6 +112,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.match_mode = .unset;
         p.*.auth_mode = .unset;
         p.*.max_keys = 0;
+        p.*.worker_events_channel = ngx_null_str;
         return p;
     }
     return null;
@@ -127,6 +136,7 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     if (c.*.auth_mode == .unset) {
         c.*.auth_mode = if (prev.*.auth_mode == .unset) .off else prev.*.auth_mode;
     }
+    if (c.*.worker_events_channel.len == 0) c.*.worker_events_channel = prev.*.worker_events_channel;
 
     if (c.*.api_enabled == 1) {
         if (c.*.zone_name.len == 0 or c.*.zone_name.data == null) {
@@ -245,6 +255,22 @@ fn append_usize(p: *[*]u8, end: [*]u8, value: usize) void {
     var tmp: [20]u8 = undefined;
     const n = write_usize_into(&tmp, value);
     append(p, end, tmp[0..n]);
+}
+
+fn publish_purge_event(channel: ngx_str_t, target: []const u8, purged: usize) void {
+    const zone = ngx_http_worker_events_default_zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
+    if (channel.len == 0 or channel.data == null) return;
+
+    const event_type = ngx_string("purged");
+    var payload_buf: [192]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"match\":\"exact\",\"target\":\"{s}\",\"purged\":{d}}}",
+        .{ target, purged },
+    ) catch return;
+    const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
+    _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
 }
 
 // ── Response helper ───────────────────────────────────────────────────────────
@@ -498,6 +524,16 @@ fn purge_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         .data = resp_mem,
         .len = @intCast(@intFromPtr(w) - @intFromPtr(resp_mem)),
     };
+
+    if (target_count > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
+        for (0..target_count) |i| {
+            const result = results.?[i];
+            if (result.found != 1 or result.purged == 0 or result.target_len == 0) continue;
+            const target: []const u8 = @ptrCast(result.target[0..result.target_len]);
+            publish_purge_event(lccf.*.worker_events_channel, target, result.purged);
+        }
+    }
+
     _ = send_json_response(r, http.NGX_HTTP_OK, resp_body);
     http.ngx_http_finalize_request(r, NGX_OK);
 }
@@ -624,6 +660,21 @@ fn ngx_conf_set_cache_purge_max_keys(
     return conf.NGX_CONF_OK;
 }
 
+fn ngx_conf_set_cache_purge_worker_events_channel(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(cache_purge_loc_conf, loc)) |lccf| {
+        var i: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
+            lccf.*.worker_events_channel = arg.*;
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
 // ── Postconfiguration ─────────────────────────────────────────────────────────
 
 fn zone_init_noop(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) callconv(.c) ngx_int_t {
@@ -703,6 +754,14 @@ export const ngx_http_cache_purge_commands = [_]ngx_command_t{
         .name = ngx_string("cache_purge_max_keys"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
         .set = ngx_conf_set_cache_purge_max_keys,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("cache_purge_worker_events_channel"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = ngx_conf_set_cache_purge_worker_events_channel,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,
