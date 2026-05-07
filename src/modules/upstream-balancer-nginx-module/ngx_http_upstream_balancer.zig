@@ -896,6 +896,29 @@ export fn upstream_balancer_free_peer(
     releaseDynamicPeerGraph(ctx);
 }
 
+/// Install the init_peer wrapper on an upstream that has no sticky directive.
+/// Called from dynamic-upstreams postconfiguration, after all init_upstream
+/// callbacks have already run and set uscf->peer.init to round-robin's init_peer.
+export fn upstream_balancer_ensure_hook(
+    us: [*c]ngx_http_upstream_srv_conf_t,
+) callconv(.c) ngx_int_t {
+    const bcf = core.castPtr(
+        BalancerSrvConf,
+        conf.ngx_http_conf_upstream_srv_conf(us, &ngx_http_upstream_balancer_module),
+    ) orelse return core.NGX_ERROR;
+
+    // Already installed via a sticky directive — nothing to do
+    if (bcf.*.original_init_peer != null) return core.NGX_OK;
+
+    // init_upstream has already run; us->peer.init is now round-robin's init_peer
+    if (us.*.peer.init == null) return core.NGX_ERROR;
+
+    bcf.*.original_init_peer = @constCast(@ptrCast(us.*.peer.init));
+    bcf.*.upstream_name = us.*.host;
+    us.*.peer.init = upstream_balancer_init_peer;
+    return core.NGX_OK;
+}
+
 export fn upstream_balancer_register_peer_source(
     us: [*c]ngx_http_upstream_srv_conf_t,
     source_ctx: ?*anyopaque,

@@ -4,7 +4,7 @@ Planned runtime upstream reconfiguration module for updating peer tables without
 
 ### Status
 
-**Planning / scaffolded** - module wiring and placeholder API surface exist. Runtime peer-table mutation is not implemented yet.
+**Phase 1 + Phase 2 complete** — truthful introspection and atomic full-snapshot replacement are implemented and tested. Phase 3 (source polling, worker-events fanout, health-aware filtering) is not started.
 
 ### Purpose and Boundaries
 
@@ -377,3 +377,86 @@ One useful way to think about the boundary is:
 - `dynamic-upstreams`: “What is the current set of peers at all?”
 
 That separation is sound. The challenge is making the handoff between those two modules precise enough that dynamic updates do not destroy deterministic routing.
+
+---
+
+## Implementation Status (as of 2026-05-07)
+
+### Phase 1 — Complete
+
+- `GET` returns truthful JSON for the configured upstream (static peers or active snapshot).
+- `HEAD` mirrors headers without body, content-length matches `GET`.
+- `PUT`, `POST`, `DELETE`, and other methods return `405`.
+- Neighboring routes are unaffected.
+- `dynamic_upstreams_target` is resolved at config load; missing name fails config.
+- `dynamic_upstreams_source` accepts only `static`; any other value fails config load.
+- 4 integration tests pass.
+
+### Phase 2 — Complete
+
+Shared-memory snapshot replacement via `PUT`.
+
+- `dynamic_upstreams_managed` inside an `upstream {}` block registers a 4 MB slab zone and wires the upstream into the balancer peer-source vtable via `upstream_balancer_ensure_hook` + `upstream_balancer_register_peer_source`.
+- `PUT` with `{"peers":[{"address":"IP:port","weight":N},...]}` validates the full peer list, builds a new `Snapshot` + `ngx_http_upstream_rr_peers_t` peer graph entirely in slab memory, atomically swaps `store->active`, and marks the previous snapshot as draining.
+- Draining snapshots are freed only when their refcount reaches zero (opportunistically after `PUT` and lazily on the last `du_release_generation` call that decrements to zero).
+- `GET` pins the active snapshot (increments refcount under slab mutex) before iterating peers, then releases it after the JSON body is built — no use-after-free under concurrent `PUT`.
+- Validation rejects: empty peer list, peer count > 256, non-IP addresses (hostnames), weight outside 1–65535, missing `address` field, invalid JSON.
+- `flags.weighted` is set to `true` when any peer weight ≠ 1, enabling nginx round-robin's weighted selection path.
+- Zone init handles config reload (reuse of previous slab store) and multi-worker first-init race via `shpool->data`.
+- 9 integration tests pass.
+
+### Implemented directive surface
+
+| Directive | Context | Effect |
+|---|---|---|
+| `dynamic_upstreams_managed` | `upstream {}` | Registers shared-memory zone and balancer vtable hook for this upstream |
+| `dynamic_upstreams_api` | `location` | Installs the GET/PUT control handler |
+| `dynamic_upstreams_target <name>` | `location` | Binds the endpoint to a named upstream; resolved at config time |
+| `dynamic_upstreams_source static` | `location` | Accepted but no-op in Phase 2; any other value fails config load |
+| `dynamic_upstreams_refresh <ms>` | `location` | Stored but unused until Phase 3 |
+
+### Phase 3 — Not started
+
+Requires the Phase 2 snapshot lifecycle to be stable first. Scope:
+
+- **Worker-events fanout**: broadcast a snapshot-activated event after each successful `PUT` so all workers invalidate per-worker cached state promptly. Correctness does not depend on this; it only improves convergence speed.
+- **Source polling**: timer-driven reconciliation loop, initially for a `static` file source, then `consul`. Must preserve last-good snapshot on source failure and document bounded retry/backoff.
+- **Health-aware activation**: at `PUT` time, query healthcheck state and exclude peers that are currently failing. Must apply at activation boundaries only — healthcheck must not mutate the active snapshot out of band.
+- **Operational fields**: expose `last_success_at_msec`, `last_error_at_msec`, `last_error_code` from `UpstreamStore` in the `GET` response.
+- **`dynamic_upstreams_refresh` enforcement**: wire the stored interval into the Phase 3 polling timer.
+
+---
+
+## Known Limitations / Technical Debt
+
+These items are working but suboptimal or incomplete in the Phase 1+2 implementation.
+
+### 1. Long slab mutex hold during `PUT`
+
+All slab allocations for a new snapshot (Snapshot struct, peers struct, N × peer_t, N × sockaddr, N × name strings) happen while holding `shpool->mutex`. For large peer lists this blocks all workers' slab operations (including those on other upstreams sharing the same zone) for the duration of the entire build loop.
+
+**Better**: allocate outside the lock using a pool-backed staging area or per-call `ngx_slab_calloc`, then hold the mutex only for the pointer swap. Deferred to Phase 3 hardening.
+
+### 2. Slab mutex on every proxied request (`du_get_active_peers`)
+
+`du_get_active_peers` is called on every upstream connection to pin the active snapshot. It acquires and releases `shpool->mutex` to safely read `store->active` and increment the refcount atomically. At high request rates this becomes contention on a single shared lock.
+
+**Better**: a dedicated per-store spinlock or an atomic compare-and-swap loop for the refcount increment, leaving the slab mutex for allocations only. Deferred to Phase 3 hardening.
+
+### 3. `new_peers->name` is null in snapshots
+
+`ngx_http_upstream_rr_peers_t.name` (the upstream group name string) is never populated in dynamically built snapshots. Nginx internal code that dereferences `peers->name` (e.g., logging in some balancer paths) will see a zero-length string. This has not caused crashes in tested paths but is strictly incomplete.
+
+**Fix**: allocate the upstream name string in slab and assign it to `new_peers->name` during snapshot construction.
+
+### 4. Stack allocation of `urls[256]` + `specs[256]` in PUT body handler
+
+The address-validation loop in `du_put_body_handler` declares `var specs: [256]PeerSpec` and `var urls: [256]ngx_url_t` on the stack. Combined size is roughly 30 KB. This is within nginx worker stack limits under normal conditions but leaves little headroom if the call depth is deeper than expected.
+
+**Fix**: allocate both arrays from `r->pool` instead of the stack. Low priority while `MAX_PEERS_PER_PUT` stays at 256.
+
+### 5. Phase 2 integration tests do not cover multi-worker visibility
+
+The test suite runs a single-worker nginx instance. The property that "one worker activates a snapshot and another worker serves traffic from the new generation" is correct by construction (shared memory, slab mutex) but is not exercised by any current test.
+
+**Fix**: add a Phase 3 multi-worker test that activates a snapshot via one worker's API port and then verifies the other worker's proxy traffic routes to the new peers.
