@@ -964,7 +964,12 @@ export fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) c
         const zone = entry.zone;
         if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null) return 1;
         const store = core.castPtr(healthcheck_store, zone.*.data) orelse return 1;
-        return if (store.*.probe_healthy != 0) 1 else 0;
+        // Conservative slow-start contract for selection:
+        // a recovered peer stays out of sticky rotation until its slow-start
+        // ramp completes and probe_recovered_at_ms is cleared.
+        if (store.*.probe_healthy == 0) return 0;
+        if (store.*.probe_recovered_at_ms > 0) return 0;
+        return 1;
     }
     return 1; // no probe configured for this peer — eligible
 }

@@ -94,6 +94,7 @@ extern var ngx_http_pgrest_module: ngx_module_t;
 extern var ngx_http_redis_module: ngx_module_t;
 extern var ngx_http_consul_module: ngx_module_t;
 extern var ngx_http_upstream_balancer_module: ngx_module_t;
+extern var ngx_http_upstream_balancer_filter_module: ngx_module_t;
 extern var ngx_http_dynamic_upstreams_module: ngx_module_t;
 
 // Security & Auth Modules
@@ -236,6 +237,7 @@ export const ngx_modules = [_][*c]ngx_module_t{
 
     &ngx_http_echoz_filter_module,
     &ngx_http_wechatpay_filter_module,
+    &ngx_http_upstream_balancer_filter_module,
     &ngx_http_oidc_filter_module,
     &ngx_http_requestid_filter_module,
     &ngx_http_cache_tags_filter_module,
@@ -332,6 +334,7 @@ export const ngx_module_names = [_][*c]const u8{
 
     "ngx_http_echoz_filter_module",
     "ngx_http_wechatpay_filter_module",
+    "ngx_http_upstream_balancer_filter_module",
     "ngx_http_oidc_filter_module",
     "ngx_http_requestid_filter_module",
     "ngx_http_cache_tags_filter_module",

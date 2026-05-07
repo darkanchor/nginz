@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { spawnSync } from "bun";
 import { join } from "path";
-import { mkdirSync, rmSync } from "fs";
+import { mkdirSync, readFileSync, rmSync } from "fs";
 import {
   startNginz,
   stopNginz,
@@ -12,6 +12,41 @@ import {
 } from "../harness.js";
 
 const MODULE = "upstream-balancer";
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let crc = i;
+    for (let j = 0; j < 8; j++) {
+      crc = (crc & 1) !== 0 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    }
+    table[i] = crc >>> 0;
+  }
+  return table;
+})();
+
+function crc32IsoHdlc(input) {
+  const bytes = new TextEncoder().encode(input);
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff];
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function stickyKeyForPeer(peerIndex, peerCount = 2, prefix = "sticky-key") {
+  for (let i = 0; i < 4096; i++) {
+    const key = `${prefix}-${i}`;
+    if (crc32IsoHdlc(key) % peerCount === peerIndex) {
+      return key;
+    }
+  }
+  throw new Error(`failed to find sticky key for peer ${peerIndex}`);
+}
+
+function countOccurrences(haystack, needle) {
+  if (needle.length === 0) return 0;
+  return haystack.split(needle).length - 1;
+}
 
 describe("upstream-balancer", () => {
   let backend1;
@@ -114,6 +149,84 @@ describe("upstream-balancer", () => {
     const res = await fetch(`${TEST_URL}/fallback-off`);
     expect(res.status).toBe(502);
   });
+
+  test("weighted sticky distribution favors the higher-weight peer", async () => {
+    const counts = { backend1: 0, backend2: 0 };
+    for (let i = 0; i < 64; i++) {
+      const res = await fetch(`${TEST_URL}/weighted`, {
+        headers: { Cookie: `route=weighted-key-${i}` },
+      });
+      expect(res.status).toBe(200);
+      counts[(await res.json()).server] += 1;
+    }
+    expect(counts.backend1).toBeGreaterThan(counts.backend2 * 2);
+  });
+
+  test("module can issue a sticky cookie and reuse it on the next request", async () => {
+    const first = await fetch(`${TEST_URL}/issue-cookie`);
+    expect(first.status).toBe(200);
+    const firstBody = await first.json();
+    const setCookie = first.headers.get("set-cookie");
+    expect(setCookie).toContain("route=peer:");
+
+    const issuedCookie = setCookie.split(";")[0];
+    const second = await fetch(`${TEST_URL}/issue-cookie`, {
+      headers: { Cookie: issuedCookie },
+    });
+    expect(second.status).toBe(200);
+    expect((await second.json()).server).toBe(firstBody.server);
+  });
+
+  test("module rotates an invalid direct-peer cookie onto a live peer", async () => {
+    const res = await fetch(`${TEST_URL}/issue-cookie`, {
+      headers: { Cookie: "route=peer:127.0.0.1:19999" },
+    });
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie");
+    expect(setCookie).toContain("route=peer:");
+    expect(setCookie).not.toContain("127.0.0.1:19999");
+  });
+
+  test("module respects custom cookie attributes when issuing affinity cookies", async () => {
+    const res = await fetch(`${TEST_URL}/issue-cookie-custom`);
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie");
+    expect(setCookie).toContain("route=peer:");
+    expect(setCookie).toContain("Path=/issue-cookie-custom");
+    expect(setCookie).toContain("Max-Age=60");
+    expect(setCookie).toContain("SameSite=Strict");
+  });
+
+  test("status endpoint exposes balancer counters", async () => {
+    await fetch(`${TEST_URL}/issue-cookie`);
+    await fetch(`${TEST_URL}/issue-cookie`, {
+      headers: { Cookie: "route=peer:127.0.0.1:19999" },
+    });
+    await fetch(`${TEST_URL}/weighted`, {
+      headers: { Cookie: "route=status-key" },
+    });
+    await fetch(`${TEST_URL}/header`, {
+      headers: { "X-Sticky-Key": "status-header-key" },
+    });
+
+    const res = await fetch(`${TEST_URL}/balancer-status`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.module).toBe("upstream_balancer");
+    expect(body.status).toBe("ok");
+    expect(body.requests_total).toBeGreaterThan(0);
+    expect(body.sticky_cookie_requests_total).toBeGreaterThan(0);
+    expect(body.sticky_header_requests_total).toBeGreaterThan(0);
+    expect(body.hash_hits).toBeGreaterThan(0);
+    expect(body.cookies_issued_total).toBeGreaterThan(0);
+    expect(body.cookies_rotated_total).toBeGreaterThan(0);
+    expect(body.direct_peer_misses).toBeGreaterThan(0);
+    expect(typeof body.peer_rejections_tried_total).toBe("number");
+    expect(typeof body.peer_rejections_unhealthy_total).toBe("number");
+    expect(typeof body.peer_rejections_fail_window_total).toBe("number");
+    expect(typeof body.peer_rejections_max_conns_total).toBe("number");
+    expect(body.runtime_peer_source_requests_total).toBe(0);
+  });
 });
 
 describe("upstream-balancer config validation", () => {
@@ -211,6 +324,147 @@ describe("upstream-balancer multi-worker consistency", () => {
   });
 });
 
+describe("upstream-balancer round-robin state preservation", () => {
+  let backend1;
+  let backend2;
+
+  beforeAll(async () => {
+    backend1 = createHTTPMock(19102);
+    backend1.setLatency(350);
+    backend1.setDefault({ status: 200, body: { server: "backend1" } });
+
+    backend2 = createHTTPMock(19103);
+    backend2.setDefault({ status: 200, body: { server: "backend2" } });
+
+    await startNginz(`tests/${MODULE}/nginx-runtime-semantics.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    backend1.stop();
+    backend2.stop();
+    cleanupRuntime(MODULE);
+  });
+
+  test("sticky path still respects max_conns and falls through to another peer", async () => {
+    const key = stickyKeyForPeer(0, 2, "max-conns");
+
+    const firstRequest = fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${key}` },
+    });
+
+    await Bun.sleep(75);
+
+    const secondStartedAt = Date.now();
+    const secondRes = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${key}` },
+    });
+    const secondElapsedMs = Date.now() - secondStartedAt;
+    const secondBody = await secondRes.json();
+
+    expect(secondRes.status).toBe(200);
+    expect(secondBody.server).toBe("backend2");
+    expect(secondElapsedMs).toBeLessThan(250);
+
+    const firstRes = await firstRequest;
+    expect(firstRes.status).toBe(200);
+    expect((await firstRes.json()).server).toBe("backend1");
+  });
+});
+
+describe("upstream-balancer backup peer semantics", () => {
+  let backend1;
+  let backend2;
+
+  beforeAll(async () => {
+    backend1 = createHTTPMock(19112);
+    backend1.setDefault(async (req) => {
+      if ((req.headers.get("cookie") || "").includes("route=backup-contract")) {
+        await Bun.sleep(350);
+      }
+      return { status: 200, body: { server: "primary" } };
+    });
+
+    backend2 = createHTTPMock(19113);
+    backend2.setDefault({ status: 200, body: { server: "backup" } });
+
+    await startNginz(`tests/${MODULE}/nginx-backup.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    backend1.stop();
+    backend2.stop();
+    cleanupRuntime(MODULE);
+  });
+
+  test("sticky maps only over primaries; fallback next may route to backup when primaries are unavailable", async () => {
+    const firstRequest = fetch(`${TEST_URL}/`, {
+      headers: { Cookie: "route=backup-contract" },
+    });
+
+    await Bun.sleep(75);
+
+    const secondStartedAt = Date.now();
+    const secondRes = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: "route=backup-contract" },
+    });
+    const secondElapsedMs = Date.now() - secondStartedAt;
+    const secondBody = await secondRes.json();
+
+    expect(secondRes.status).toBe(200);
+    expect(secondBody.server).toBe("backup");
+    expect(secondElapsedMs).toBeLessThan(250);
+
+    const firstRes = await firstRequest;
+    expect(firstRes.status).toBe(200);
+    expect((await firstRes.json()).server).toBe("primary");
+  });
+});
+
+describe("upstream-balancer retry and failure accounting", () => {
+  let backend2;
+  let runtimeDir;
+
+  beforeAll(async () => {
+    backend2 = createHTTPMock(19123);
+    backend2.setDefault({ status: 200, body: { server: "backend2" } });
+
+    runtimeDir = await startNginz(`tests/${MODULE}/nginx-retry-failure.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    backend2.stop();
+    cleanupRuntime(MODULE);
+  });
+
+  test("failed sticky-selected peer is retried once, then suppressed by nginx fail counters on the next request", async () => {
+    const key = stickyKeyForPeer(0, 2, "retry-failure");
+    const errorLogPath = join(runtimeDir, "logs", "error.log");
+
+    const firstRes = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${key}` },
+    });
+    expect(firstRes.status).toBe(200);
+    expect((await firstRes.json()).server).toBe("backend2");
+
+    const afterFirst = readFileSync(errorLogPath, "utf8");
+    const firstConnectErrors = countOccurrences(afterFirst, "connect() failed");
+    expect(firstConnectErrors).toBe(1);
+
+    const secondRes = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${key}` },
+    });
+    expect(secondRes.status).toBe(200);
+    expect((await secondRes.json()).server).toBe("backend2");
+
+    const afterSecond = readFileSync(errorLogPath, "utf8");
+    const secondConnectErrors = countOccurrences(afterSecond, "connect() failed");
+    expect(secondConnectErrors).toBe(1);
+  });
+});
+
 // Phase 4: healthcheck integration.
 // When a peer probe marks a backend unhealthy, the balancer must exclude it
 // from sticky selection. Fail-open: peers with no probe always stay eligible.
@@ -275,9 +529,24 @@ describe("upstream-balancer healthcheck integration", () => {
     backend2.get("/probe", { status: 200, body: { status: "ok" } });
   });
 
-  test("backend recovers: traffic returns to both peers after probe succeeds", async () => {
-    // backend2 probe already restored above; wait for recovery (passes=1).
-    await Bun.sleep(400);
+  test("recovering backend stays out of rotation during slow-start", async () => {
+    // backend2 probe already restored above; probe succeeds quickly, but
+    // slow-start should keep it out of sticky selection for a short window.
+    await Bun.sleep(150);
+
+    const servers = new Set();
+    for (let i = 0; i < 8; i++) {
+      const res = await fetch(`${TEST_URL}/`, {
+        headers: { Cookie: `route=hc-recovering-${i}` },
+      });
+      expect(res.status).toBe(200);
+      servers.add((await res.json()).server);
+    }
+    expect(servers).toEqual(new Set(["backend1"]));
+  });
+
+  test("backend returns after slow-start completes", async () => {
+    await Bun.sleep(350);
 
     const servers = new Set();
     for (const key of ["hc-key-a", "hc-key-b", "hc-key-c", "hc-key-d"]) {
