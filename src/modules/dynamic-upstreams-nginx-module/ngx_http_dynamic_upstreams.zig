@@ -766,7 +766,7 @@ fn handle_get(r: [*c]ngx_http_request_t) ngx_int_t {
     }
 
     // Estimate JSON size
-    const est: usize = 200 + target_name.len + peer_count * 80;
+    const est: usize = 256 + target_name.len + source_name.len + peer_count * 80;
     var jb = JsonBuilder.init(r.*.pool, est) orelse return core.NGX_ERROR;
     const start = jb.w;
 
@@ -882,6 +882,7 @@ fn build_and_activate_snapshot(
     lccf: [*c]dynamic_upstreams_loc_conf,
     json: [*c]cjson.cJSON,
     allow_noop_if_same: bool,
+    allow_empty_peers: bool,
 ) ActivationResult {
     const peers_node = cjson.cJSON_GetObjectItem(json, "peers");
     if (peers_node == core.nullptr(cjson.cJSON) or cjson.cJSON_IsArray(peers_node) != 1) {
@@ -890,7 +891,7 @@ fn build_and_activate_snapshot(
     }
 
     const n_peers: usize = @intCast(@max(0, cjson.cJSON_GetArraySize(peers_node)));
-    if (n_peers == 0) {
+    if (n_peers == 0 and !allow_empty_peers) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
         return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"at least one peer required\"}") } };
     }
@@ -899,22 +900,34 @@ fn build_and_activate_snapshot(
         return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"too many peers\"}") } };
     }
 
-    const specs = core.ngz_pcalloc_n(@intCast(n_peers), PeerSpec, pool) orelse {
-        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
-        return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
-    };
-    const urls = core.ngz_pcalloc_n(@intCast(n_peers), ngx_url_t, pool) orelse {
-        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
-        return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate url scratch space\"}") } };
-    };
-    const eligible_specs = core.ngz_pcalloc_n(@intCast(n_peers), PeerSpec, pool) orelse {
-        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
-        return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
-    };
-    const eligible_urls = core.ngz_pcalloc_n(@intCast(n_peers), ngx_url_t, pool) orelse {
-        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
-        return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate url scratch space\"}") } };
-    };
+    const specs: [*c]PeerSpec = if (n_peers == 0)
+        core.nullptr(PeerSpec)
+    else
+        core.ngz_pcalloc_n(@intCast(n_peers), PeerSpec, pool) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+        };
+    const urls: [*c]ngx_url_t = if (n_peers == 0)
+        core.nullptr(ngx_url_t)
+    else
+        core.ngz_pcalloc_n(@intCast(n_peers), ngx_url_t, pool) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate url scratch space\"}") } };
+        };
+    const eligible_specs: [*c]PeerSpec = if (n_peers == 0)
+        core.nullptr(PeerSpec)
+    else
+        core.ngz_pcalloc_n(@intCast(n_peers), PeerSpec, pool) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+        };
+    const eligible_urls: [*c]ngx_url_t = if (n_peers == 0)
+        core.nullptr(ngx_url_t)
+    else
+        core.ngz_pcalloc_n(@intCast(n_peers), ngx_url_t, pool) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate url scratch space\"}") } };
+        };
 
     var addr_count: usize = 0;
     var it = CJSON.Iterator.init(peers_node);
@@ -972,7 +985,7 @@ fn build_and_activate_snapshot(
         addr_count += 1;
     }
 
-    if (addr_count == 0) {
+    if (addr_count == 0 and !allow_empty_peers) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
         return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"no valid peers after parsing\"}") } };
     }
@@ -986,7 +999,7 @@ fn build_and_activate_snapshot(
         eligible_count += 1;
     }
 
-    if (eligible_count == 0) {
+    if (eligible_count == 0 and addr_count > 0) {
         record_store_error(ducf, DU_ERROR_ALL_PEERS_UNHEALTHY);
         return .{ .err = .{ .status = http.NGX_HTTP_SERVICE_UNAVAILABLE, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"no eligible peers after health filtering\"}") } };
     }
@@ -1237,7 +1250,7 @@ export fn du_put_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     };
     defer cj.free(json);
 
-    const result = build_and_activate_snapshot(r.*.pool, ducf, uscf, lccf, json, false);
+    const result = build_and_activate_snapshot(r.*.pool, ducf, uscf, lccf, json, false, false);
     switch (result) {
         .err => |e| {
             _ = send_json_response(r, e.status, e.body);
@@ -1574,7 +1587,7 @@ fn run_consul_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) voi
         return;
     };
 
-    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true);
+    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, true);
 }
 
 fn run_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
@@ -1608,7 +1621,7 @@ fn run_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
     };
     defer cj.free(json);
 
-    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true);
+    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, false);
 }
 
 fn dynamic_upstreams_refresh_timer_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {

@@ -168,15 +168,14 @@ make install
 | **oidc** | OpenID Connect SSO with PKCE and RS256 ID token verification |
 | **pgrest** | PostgreSQL REST API with JWT auth, content negotiation (JSON/CSV/XML) |
 | **healthcheck** | Health/readiness endpoints with shared-memory state, active probes, slow-start tracking, worker-events transition fanout, and balancer-facing peer eligibility |
+| **dynamic-upstreams** | Live upstream snapshot replacement with GET/PUT control API, static-file polling, worker-events activation fanout, health-aware activation, and Consul-backed reconciliation with last-good preservation on refresh failure |
 | **upstream-balancer** | Sticky upstream peer selection with cookie/header affinity, fallback control, cookie issuance, health-aware eligibility, and runtime peer-source handoff for dynamic snapshots |
 | **wechatpay** | WeChat Pay signature signing and verification |
 | **worker-events** | Cross-worker shared-memory event ring with publish/inspect API, overflow accounting, publish auth, and real native consumers in healthcheck, cache-purge, and dynamic-upstreams |
 
-### Implemented with Limitations (1)
+### Implemented with Limitations (0)
 
-| Module | Description |
-|--------|-------------|
-| **dynamic-upstreams** | Live upstream snapshot replacement with GET/PUT control API, static-file polling, worker-events activation fanout, and health-aware activation; `consul` source support is still pending |
+None currently.
 
 ### Planning (0)
 

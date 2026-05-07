@@ -251,6 +251,14 @@ These variables expose per-request Consul state to `nginz-njs` scripted modules 
 - `$consul_service_healthy_count` is the count of healthy service instances returned by a `consul_services` query.
 - `$consul_lookup_error` is `consul_error` when Consul returned a non-200/non-404 status or a parse error occurred, not found otherwise.
 
+### Dynamic Upstreams Integration
+
+`dynamic-upstreams` consumes the same Consul health endpoint shape when configured with `dynamic_upstreams_source consul`.
+
+- It queries `GET /v1/health/service/<name>?passing=true` and forwards optional `tag`, `dc`, and `X-Consul-Token` metadata.
+- An empty healthy result is valid service-discovery state and reconciles to an empty upstream snapshot rather than preserving stale peers.
+- The current `dynamic-upstreams` adapter still requires discovered peer addresses to be IP literals plus port; it does not resolve hostnames returned by Consul.
+
 ### Limitations
 
 - Read-only access to Consul (no service registration or KV writes)

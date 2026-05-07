@@ -450,8 +450,8 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
   beforeAll(async () => {
     consulMock = createConsulMock(MOCK_PORTS.CONSUL);
     consulMock.addService("api-backend", [
-      { id: "api-1", address: "127.0.0.1", port: 19002 },
-      { id: "api-2", address: "127.0.0.1", port: 19003 },
+      { id: "api-1", address: "127.0.0.1", port: 19002, tags: ["primary"] },
+      { id: "api-2", address: "127.0.0.1", port: 19003, tags: ["primary"] },
     ]);
 
     await startNginz(`tests/${MODULE}/nginx-consul.conf`, MODULE);
@@ -474,11 +474,26 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
     expect(body.peers).toContainEqual({ address: "127.0.0.1:19003", weight: 1 });
   });
 
+  test("consul source forwards tag, dc, and token metadata to the health query", async () => {
+    consulMock.clearLog();
+    await Bun.sleep(250);
+
+    const requests = consulMock.getRequests();
+    expect(requests.length).toBeGreaterThan(0);
+
+    const lastRequest = requests.at(-1);
+    expect(lastRequest.path).toBe("/v1/health/service/api-backend");
+    expect(lastRequest.query.passing).toBe("true");
+    expect(lastRequest.query.tag).toBe("primary");
+    expect(lastRequest.query.dc).toBe("dc-west");
+    expect(lastRequest.headers["x-consul-token"]).toBe("test-token-123");
+  });
+
   test("consul source updates upstream when catalog changes", async () => {
     // Remove one service from consul
     consulMock.clearServices();
     consulMock.addService("api-backend", [
-      { id: "api-1", address: "127.0.0.1", port: 19002 },
+      { id: "api-1", address: "127.0.0.1", port: 19002, tags: ["primary"] },
     ]);
 
     const body = await waitForDynamicState((s) => s.peer_count === 1, 3000);
@@ -488,6 +503,7 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
   test("consul source records error and keeps last good state on consul failure", async () => {
     const snapshot = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
     const prev_gen = snapshot.generation;
+    const prev_peers = snapshot.peers;
 
     // Stop consul — next refresh will fail
     consulMock.stop();
@@ -497,6 +513,18 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
     // Generation must not regress — last good snapshot stays active
     expect(body.generation).toBe(prev_gen);
     expect(body.last_error_code).toBeGreaterThan(0);
-    expect(body.peer_count).toBeGreaterThan(0);
+    expect(body.peers).toEqual(prev_peers);
+  });
+
+  test("consul source reconciles an empty healthy result to an empty upstream snapshot", async () => {
+    consulMock = createConsulMock(MOCK_PORTS.CONSUL);
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const body = await waitForDynamicState(
+      (s) => s.peer_count === 0 && s.generation > before.generation,
+      3000,
+    );
+    expect(body.last_error_code).toBe(0);
+    expect(body.peers).toEqual([]);
   });
 });

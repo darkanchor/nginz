@@ -4,7 +4,7 @@ Runtime upstream reconfiguration module for updating peer tables without a full 
 
 ### Status
 
-**Phase 1 + Phase 2 + Phase 3 complete** — truthful introspection, atomic full-snapshot replacement, worker-events fanout, operational status fields, bounded static-file polling, health-aware activation, and consul service-discovery source are all implemented and tested.
+**Feature ready** — truthful introspection, atomic full-snapshot replacement, worker-events fanout, operational status fields, bounded static-file polling, health-aware activation, and consul service-discovery reconciliation are implemented and test-backed.
 
 ### Purpose and Boundaries
 
@@ -31,8 +31,10 @@ This module should **not** own:
 - `GET` exposes the active generation, current peers, source mode, and operational fields such as `last_success_at_msec`, `last_error_at_msec`, and `last_error_code`.
 - `PUT` accepts whole-snapshot replacement with pool/slab-backed validation, duplicate-peer rejection, and last-good preservation on failure.
 - `dynamic_upstreams_source static` plus `dynamic_upstreams_source_file` and `dynamic_upstreams_refresh` enables worker-0 polling of a JSON source file with no-op refresh on unchanged content.
+- `dynamic_upstreams_source consul` reconciles healthy instances from Consul’s `/v1/health/service/<name>?passing=true` endpoint, forwards optional `tag` / `dc` / token metadata, and treats an empty healthy result as a valid empty upstream snapshot.
 - Successful activation can publish a `snapshot_activated` event through `dynamic_upstreams_worker_events_channel`.
 - Health-aware activation filters candidate peers through `ngz_healthcheck_is_peer_eligible()` before making a generation live.
+- Source-driven reconciliation still requires discovered peer addresses to be IP literals plus port; hostname resolution is not performed in this module.
 
 ### Current Test Coverage
 
@@ -46,6 +48,9 @@ This module should **not** own:
 - worker-events fanout on activation
 - static-file polling with last-good preservation on source failure
 - health-aware activation and re-inclusion after recovery
+- consul source query metadata forwarding (`tag`, `dc`, `X-Consul-Token`)
+- consul source last-good preservation on transport failure
+- consul source reconciliation to an empty peer set when no healthy instances remain
 
 ### Directive Surface
 
@@ -238,6 +243,10 @@ http {
             dynamic_upstreams_api;
             dynamic_upstreams_target api_backend;
             dynamic_upstreams_source consul;
+            dynamic_upstreams_consul_address 127.0.0.1:8500;
+            dynamic_upstreams_consul_service api-backend;
+            dynamic_upstreams_consul_tag primary;
+            dynamic_upstreams_consul_dc dc-west;
             dynamic_upstreams_refresh 5000;
         }
     }
