@@ -4,7 +4,7 @@ Planned selective cache-purge API for operational cache invalidation beyond raw 
 
 ### Status
 
-**Phase 1 and exact-match Phase 2 landed; advanced policy still pending** - the module now exposes a real `POST` JSON purge API and exact tag invalidation against the shared `cache-tags` metadata store. Prefix/glob matching and stronger authorization modes remain unimplemented and are rejected at config load.
+**Exact invalidation is usable end-to-end, with optional worker-events fanout landed** - the module exposes a real `POST` JSON purge API, exact tag invalidation against the shared `cache-tags` metadata store, multi-worker metadata mutation, and per-target worker-events notifications when configured. Prefix/glob matching and stronger authorization modes remain unimplemented and are rejected at config load.
 
 ### Purpose and Boundaries
 
@@ -28,6 +28,7 @@ This module should **not** own:
 - `cache_purge_api` installs a `POST`-only JSON purge endpoint.
 - Request body shape is `{"targets":["tag-a","tag-b"]}`.
 - Exact tag invalidation removes matching entries from the shared `cache-tags` metadata store and returns per-target accounting.
+- `cache_purge_worker_events_channel <channel>` optionally publishes one `purged` event per mutated target through the worker-events default zone.
 - `cache_purge_match prefix|glob` and `cache_purge_authorize allowlist|signed-token` are parsed but rejected at config load because the implementation is not there yet.
 - `cache_purge_zone` is currently limited to the single cache-tags metadata store and only accepts `default` or `cache_tags_zone`.
 
@@ -40,6 +41,7 @@ This module should **not** own:
 - config-load rejection for missing/unsupported zone config and deferred modes
 - exact invalidation success, zero-hit behavior, and idempotent repeated purge
 - shared metadata behavior under `worker_processes 2`
+- worker-events notifications only for mutated targets
 - unrelated routes continue working
 
 ### Directive Surface
@@ -51,6 +53,7 @@ This module should **not** own:
 | `cache_purge_match` | `<exact|prefix|glob>` | `location` | Choose the invalidation matching strategy |
 | `cache_purge_authorize` | `<off|allowlist|signed-token>` | `location` | Define the planned authorization mode |
 | `cache_purge_max_keys` | `<count>` | `location` | Bound batch invalidation request size |
+| `cache_purge_worker_events_channel` | `<channel>` | `location` | Optionally publish per-target invalidation events to the worker-events default zone |
 
 ### Integration Points
 
@@ -66,7 +69,7 @@ This module should **not** own:
 
 - `cache-tags` remains the response/filter-side tagging primitive.
 - This module is the operator-facing purge/control surface.
-- `worker-events` may later become a fanout mechanism, but it is not required for the first useful implementation.
+- `worker-events` is optional fanout for mutation notifications, but it is not required for correctness of exact invalidation.
 
 ### Data Model and Config
 
@@ -122,7 +125,7 @@ Before Phase 1 closes, the README must name:
 | The scaffold purge endpoint is explicitly unimplemented | `tests/cache-purge/cache-purge.test.js` | ~~Keep placeholder behavior explicit until Phase 1 contract replacement lands~~ **DONE: replaced with real POST contract** |
 | Phase 1 defines a stable API contract before invalidation logic | Phase 1 TDD checklist | Bun tests for allowed/rejected methods, config validation, and max-keys request validation |
 | Phase 2 exact invalidation is useful before broader matching modes | Phase 2 TDD checklist | Bun tests for exact invalidation, zero-hit behavior, optional prefix mode, and multi-worker metadata visibility |
-| Phase 3 fanout and stronger auth stay additive | Phase 3 TDD checklist | Integration coverage for signed-token or allowlist auth and worker-events fanout only if implemented |
+| Phase 3 fanout and stronger auth stay additive | Phase 3 TDD checklist | Worker-events fanout is implemented and integration-tested; stronger auth remains pending |
 
 ### Phase Plan
 
@@ -207,13 +210,13 @@ Add optional advanced matching, authorization depth, and fanout integration.
 
 - [ ] Add a Bun test for signed-token or allowlist authorization once supported
 - [ ] Add a Bun test for glob matching only if the mode is implemented
-- [ ] Add an integration test for event-bus fanout if worker-events coupling is added
+- [x] Add an integration test for event-bus fanout if worker-events coupling is added
 
 **Implementation checklist**
 
 - [ ] Add stronger authorization modes
 - [ ] Add advanced matching only if needed after exact/prefix prove insufficient
-- [ ] Add optional worker-events fanout for broader invalidation propagation
+- [x] Add optional worker-events fanout for broader invalidation propagation
 
 **Exit criteria**
 

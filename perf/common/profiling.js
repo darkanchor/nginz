@@ -163,8 +163,10 @@ export async function startProfiling({ mode, pids, profilingDir }) {
 
 export async function stopProfiling(session, profilingDir) {
   if (session.processRef && session._fifoPath) {
-    // Write to FIFO to unblock perf stat's command
-    try { writeFileSync(session._fifoPath, "x"); } catch {}
+    // Use a bounded shell write so a missing FIFO reader cannot hang teardown.
+    try {
+      execSync(`timeout 1 sh -c 'printf x > "${session._fifoPath}"'`);
+    } catch {}
     // Clean up FIFO
     try { execSync(`rm -f "${session._fifoPath}"`); } catch {}
     // Wait briefly for perf to flush output

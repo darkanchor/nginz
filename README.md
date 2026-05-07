@@ -142,9 +142,9 @@ make install
 
 ## Module Status
 
-22 modules total. All modules have integration tests and individual README documentation.
+26 modules total, including 2 reference/demo modules. All non-reference modules have integration tests and individual README documentation.
 
-### Feature Ready (20)
+### Feature Ready (22)
 
 | Module | Description |
 |--------|-------------|
@@ -166,21 +166,21 @@ make install
 | **nftset** | nftables-backed IP allow/block checks via raw Netlink lookup |
 | **oidc** | OpenID Connect SSO with PKCE and RS256 ID token verification |
 | **pgrest** | PostgreSQL REST API with JWT auth, content negotiation (JSON/CSV/XML) |
-| **healthcheck** | Health/readiness endpoints with shared-memory state and active HTTP probing |
+| **healthcheck** | Health/readiness endpoints with shared-memory state, active probes, slow-start tracking, worker-events transition fanout, and balancer-facing peer eligibility |
+| **upstream-balancer** | Sticky upstream peer selection with cookie/header affinity, fallback control, cookie issuance, health-aware eligibility, and runtime peer-source handoff for dynamic snapshots |
 | **wechatpay** | WeChat Pay signature signing and verification |
+| **worker-events** | Cross-worker shared-memory event ring with publish/inspect API, overflow accounting, publish auth, and real native consumers in healthcheck, cache-purge, and dynamic-upstreams |
 
-### Implemented with Limitations (0)
-
-None currently.
-
-### Planning (4)
+### Implemented with Limitations (2)
 
 | Module | Description |
 |--------|-------------|
-| **upstream-balancer** | Scaffolded native upstream peer-selection and sticky-session foundation |
-| **dynamic-upstreams** | Scaffolded runtime upstream reconfiguration API built on future peer-table foundations |
-| **worker-events** | Scaffolded cross-worker event-bus primitive for native and njs coordination |
-| **cache-purge** | Scaffolded selective cache-purge API intended to complement `cache-tags` |
+| **dynamic-upstreams** | Live upstream snapshot replacement with GET/PUT control API, static-file polling, worker-events activation fanout, and health-aware activation; `consul` source support is still pending |
+| **cache-purge** | Operator-facing exact tag invalidation API backed by `cache-tags`, with multi-worker mutation and optional worker-events fanout; prefix/glob matching and stronger authorization modes are still pending |
+
+### Planning (0)
+
+None currently.
 
 ### Reference (2)
 

@@ -1,40 +1,72 @@
-# dynamic-upstreams — Performance
+# Dynamic Upstreams Combo Benchmark
 
-Performance scaffolding for the dynamic-upstreams module.
+This is the combined Milestone 2 performance harness.
 
-The module is currently a scaffold (planned runtime upstream reconfiguration API).
-The main endpoint returns a 501 placeholder. These benchmarks establish a baseline
-for the current minimal path so that future native peer-table work can measure
-regression.
+It replaces the removed per-module perf scaffolding for:
 
-## Quick start
+- `dynamic-upstreams`
+- `upstream-balancer`
+- `healthcheck`
+- `worker-events`
 
-```bash
-# Full matrix (all scenarios, concurrencies 1,8,32)
-bun perf/dynamic-upstreams/benchmark/run.js
+and keeps `cache-tags` plus `cache-purge` in the same runtime so the common operator control path can be measured beside the main proxy path.
 
-# Single scenario
-bun perf/dynamic-upstreams/benchmark/run.js --scenario=placeholder-501
+## Why this suite exists
 
-# Narrow load
-bun perf/dynamic-upstreams/benchmark/run.js --scenario=placeholder-501 --concurrency=1,8 --requests=500 --warmup=50
-```
+Those modules do not make much sense as isolated microbenchmarks. The common real deployment shape is:
+
+- request traffic goes through `upstream-balancer`
+- upstream membership is owned by `dynamic-upstreams`
+- peer eligibility is shaped by `healthcheck`
+- convergence signals flow through `worker-events`
+- cache metadata can be invalidated through `cache-purge`
+
+So this suite measures the stack as one runtime, named after `dynamic-upstreams` because that is the control-plane anchor.
 
 ## Scenarios
 
-| Name | Description | Expected | Notes |
-|------|------------|----------|-------|
-| `placeholder-501` | GET on scaffold endpoint → 501 + JSON body | status=501, body={"status":"not_implemented","module":"dynamic_upstreams"} | Full module directive path, minimal response |
-| `placeholder-head` | HEAD on scaffold endpoint → 501, empty body | status=501, body="" | Same path, HEAD method — headers-only path |
-| `healthy-route` | GET on `/` → 200 "ok" | body="ok" | Neighboring echozn route — baseline module-off path |
+- `sticky-read`
+  - steady proxy traffic through `upstream-balancer` with `cache_tags` enabled on the proxied location
+- `sticky-read-with-churn`
+  - the same traffic path while `PUT /dynamic-upstreams` keeps activating new snapshots in the background
+- `capture-and-purge`
+  - proxy one tagged response, then purge that exact tag through `cache-purge`
+- `capture-purge-with-churn`
+  - worst-case milestone-2 combo path: capture and exact purge on every measured iteration while `dynamic-upstreams` keeps activating snapshots in the background
 
-## No external dependencies
+## What the runtime includes
 
-Zero containers, zero services. The module responds with inline JSON or delegates
-to echozn. Every millisecond is nginz processing overhead.
+- `worker_processes 2`
+- one managed upstream with:
+  - `upstream_balancer_sticky_cookie`
+  - `dynamic_upstreams_managed`
+  - active upstream probes from `healthcheck`
+- one `dynamic_upstreams_api` endpoint
+- one `worker_events_api` endpoint
+- one proxied app location with `cache_tags`
+- one `cache_purge_api` endpoint
 
-## Caveats
+The runner starts two local mock backends and writes a generated nginx config into the per-run runtime directory.
 
-- The 501 path is the current production path for this scaffold module.
-  When the module gets a real implementation, the overhead profile will change
-  materially and a new baseline must be collected.
+## Usage
+
+```bash
+bun perf/dynamic-upstreams/benchmark/run.js
+```
+
+Examples:
+
+```bash
+bun perf/dynamic-upstreams/benchmark/run.js --scenario=sticky-read --requests=2000 --concurrency=8,32,64
+bun perf/dynamic-upstreams/benchmark/run.js --scenario=sticky-read-with-churn --requests=1000 --concurrency=16 --artifact-tag=churn
+bun perf/dynamic-upstreams/benchmark/run.js --scenario=capture-and-purge --requests=500 --concurrency=8
+```
+
+Default perf build mode is `ReleaseSmall`.
+
+## Notes
+
+- The generated runtime uses `PUT`-driven snapshot activation, not the static-file refresh timer.
+- The churn scenario is intentionally bounded and uses the same backend addresses with changed weights so the benchmark stresses activation and fanout without inventing unrelated topology churn.
+- `cache-purge` is measured as a control-plane cycle, not as a request-path feature bolted onto every proxied read.
+- `capture-purge-with-churn` is the intended worst-case study slice for milestone 2 because it combines shared metadata mutation, worker-events publication, and background snapshot activation in one runtime.

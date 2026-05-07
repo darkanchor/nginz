@@ -1,12 +1,16 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { existsSync, rmSync, writeFileSync } from "fs";
 import {
   startNginz,
   stopNginz,
   cleanupRuntime,
   TEST_URL,
+  createHTTPMock,
+  MOCK_PORTS,
 } from "../harness.js";
 
 const MODULE = "dynamic-upstreams";
+const REFRESH_SOURCE_FILE = "/tmp/nginz-dynamic-upstreams-source.json";
 
 async function getWorkerEvents(channel = "upstreams", since = null) {
   const params = new URLSearchParams({ channel });
@@ -28,6 +32,20 @@ async function waitForWorkerEvents(predicate, channel = "upstreams", timeout = 4
     await Bun.sleep(75);
   }
   throw new Error(`Timed out waiting for worker-events on channel ${channel}`);
+}
+
+async function waitForDynamicState(predicate, timeout = 4000) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    if (predicate(body)) {
+      return body;
+    }
+    await Bun.sleep(75);
+  }
+  throw new Error("Timed out waiting for dynamic-upstreams state");
 }
 
 describe("dynamic-upstreams Phase 1 — read-only introspection", () => {
@@ -278,5 +296,149 @@ describe("dynamic-upstreams Phase 3 — operational fields and worker-events fan
     expect(after.peer_count).toBe(before.peer_count);
     expect(after.last_error_code).toBe(4001);
     expect(after.last_error_at_msec).toBeGreaterThanOrEqual(after.last_success_at_msec);
+  });
+});
+
+describe("dynamic-upstreams Phase 3 — static source polling", () => {
+  beforeAll(async () => {
+    writeFileSync(
+      REFRESH_SOURCE_FILE,
+      JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 1 }] }),
+    );
+    await startNginz(`tests/${MODULE}/nginx-refresh.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+    if (existsSync(REFRESH_SOURCE_FILE)) {
+      rmSync(REFRESH_SOURCE_FILE);
+    }
+  });
+
+  test("timer-driven refresh activates the file snapshot and does not churn unchanged generations", async () => {
+    const state = await waitForDynamicState((body) => body.generation > 0);
+    expect(state.peers).toHaveLength(1);
+    expect(state.peers[0].address).toBe("127.0.0.1:19002");
+    expect(state.last_success_at_msec).toBeGreaterThan(0);
+
+    await Bun.sleep(400);
+    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(after.generation).toBe(state.generation);
+    expect(after.peers[0].address).toBe("127.0.0.1:19002");
+  });
+
+  test("changing the source file activates a new generation and emits a worker-events notification", async () => {
+    const beforeState = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const beforeEvents = await getWorkerEvents();
+
+    writeFileSync(
+      REFRESH_SOURCE_FILE,
+      JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19003", weight: 2 },
+          { address: "127.0.0.1:19002", weight: 1 },
+        ],
+      }),
+    );
+
+    const state = await waitForDynamicState((body) => body.generation > beforeState.generation);
+    expect(state.peers).toHaveLength(2);
+    expect(state.peers[0].address).toBe("127.0.0.1:19003");
+
+    const events = await waitForWorkerEvents(
+      (snapshot) => snapshot.events.length >= 1,
+      "upstreams",
+      4000,
+      beforeEvents.newest_generation,
+    );
+    const payload = JSON.parse(events.events[0].payload);
+    expect(payload).toEqual({
+      target: "api_backend",
+      source: "static",
+      generation: state.generation,
+      peer_count: 2,
+    });
+  });
+
+  test("invalid source JSON preserves the last good snapshot and records the refresh error", async () => {
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    writeFileSync(REFRESH_SOURCE_FILE, "{bad-json");
+
+    const after = await waitForDynamicState(
+      (body) =>
+        body.last_error_code === 4001 &&
+        body.generation === before.generation,
+      4000,
+    );
+    expect(after.peer_count).toBe(before.peer_count);
+    expect(after.peers).toEqual(before.peers);
+  });
+});
+
+describe("dynamic-upstreams Phase 3 — health-aware activation", () => {
+  let backend1;
+  let backend2;
+
+  beforeAll(async () => {
+    backend1 = createHTTPMock(MOCK_PORTS.HTTP_UPSTREAM_1);
+    backend1.get("/probe", { status: 200, body: { status: "ok" } });
+    backend1.setDefault({ status: 200, body: { server: "backend1" } });
+
+    backend2 = createHTTPMock(MOCK_PORTS.HTTP_UPSTREAM_2);
+    backend2.get("/probe", { status: 500, body: { status: "fail" } });
+    backend2.setDefault({ status: 200, body: { server: "backend2" } });
+
+    await startNginz(`tests/${MODULE}/nginx-health-aware.conf`, MODULE);
+    await Bun.sleep(400);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    backend1.stop();
+    backend2.stop();
+    cleanupRuntime(MODULE);
+  });
+
+  test("PUT activates only the currently healthy subset", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(body.peer_count).toBe(1);
+    expect(body.peers).toEqual([{ address: "127.0.0.1:19002", weight: 1 }]);
+    expect(body.last_error_code).toBe(0);
+  });
+
+  test("recovered peer is re-included on the next full activation", async () => {
+    backend2.get("/probe", { status: 200, body: { status: "ok" } });
+    await Bun.sleep(500);
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = await waitForDynamicState((state) => state.peer_count === 2, 2000);
+    expect(body.peers).toEqual([
+      { address: "127.0.0.1:19002", weight: 1 },
+      { address: "127.0.0.1:19003", weight: 1 },
+    ]);
   });
 });

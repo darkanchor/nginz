@@ -89,9 +89,9 @@ Mutual exclusion: `sticky_cookie` and `sticky_header` cannot both appear in the 
 
 ### Milestone 2 Reminder
 
-- `healthcheck` probing/reporting is already implemented separately, but milestone 2 is not complete until this module can consume documented peer-health input and apply it during peer selection.
-- The missing healthcheck integration here is selection-time behavior only: skip unhealthy peers, define fallback semantics, and document what happens while a peer is in slow-start recovery.
-- Do not duplicate probing logic in this module; consume `healthcheck` state through a narrow contract instead.
+- `upstream-balancer` now consumes `healthcheck` peer state through `ngz_healthcheck_is_peer_eligible()` and excludes unhealthy or slow-starting peers during selection.
+- Its remaining milestone-2 role is to preserve a stable peer identity and request-pinning contract for `dynamic-upstreams`.
+- Do not duplicate probing or control-plane logic here; this module should stay focused on request-time peer selection.
 
 ### Data Model and Config
 
@@ -221,7 +221,7 @@ Implement one deterministic affinity policy at a time: cookie first, then header
 - [x] Add a Bun test for affinity miss with `upstream_balancer_fallback next`
 - [x] Add a Bun test for affinity miss with `upstream_balancer_fallback off`
 - [x] Empty/absent cookie or header key is treated as a miss and follows the configured fallback policy (covered by fallback tests; empty key: `vv.flags.len == 0` → key_absent path)
-- [ ] Add a multi-worker Bun test proving the same affinity key resolves to the same peer across workers for one generation — deferred to Phase 3
+- [x] Add a multi-worker Bun test proving the same affinity key resolves to the same peer across workers for one generation
 
 **Implementation checklist**
 

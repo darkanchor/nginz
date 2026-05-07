@@ -1,10 +1,10 @@
 ## Dynamic Upstreams Module
 
-Planned runtime upstream reconfiguration module for updating peer tables without a full nginx reload.
+Runtime upstream reconfiguration module for updating peer tables without a full nginx reload.
 
 ### Status
 
-**Phase 1 + Phase 2 complete; Phase 3 started** — truthful introspection and atomic full-snapshot replacement are implemented and tested. Worker-events fanout and operational status fields are now live; source polling and health-aware activation are still pending.
+**Phase 1 + Phase 2 complete; Phase 3 nearly complete** — truthful introspection, atomic full-snapshot replacement, worker-events fanout, operational status fields, bounded static-file polling, and health-aware activation are implemented and tested. `consul` source support is the remaining Phase 3 gap.
 
 ### Purpose and Boundaries
 
@@ -23,26 +23,38 @@ This module should **not** own:
 - core health probing logic
 - unrelated gateway APIs
 
-### Current Scaffold Behavior
+### Current Behavior
 
-- `dynamic_upstreams_api` installs a placeholder JSON endpoint that returns HTTP `501`.
-- The additional directives reserve configuration names and store stub values for future implementation.
-- No peer-table updates, discovery integration, or background reconciliation are active yet.
+- `dynamic_upstreams_api` installs a real `GET` / `HEAD` / `PUT` control endpoint.
+- `dynamic_upstreams_target <name>` binds the endpoint to a named upstream and is validated at config load.
+- `dynamic_upstreams_managed` registers a shared-memory snapshot store and the peer-source handoff used by `upstream-balancer`.
+- `GET` exposes the active generation, current peers, source mode, and operational fields such as `last_success_at_msec`, `last_error_at_msec`, and `last_error_code`.
+- `PUT` accepts whole-snapshot replacement with pool/slab-backed validation, duplicate-peer rejection, and last-good preservation on failure.
+- `dynamic_upstreams_source static` plus `dynamic_upstreams_source_file` and `dynamic_upstreams_refresh` enables worker-0 polling of a JSON source file with no-op refresh on unchanged content.
+- Successful activation can publish a `snapshot_activated` event through `dynamic_upstreams_worker_events_channel`.
+- Health-aware activation filters candidate peers through `ngz_healthcheck_is_peer_eligible()` before making a generation live.
 
-### Current Scaffold Test Coverage
+### Current Test Coverage
 
-`tests/dynamic-upstreams/dynamic-upstreams.test.js` currently proves:
+`tests/dynamic-upstreams/dynamic-upstreams.test.js` now proves:
 
-- the scaffold endpoint returns an explicit JSON `501 Not Implemented` response
-- `HEAD` requests behave deterministically on the placeholder endpoint
-- neighboring routes remain unaffected while the control surface is still scaffold-only
+- truthful `GET` / `HEAD` behavior for static peers and active snapshots
+- whole-snapshot replacement through `PUT`
+- validation failures preserve the previous generation
+- duplicate peers are rejected
+- content-type enforcement and deterministic `405` / `415` responses
+- worker-events fanout on activation
+- static-file polling with last-good preservation on source failure
+- health-aware activation and re-inclusion after recovery
 
 ### Directive Surface
 
-| Directive | Planned Syntax | Planned Context | Purpose |
+| Directive | Syntax | Context | Purpose |
 |---|---|---|---|
+| `dynamic_upstreams_managed` | `;` | `upstream` | Register a managed shared-memory snapshot store and balancer handoff for this upstream |
 | `dynamic_upstreams_api` | `;` | `location` | Expose the control endpoint for read/write upstream operations |
-| `dynamic_upstreams_source` | `<consul|static>` | `location` | Select the reconciliation source for the endpoint |
+| `dynamic_upstreams_source` | `<consul\|static>` | `location` | Select the reconciliation source for the endpoint |
+| `dynamic_upstreams_source_file` | `<path>` | `location` | Provide the JSON snapshot file used by `dynamic_upstreams_source static` |
 | `dynamic_upstreams_target` | `<upstream_name>` | `location` | Bind the endpoint to an upstream group |
 | `dynamic_upstreams_refresh` | `<milliseconds>` | `location` | Configure background reconciliation cadence |
 | `dynamic_upstreams_worker_events_channel` | `<channel>` | `location` | Publish snapshot activation notifications to the worker-events default zone |
@@ -115,12 +127,17 @@ The first writable snapshot request should be one explicit JSON schema, for exam
 }
 ```
 
-Before Phase 2 is called complete, the README must name:
+Current write contract:
 
-- allowed HTTP write method
-- accepted content type
-- peer validation rules
-- success and validation-error response shapes
+- allowed write method: `PUT`
+- accepted content type: `application/json`
+- peer validation rules:
+  - non-empty `peers` array
+  - each `address` must be an IP literal plus port
+  - duplicate peer addresses are rejected
+  - malformed JSON or missing required fields fail without changing the active generation
+- success responses return the activated generation and peer count
+- validation failures preserve the previously active generation
 
 ### Request / Worker Lifecycle
 
@@ -131,124 +148,38 @@ Before Phase 2 is called complete, the README must name:
 
 ### Traceability and Audit Hooks
 
-| Requirement / claim | Evidence today | Required future evidence |
-|---|---|---|
-| The scaffold endpoint is explicitly unimplemented rather than silently inert | `tests/dynamic-upstreams/dynamic-upstreams.test.js` | Keep placeholder behavior explicit until Phase 1 read-only introspection replaces it |
-| Phase 1 is read-only and truthful about the bound upstream | Phase 1 TDD checklist | Bun tests for `GET`, `HEAD`, invalid target binding, and unaffected neighboring routes |
-| Phase 2 snapshot replacement is atomic | Phase 2 TDD checklist | Bun tests for add/remove operations, malformed writes, and multi-worker visibility without partial reads |
-| Phase 3 source-driven refresh preserves last good state on failure | Phase 3 TDD checklist | Bun tests for bounded refresh, stale-but-valid behavior, and documented drain semantics |
+| Requirement / claim | Evidence |
+|---|---|
+| `GET` / `HEAD` are truthful about the bound upstream | `tests/dynamic-upstreams/dynamic-upstreams.test.js` Phase 1 block |
+| Snapshot replacement is atomic and preserves last good state on validation failure | same test file, Phase 2 block |
+| Source-driven refresh preserves last good state on failure | same test file, refresh block |
+| Worker-events fanout publishes activation notifications | same test file, Phase 3 worker-events block |
+| Health-aware activation excludes ineligible peers and re-admits them after recovery | same test file, health-aware block |
 
-### Phase Plan
+### Phase Status
 
 #### Phase 1 - Read-only control surface
 
-**Scope**
-
-Replace the placeholder endpoint with a truthful read-only API for one named upstream.
-
-**Implementation notes**
-
-- Keep the first version introspection-only
-- Report what upstream the endpoint is bound to and what the current peer snapshot looks like
-- Make bad target bindings fail clearly at config time or runtime, but not silently
-
-**TDD checklist**
-
-- [ ] Add a Bun test for `GET` returning a stable JSON shape
-- [ ] Add a Bun test for `HEAD` on the control endpoint
-- [ ] Add a Bun test for a missing or invalid target upstream name
-- [ ] Add a Bun test proving neighboring routes remain unaffected
-- [ ] Add a Bun test proving valid Phase 1 requests no longer return the scaffold `501` placeholder
-
-**Implementation checklist**
-
-- [ ] Replace `501` with a read-only JSON response for the bound upstream
-- [ ] Validate and store the named target upstream in config
-- [ ] Define the response schema for active peer snapshot reporting
-- [ ] Emit clear errors for unsupported source modes in the current phase
-
-**Exit criteria**
-
-- `GET` returns the documented JSON fields for the configured upstream and `HEAD` remains consistent with that contract
-- Invalid target bindings fail in one documented way: config-load rejection or runtime API error response
-- The runtime still performs no peer mutation yet
+- [x] `GET` returns truthful JSON for the configured upstream
+- [x] `HEAD` mirrors the read contract headers without a body
+- [x] neighboring routes remain unaffected
+- [x] target binding is validated at config load
 
 #### Phase 2 - Safe snapshot replacement
 
-**Scope**
-
-Add controlled write support for replacing the active peer snapshot without partial reads.
-
-**Implementation notes**
-
-- Start with a simple static JSON payload or equivalent deterministic source
-- Validate the full peer list before making it visible
-- Use generation/version tracking so readers never observe a half-applied update
-
-Peer validation rules must be written down before Phase 2 closes, including at least:
-
-- address syntax expectations
-- duplicate-peer handling
-- whether weights or flags are accepted yet or rejected explicitly
-
-**TDD checklist**
-
-- [ ] Add a Bun test for adding peers to an upstream snapshot
-- [ ] Add a Bun test for removing peers from an upstream snapshot
-- [ ] Add a Bun test for rejecting malformed write payloads with stable error responses
-- [ ] Add a multi-worker test proving readers never observe partial snapshot state
-
-**Implementation checklist**
-
-- [ ] Define write request schema and validation rules
-- [ ] Introduce snapshot generation/version tracking
-- [ ] Implement atomic active-snapshot replacement
-- [ ] Reject invalid peer entries before activation
-- [ ] Record last successful and last failed update state for inspection
-
-**Exit criteria**
-
-- A full peer snapshot can be replaced without reload
-- Readers only see complete generations
-- Validation failures leave the previously active generation readable and unchanged
+- [x] `PUT` performs whole-snapshot replacement without reload
+- [x] readers only see complete generations
+- [x] invalid payloads preserve the previously active generation
+- [x] duplicate-peer rejection and peer validation are test-backed
 
 #### Phase 3 - Reconciliation and operational depth
 
-**Scope**
-
-Add bounded source-driven refresh and operational behavior for production use.
-
-**Implementation notes**
-
-- `consul` integration should come only after the static write path is stable
-- Drain/remove behavior should be documented explicitly
-- Health-aware filtering should integrate with healthcheck state only after both contracts are documented
-
-Bounded refresh must be made concrete before this phase closes, including:
-
-- refresh interval source
-- maximum retry/backoff behavior
-- what state is returned while the last refresh attempt has failed
-
-**TDD checklist**
-
-- [ ] Add a Bun test for bounded refresh polling behavior
-- [ ] Add a Bun test for source failure retaining last good snapshot
-- [ ] Add a Bun test for drain semantics if they are introduced
-- [ ] Add multi-worker verification for visibility of refreshed snapshots
-
-**Implementation checklist**
-
-- [ ] Implement source reconciliation loop with bounded retry/refresh policy
-- [ ] Preserve last known good snapshot on source failure
-- [ ] Document drain/remove semantics and compatibility with healthcheck
-- [ ] Expose operational fields for active generation, source state, and last error
-
-**Exit criteria**
-
-- Source-driven reconciliation exposes documented refresh interval, last success, and last error fields
-- Failure to refresh does not destroy the last good snapshot
-- The read/write API contract is explicit enough that another module or operator can use it without reading Zig implementation details
+- [x] bounded static-file polling is implemented
+- [x] source failure preserves the last good snapshot
+- [x] worker-events fanout on activation is implemented
+- [x] operational fields for last success and last error are exposed
+- [x] health-aware activation is implemented
+- [ ] `consul` source mode remains the last meaningful gap
 
 ### Failure Handling
 
@@ -314,14 +245,7 @@ http {
 - automatic fanout over a worker event bus
 - advanced source plugins beyond static and consul
 
-### Documentation Audit Checklist
-
-- [x] Audit date: 2026-05-03
-- [x] Scaffolded Zig module and README exist under `src/modules/dynamic-upstreams-nginx-module/`.
-- [x] Placeholder API endpoint is intentionally explicit about `501 Not Implemented` state.
-- [x] README now includes phased checked todos and binary exit criteria for implementation.
-- [x] Bun integration coverage exists at `tests/dynamic-upstreams/` for placeholder JSON, `HEAD`, and neighboring-route behavior.
-- [x] Current scaffold claims now trace to present tests and future phase-specific verification points.
+### Rationale
 
 The `dynamic-upstreams` module is meant to solve a different problem from `upstream-balancer`.
 
@@ -338,14 +262,7 @@ The README for [dynamic-upstreams]() is explicit that this module should act lik
 
 That “snapshot” idea is the key design choice. Instead of editing the live peer list in place, it wants to build a complete new generation, validate it, and then atomically flip from old generation to new generation. That is the right instinct, because in-place mutation is how you get half-updated state, worker races, and crashes.
 
-Right now, just like the balancer module, it is still mostly scaffolded. The API endpoint exists only as a placeholder and returns `501 Not Implemented`. The intended directives are:
-
-- `dynamic_upstreams_api`
-- `dynamic_upstreams_source <consul|static>`
-- `dynamic_upstreams_target <upstream_name>`
-- `dynamic_upstreams_refresh <milliseconds>`
-
-The intended first useful version is read-only: expose a JSON view of one configured upstream and its current active snapshot. Only after that would it accept writes to replace the peer set.
+The current implementation now covers that design through a real read/write control API, atomic whole-snapshot activation, bounded static-source polling, worker-events fanout, and health-aware activation. The one remaining source adapter gap is `consul`.
 
 The main technical challenges are more severe here than in a normal config API:
 
@@ -413,11 +330,12 @@ Shared-memory snapshot replacement via `PUT`.
 | `dynamic_upstreams_managed` | `upstream {}` | Registers shared-memory zone and balancer vtable hook for this upstream |
 | `dynamic_upstreams_api` | `location` | Installs the GET/PUT control handler |
 | `dynamic_upstreams_target <name>` | `location` | Binds the endpoint to a named upstream; resolved at config time |
-| `dynamic_upstreams_source static` | `location` | Accepted but no-op in Phase 2; any other value fails config load |
-| `dynamic_upstreams_refresh <ms>` | `location` | Parsed and validated; still unused until source polling lands |
+| `dynamic_upstreams_source static` | `location` | Enables static-source semantics; `consul` still fails config load |
+| `dynamic_upstreams_source_file <path>` | `location` | Absolute or config-prefixed JSON file used by the refresh timer |
+| `dynamic_upstreams_refresh <ms>` | `location` | Enables worker-0 polling of the static source file at the configured interval |
 | `dynamic_upstreams_worker_events_channel <channel>` | `location` | Optional worker-events fanout channel for `snapshot_activated` notifications |
 
-### Phase 3 — In progress
+### Phase 3 — Nearly complete
 
 Implemented in this slice:
 
@@ -425,12 +343,14 @@ Implemented in this slice:
 - **Operational fields**: `GET` now exposes `last_success_at_msec`, `last_error_at_msec`, and `last_error_code`.
 - **Write-path guardrail**: `PUT` now requires `Content-Type: application/json` and records request-level failures in shared state for inspection.
 - **Multi-worker verification**: a Phase 3 test config with `worker_processes 2` verifies snapshot activation plus worker-events visibility.
+- **Static source polling**: worker `0` owns a cancelable timer that reloads a JSON snapshot from `dynamic_upstreams_source_file` every `dynamic_upstreams_refresh` milliseconds.
+- **Last-good preservation**: unreadable or invalid source files update shared error state but do not replace the active generation.
+- **No-op refresh on unchanged source**: polling the same peer list does not churn generations or emit duplicate activation events.
+- **Health-aware activation**: both `PUT` and timer-driven refresh filter candidate peers through `ngz_healthcheck_is_peer_eligible()` before activation and keep the last good snapshot if every peer is currently ineligible.
 
 Still pending:
 
-- **Source polling**: timer-driven reconciliation loop, initially for a `static` file source, then `consul`. Must preserve last-good snapshot on source failure and document bounded retry/backoff.
-- **Health-aware activation**: at `PUT` time, query healthcheck state and exclude peers that are currently failing. Must apply at activation boundaries only — healthcheck must not mutate the active snapshot out of band.
-- **`dynamic_upstreams_refresh` enforcement**: wire the stored interval into the Phase 3 polling timer.
+- **`consul` source mode**: source-driven reconciliation is implemented only for `static` files in this phase.
 
 ---
 
@@ -450,8 +370,8 @@ All slab allocations for a new snapshot (Snapshot struct, peers struct, N × pee
 
 **Better**: a dedicated per-store spinlock or an atomic compare-and-swap loop for the refcount increment, leaving the slab mutex for allocations only. Deferred to Phase 3 hardening.
 
-### 3. Source polling and health-aware activation are still absent
+### 3. `consul` source mode is still absent
 
-Phase 3 now covers operational metadata and worker-events fanout, but the control plane still only supports explicit static `PUT` replacement. There is no timer-driven refresh loop yet, and no activation-time filtering against healthcheck state.
+Phase 3 now covers operational metadata, worker-events fanout, bounded static-file polling, and health-aware activation, but `consul` is still rejected at config load because this module does not yet expose a source-specific discovery contract.
 
-**Fix**: add bounded polling first, then layer health-aware activation on top of the existing healthcheck peer-eligibility contract.
+**Fix**: add a documented `consul` source adapter with the same last-good semantics as the static file source.

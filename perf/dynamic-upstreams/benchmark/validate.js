@@ -1,49 +1,49 @@
-export async function validateScenario(baseUrl, scenario) {
-  const url = `${baseUrl}${scenario.path}`;
-  const init = { method: scenario.method || "GET" };
-
-  let res;
+async function parseJsonOrThrow(response, context) {
+  const text = await response.text();
   try {
-    res = await fetch(url, init);
-  } catch (err) {
-    return { ok: false, error: `fetch failed: ${err.message}`, scenario: scenario.name };
+    return text.length === 0 ? null : JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Invalid JSON for ${context}: ${error.message}\n${text.slice(0, 200)}`);
+  }
+}
+
+export async function validateRuntime(context) {
+  const stateRes = await fetch(`${context.baseUrl}/dynamic-upstreams`);
+  if (stateRes.status !== 200) {
+    return { ok: false, error: `dynamic-upstreams state returned HTTP ${stateRes.status}` };
+  }
+  const state = await parseJsonOrThrow(stateRes, "dynamic-upstreams state");
+  if (state.target !== context.upstreamName) {
+    return { ok: false, error: `unexpected upstream target ${state.target}` };
+  }
+  if (state.peer_count < 2) {
+    return { ok: false, error: `expected at least 2 active peers, got ${state.peer_count}` };
   }
 
-  if (res.status !== scenario.expectedStatus) {
-    return { ok: false, error: `HTTP ${res.status} (expected ${scenario.expectedStatus})`, scenario: scenario.name };
+  const eventsRes = await fetch(`${context.baseUrl}/worker-events?channel=${encodeURIComponent(context.eventsChannel)}`);
+  if (eventsRes.status !== 200) {
+    return { ok: false, error: `worker-events returned HTTP ${eventsRes.status}` };
+  }
+  const events = await parseJsonOrThrow(eventsRes, "worker-events");
+  if (!Array.isArray(events.events)) {
+    return { ok: false, error: "worker-events response missing events array" };
   }
 
-  if (scenario.name === "placeholder-501") {
-    const contentType = res.headers.get("content-type") || "";
-    if (!contentType.includes("application/json")) {
-      return { ok: false, error: `unexpected content-type: ${contentType}`, scenario: scenario.name };
-    }
-
-    let body;
-    try {
-      body = await res.json();
-    } catch {
-      return { ok: false, error: "response is not valid JSON", scenario: scenario.name };
-    }
-
-    if (body.status !== "not_implemented" || body.module !== "dynamic_upstreams") {
-      return { ok: false, error: `unexpected body: ${JSON.stringify(body)}`, scenario: scenario.name };
-    }
+  const healthRes = await fetch(`${context.baseUrl}/health`);
+  if (healthRes.status !== 200) {
+    return { ok: false, error: `health status returned HTTP ${healthRes.status}` };
   }
 
-  if (scenario.name === "placeholder-head") {
-    const text = await res.text();
-    if (text !== "") {
-      return { ok: false, error: `HEAD returned non-empty body: "${text}"`, scenario: scenario.name };
-    }
-  }
+  return { ok: true };
+}
 
-  if (scenario.name === "healthy-route") {
-    const body = await res.text();
-    if (body.trim() !== "ok") {
-      return { ok: false, error: `unexpected body: "${body.trim()}"`, scenario: scenario.name };
-    }
+export async function validateScenario(context, scenario) {
+  const result = await scenario.execute(context, 0);
+  if (result.status !== 200) {
+    return { ok: false, error: `${scenario.name} returned HTTP ${result.status}` };
   }
-
-  return { ok: true, scenario: scenario.name };
+  if (result.payloadBytes <= 0) {
+    return { ok: false, error: `${scenario.name} returned an empty payload` };
+  }
+  return { ok: true };
 }

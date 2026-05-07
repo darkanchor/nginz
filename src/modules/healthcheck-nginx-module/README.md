@@ -4,7 +4,7 @@ Active and passive health/readiness endpoints for nginx with shared-memory aggre
 
 ### Status
 
-**Feature-complete for reporting/probing, not yet integrated into upstream selection** — The module provides service-level readiness, per-upstream probes, per-peer probes, body/status match rules, HTTPS support, slow-start recovery tracking, a Prometheus-format metrics endpoint, and nginx variables. It still does not mark nginx upstream peers down or feed balancer decisions directly; that milestone-2 integration remains future work alongside worker-events fanout.
+**Feature-complete for probing/reporting, with balancer and worker-events integration landed** — The module provides service-level readiness, per-upstream probes, per-peer probes, body/status match rules, HTTPS support, slow-start recovery tracking, a Prometheus-format metrics endpoint, nginx variables, worker-events transition fanout, and a balancer-facing peer-eligibility contract consumed by `upstream-balancer`. It still does not mark nginx upstream peers `down` directly, and upstream/peer probe failures still do not drive `/ready` by themselves.
 
 ### Rationale
 
@@ -27,11 +27,11 @@ This module currently solves the reporting/probing side of the problem well:
 - per-upstream and per-peer probe reporting
 - match rules, slow-start tracking, and metrics
 
-What it still does **not** do is the harder second half of milestone 2:
+What it still does **not** do is the narrower remaining part of milestone 2:
 
-- mark upstream peers down in nginx
-- make peer health influence live upstream selection
-- fan out health transitions over `worker-events`
+- mark upstream peers down in nginx core structures
+- make upstream or peer probe failures change `/ready` by themselves
+- define broader routing policy beyond the balancer-side eligibility contract
 
 That remaining work belongs at the integration boundary with `upstream-balancer` and `worker-events`, not inside probe execution itself.
 
@@ -44,6 +44,8 @@ That remaining work belongs at the integration boundary with `upstream-balancer`
 - **Per-upstream and per-peer visibility**: `/health` reports service-level, upstream-level, and peer-level probe state
 - **Prometheus metrics**: `/metrics` exports the module state in text format for scraping
 - **Nginx variables**: readiness/liveness/probe-state variables are available to scripted or native routing logic
+- **Worker-events transition fanout**: service-level probe state transitions can publish notifications into the worker-events ring
+- **Balancer-facing peer eligibility**: `upstream-balancer` can exclude unhealthy or slow-starting peers through `ngz_healthcheck_is_peer_eligible()`
 
 ### Directives
 
@@ -62,6 +64,7 @@ That remaining work belongs at the integration boundary with `upstream-balancer`
 | `health_probe_passes` | `<count>` | `1` | Consecutive successes to recover |
 | `health_probe_slow_start` | `<time>` | `0` (disabled) | Recovery ramp duration |
 | `health_probe_match` | `status=<min>-<max> [body=<str>]` | — | Match rules for probe response |
+| `health_worker_events_channel` | `<channel>` | — | Publish service-level transition events to the worker-events default zone |
 
 #### Upstream-context
 
@@ -109,14 +112,15 @@ That remaining work belongs at the integration boundary with `upstream-balancer`
 - Active probe results are shared across workers, but only worker `0` performs the periodic probe loops.
 - Liveness and readiness are intentionally different. Nginx can be alive while readiness is failing.
 - Fail/pass thresholds are there to avoid flapping under a noisy backend.
-- Service-level readiness currently follows the service-level `health_probe`; upstream and peer probe failures are reported, but do not yet change `/ready` or peer selection.
-- Slow-start fields currently expose recovery timing and ramp metadata; they do not yet enforce traffic shaping in nginx upstream selection.
+- Service-level readiness currently follows the service-level `health_probe`; upstream and peer probe failures are reported, but do not yet change `/ready` by themselves.
+- Upstream peer selection can consume probe state through `upstream-balancer`, which excludes unhealthy peers and peers still inside slow-start recovery.
+- Slow-start metadata is not a general-purpose traffic shaper; it is currently used only by the balancer-side peer-eligibility check.
 
 ### Phases
 
 - **Phase 1** ✅ Shared counters, readiness/liveness, active HTTP probe, thresholds, per-upstream probes, nginx variables
 - **Phase 2** Partial: per-upstream probes, `upstreams_summary`, per-peer probe reporting, match rules. Remaining: balancer-facing peer health contract
-- **Phase 3** Partial: HTTPS/TLS probing, body/status match rules, slow-start recovery, Prometheus metrics. Remaining: event-bus integration and health-aware upstream control
+- **Phase 3** Mostly complete: HTTPS/TLS probing, body/status match rules, slow-start recovery, Prometheus metrics, worker-events transition fanout, and balancer-facing peer eligibility are implemented. Remaining: direct nginx peer marking and any future readiness-policy expansion.
 
 #### Phase 1 - shared health and readiness
 
@@ -149,15 +153,14 @@ This phase adds recovery depth and operator-facing polish:
 - body/status match rules
 - slow-start recovery metadata
 - Prometheus-format metrics
-- eventual transition fanout through `worker-events`
-- eventual health-aware upstream control through `upstream-balancer`
+- transition fanout through `worker-events`
+- health-aware upstream control through `upstream-balancer`
 
 The probing/visibility parts of this phase are largely implemented. The routing/control parts are still pending because they depend on other milestone-2 modules.
 
 ### Limitations
 
-- **No upstream peer marking yet**: probe failures are observable, but peers are not marked down in nginx.
-- **No health-aware peer selection yet**: health data does not yet feed `upstream-balancer`.
-- **No worker-events fanout yet**: health transitions are stored in shared memory, but not broadcast through the future event bus.
+- **No direct peer marking yet**: probe failures are observable and can exclude peers through `upstream-balancer`, but the module does not mark nginx upstream peers `down` directly.
+- **Readiness remains service-level**: upstream and peer probe failures do not automatically flip `/ready` unless the service-level probe itself fails.
 - **Best-effort timeout scope**: probe timeout currently covers connect/send/receive at the socket layer used by the module, not a richer nginx-native async probe engine.
 - **Reload/restart reset**: shared-memory probe state resets when zones are recreated.
