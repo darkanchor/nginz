@@ -144,7 +144,7 @@ make install
 
 26 modules total, including 2 reference/demo modules. All non-reference modules have integration tests and individual README documentation.
 
-### Feature Ready (22)
+### Feature Ready (23)
 
 | Module | Description |
 |--------|-------------|
@@ -162,6 +162,7 @@ make install
 | **circuit-breaker** | Failure detection with half-open recovery |
 | **prometheus** | Native /metrics endpoint with histograms |
 | **cache-tags** | Tag-based cache invalidation |
+| **cache-purge** | Operator-facing exact/prefix tag invalidation API backed by `cache-tags`, with IP/CIDR allowlist auth, multi-worker mutation, and optional worker-events fanout |
 | **acme** | Let's Encrypt certificate automation for single-domain HTTP-01 issuance with live Pebble/challtestsrv validation |
 | **nftset** | nftables-backed IP allow/block checks via raw Netlink lookup |
 | **oidc** | OpenID Connect SSO with PKCE and RS256 ID token verification |
@@ -171,12 +172,11 @@ make install
 | **wechatpay** | WeChat Pay signature signing and verification |
 | **worker-events** | Cross-worker shared-memory event ring with publish/inspect API, overflow accounting, publish auth, and real native consumers in healthcheck, cache-purge, and dynamic-upstreams |
 
-### Implemented with Limitations (2)
+### Implemented with Limitations (1)
 
 | Module | Description |
 |--------|-------------|
 | **dynamic-upstreams** | Live upstream snapshot replacement with GET/PUT control API, static-file polling, worker-events activation fanout, and health-aware activation; `consul` source support is still pending |
-| **cache-purge** | Operator-facing exact tag invalidation API backed by `cache-tags`, with multi-worker mutation and optional worker-events fanout; prefix/glob matching and stronger authorization modes are still pending |
 
 ### Planning (0)
 

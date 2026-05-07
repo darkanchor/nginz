@@ -4,7 +4,7 @@ Planned selective cache-purge API for operational cache invalidation beyond raw 
 
 ### Status
 
-**Exact invalidation is usable end-to-end, with optional worker-events fanout landed** - the module exposes a real `POST` JSON purge API, exact tag invalidation against the shared `cache-tags` metadata store, multi-worker metadata mutation, and per-target worker-events notifications when configured. Prefix/glob matching and stronger authorization modes remain unimplemented and are rejected at config load.
+**Feature Ready for bounded operator workflows** - the module exposes a real `POST` JSON purge API, exact and prefix invalidation against the shared `cache-tags` metadata store, optional IP/CIDR allowlist authorization, multi-worker metadata mutation, and per-target worker-events notifications when configured. `glob` matching and `signed-token` authorization remain intentionally deferred.
 
 ### Purpose and Boundaries
 
@@ -27,10 +27,12 @@ This module should **not** own:
 
 - `cache_purge_api` installs a `POST`-only JSON purge endpoint.
 - Request body shape is `{"targets":["tag-a","tag-b"]}`.
-- Exact tag invalidation removes matching entries from the shared `cache-tags` metadata store and returns per-target accounting.
+- Exact and prefix invalidation remove matching entries from the shared `cache-tags` metadata store and return per-target accounting.
 - `cache_purge_worker_events_channel <channel>` optionally publishes one `purged` event per mutated target through the worker-events default zone.
-- `cache_purge_match prefix|glob` and `cache_purge_authorize allowlist|signed-token` are parsed but rejected at config load because the implementation is not there yet.
+- `cache_purge_authorize allowlist` gates the purge endpoint by client IP/CIDR via `cache_purge_allowlist`.
+- `cache_purge_match glob` and `cache_purge_authorize signed-token` remain config-time rejections until their cost and request contracts are defined.
 - `cache_purge_zone` is currently limited to the single cache-tags metadata store and only accepts `default` or `cache_tags_zone`.
+- Shared metadata lookup failures are treated as internal/runtime errors rather than being documented as zero-hit misses; under the normal linked build, the shared `cache-tags` zone is provisioned during module postconfiguration.
 
 ### Current Test Coverage
 
@@ -38,10 +40,12 @@ This module should **not** own:
 
 - method and content-type enforcement on the purge endpoint
 - request-body and target validation
-- config-load rejection for missing/unsupported zone config and deferred modes
+- config-load rejection for missing/unsupported zone config, invalid allowlist entries, and deferred modes
 - exact invalidation success, zero-hit behavior, and idempotent repeated purge
+- prefix invalidation success, deterministic duplicate-target accounting, and shared metadata behavior under `worker_processes 2`
+- allowlist authorization success/failure paths
 - shared metadata behavior under `worker_processes 2`
-- worker-events notifications only for mutated targets
+- worker-events notifications only for mutated targets, including prefix mode payload reporting
 - unrelated routes continue working
 
 ### Directive Surface
@@ -52,6 +56,7 @@ This module should **not** own:
 | `cache_purge_zone` | `<name>` | `location` | Bind the endpoint to a named purge metadata zone |
 | `cache_purge_match` | `<exact|prefix|glob>` | `location` | Choose the invalidation matching strategy |
 | `cache_purge_authorize` | `<off|allowlist|signed-token>` | `location` | Define the planned authorization mode |
+| `cache_purge_allowlist` | `<ip-or-cidr> [ip-or-cidr ...]` | `location` | Define the client IP/CIDR allowlist used when `cache_purge_authorize allowlist` is enabled |
 | `cache_purge_max_keys` | `<count>` | `location` | Bound batch invalidation request size |
 | `cache_purge_worker_events_channel` | `<channel>` | `location` | Optionally publish per-target invalidation events to the worker-events default zone |
 
@@ -124,8 +129,8 @@ Before Phase 1 closes, the README must name:
 |---|---|---|
 | The scaffold purge endpoint is explicitly unimplemented | `tests/cache-purge/cache-purge.test.js` | ~~Keep placeholder behavior explicit until Phase 1 contract replacement lands~~ **DONE: replaced with real POST contract** |
 | Phase 1 defines a stable API contract before invalidation logic | Phase 1 TDD checklist | Bun tests for allowed/rejected methods, config validation, and max-keys request validation |
-| Phase 2 exact invalidation is useful before broader matching modes | Phase 2 TDD checklist | Bun tests for exact invalidation, zero-hit behavior, optional prefix mode, and multi-worker metadata visibility |
-| Phase 3 fanout and stronger auth stay additive | Phase 3 TDD checklist | Worker-events fanout is implemented and integration-tested; stronger auth remains pending |
+| Phase 2 exact invalidation is useful before broader matching modes | Phase 2 TDD checklist | Bun tests for exact invalidation, zero-hit behavior, prefix mode, and multi-worker metadata visibility |
+| Phase 3 fanout and stronger auth stay additive | Phase 3 TDD checklist | Worker-events fanout and allowlist auth are implemented and integration-tested; signed-token remains pending |
 
 ### Phase Plan
 
@@ -178,20 +183,20 @@ Implement useful targeted invalidation with exact matching first, then prefix ma
 
 - [x] Add a Bun test for exact-key or exact-tag invalidation success
 - [x] Add a Bun test for zero-hit invalidation returning a stable response
-- [ ] Add a Bun test for prefix invalidation if prefix mode is enabled in this phase
+- [x] Add a Bun test for prefix invalidation if prefix mode is enabled in this phase
 - [x] Add a multi-worker test proving purge metadata visibility across workers
 
 **Implementation checklist**
 
 - [x] Implement exact invalidation against named purge metadata
 - [x] Enforce max-keys bounds during batch operations
-- [ ] Add prefix invalidation only after exact invalidation is stable
+- [x] Add prefix invalidation only after exact invalidation is stable
 - [x] Return operator-usable result counts in the response body
 
 **Exit criteria**
 
 - [x] Exact invalidation removes or marks invalid the targeted cache metadata and returns documented result counts
-- Prefix matching remains deferred unless Phase 2 implementation and tests explicitly add it
+- [x] Prefix matching is implemented with bounded shared-store scans and explicit test coverage
 - [x] Multi-worker metadata behavior is verified before being called complete
 
 #### Phase 3 - Policy hardening and fanout
@@ -208,13 +213,13 @@ Add optional advanced matching, authorization depth, and fanout integration.
 
 **TDD checklist**
 
-- [ ] Add a Bun test for signed-token or allowlist authorization once supported
+- [x] Add a Bun test for signed-token or allowlist authorization once supported
 - [ ] Add a Bun test for glob matching only if the mode is implemented
 - [x] Add an integration test for event-bus fanout if worker-events coupling is added
 
 **Implementation checklist**
 
-- [ ] Add stronger authorization modes
+- [x] Add stronger authorization modes
 - [ ] Add advanced matching only if needed after exact/prefix prove insufficient
 - [x] Add optional worker-events fanout for broader invalidation propagation
 
@@ -270,7 +275,8 @@ server {
         cache_purge_api;
         cache_purge_zone default;
         cache_purge_match exact;
-        cache_purge_authorize off;
+        cache_purge_authorize allowlist;
+        cache_purge_allowlist 127.0.0.1/32 ::1/128;
         cache_purge_max_keys 256;
     }
 }
@@ -284,11 +290,11 @@ server {
 
 ### Documentation Audit Checklist
 
-- [x] Audit date: 2026-05-03
+- [x] Audit date: 2026-05-07
 - [x] Scaffolded Zig module and README exist under `src/modules/cache-purge-nginx-module/`.
 - [x] Placeholder API endpoint was replaced by a real POST-based purge contract.
 - [x] README now includes phased checked todos and binary exit criteria for implementation.
-- [x] Bun integration coverage exists at `tests/cache-purge/` for request validation, config-load validation, exact invalidation, multi-worker shared metadata, and unaffected-route behavior.
+- [x] Bun integration coverage exists at `tests/cache-purge/` for request validation, config-load validation, exact/prefix invalidation, allowlist auth, multi-worker shared metadata, worker-events fanout, and unaffected-route behavior.
 - [x] Current scaffold claims now trace to present tests and future phase-specific verification points.
 
 The `cache-purge` module is meant to be the operator-facing way to invalidate cached content. In plain words: it is supposed to give you an API endpoint where you can say “remove these cached entries” without doing a blunt full cache clear.
@@ -303,13 +309,14 @@ The intended API surface is small:
 - `cache_purge_zone <name>`
 - `cache_purge_match <exact|prefix|glob>`
 - `cache_purge_authorize <off|allowlist|signed-token>`
+- `cache_purge_allowlist <ip-or-cidr> [ip-or-cidr ...]`
 - `cache_purge_max_keys <count>`
 
 So the shape is: expose a location, bind it to some purge metadata zone, choose how matching works, choose how callers are authorized, and put a hard limit on how many keys can be purged in one request.
 
 The important design choice is that it wants to start with exact matching first, then maybe prefix matching later, and treat glob matching as optional and probably late. That is the right order. Exact invalidation is much easier to make correct and bounded. Prefix can be justified. Glob can get expensive and ambiguous fast.
 
-The scaffold stage is over. The code in [ngx_http_cache_purge.zig]() now exposes a real POST-based exact invalidation API backed by the shared `cache-tags` metadata store, with config-time rejection for unsupported match/auth modes and multi-worker test coverage for shared metadata mutation.
+The scaffold stage is over. The code in [ngx_http_cache_purge.zig]() now exposes a real POST-based exact/prefix invalidation API backed by the shared `cache-tags` metadata store, with IP/CIDR allowlist authorization, explicit runtime failure handling for missing metadata, and multi-worker test coverage for shared metadata mutation.
 
 The real engineering challenges are mostly about metadata and correctness:
 

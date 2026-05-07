@@ -212,17 +212,53 @@ describe("cache-purge Phase 1 - config load validation", () => {
     );
   });
 
-  test("cache_purge_match rejects prefix until implemented", () => {
+  test("cache_purge_match accepts prefix when configured", () => {
+    const runtimeName = "config-prefix-supported";
+    const runtimeDir = createConfigTestRuntime(runtimeName);
+
+    try {
+      const result = spawnSync({
+        cmd: [
+          "./zig-out/bin/nginz",
+          "-t",
+          "-c",
+          join(process.cwd(), "tests", MODULE, "nginx-prefix.conf"),
+          "-p",
+          runtimeDir,
+        ],
+        cwd: process.cwd(),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const stderr = new TextDecoder().decode(result.stderr ?? new Uint8Array());
+      const stdout = new TextDecoder().decode(result.stdout ?? new Uint8Array());
+      const output = `${stdout}\n${stderr}`;
+      expect(result.exitCode).toBe(0);
+      expect(output).toContain("test is successful");
+    } finally {
+      cleanupConfigTestRuntime(runtimeName);
+    }
+  });
+
+  test("cache_purge_authorize allowlist requires cache_purge_allowlist", () => {
     expectConfigTestFailure(
-      "nginx-prefix.conf",
-      "cache_purge_match prefix is not yet implemented; use exact",
+      "nginx-allowlist-missing.conf",
+      "cache_purge_authorize allowlist requires cache_purge_allowlist",
     );
   });
 
-  test("cache_purge_authorize rejects allowlist until implemented", () => {
+  test("cache_purge_allowlist rejects invalid CIDR entries", () => {
     expectConfigTestFailure(
-      "nginx-allowlist.conf",
-      "cache_purge_authorize allowlist is not yet implemented; use off",
+      "nginx-allowlist-invalid.conf",
+      "cache_purge_allowlist entries must be IP or CIDR",
+    );
+  });
+
+  test("cache_purge_match still rejects unsupported glob mode", () => {
+    expectConfigTestFailure(
+      "nginx-glob.conf",
+      "cache_purge_match glob is not yet implemented; use exact or prefix",
     );
   });
 });
@@ -332,6 +368,65 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
   });
 });
 
+describe("cache-purge Phase 2 - Prefix invalidation", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-prefix.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("prefix purge removes all matching tags with stable accounting", async () => {
+    await fetch(`${TEST_URL}/api`);
+
+    const res = await purge(["user-"]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.match).toBe("prefix");
+    expect(body.requested).toBe(1);
+    expect(body.missing).toBe(0);
+    expect(body.purged).toBeGreaterThanOrEqual(2);
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0].target).toBe("user-");
+    expect(body.results[0].purged).toBeGreaterThanOrEqual(2);
+
+    const zeroHit = await purge(["user-"]);
+    expect(zeroHit.status).toBe(200);
+    const zeroHitBody = await zeroHit.json();
+    expect(zeroHitBody.purged).toBe(0);
+    expect(zeroHitBody.missing).toBe(1);
+
+    const sibling = await purge(["product-"]);
+    expect(sibling.status).toBe(200);
+    const siblingBody = await sibling.json();
+    expect(siblingBody.purged).toBeGreaterThan(0);
+    expect(siblingBody.missing).toBe(0);
+  });
+
+  test("duplicate prefix targets remain deterministic", async () => {
+    await fetch(`${TEST_URL}/api`);
+
+    const res = await purge(["user-", "user-"]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.requested).toBe(2);
+    expect(body.missing).toBe(1);
+    expect(body.results[0].purged).toBeGreaterThanOrEqual(2);
+    expect(body.results[1].purged).toBe(0);
+  });
+
+  test("response remains valid JSON for heavily escaped targets", async () => {
+    const escapedTarget = 'x\\"\\n\\r\\t';
+    const res = await purge([escapedTarget]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0].target).toBe(escapedTarget);
+  });
+});
+
 describe("cache-purge Phase 2 - shared metadata with 2 workers", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx-multiw.conf`, MODULE);
@@ -415,6 +510,78 @@ describe("cache-purge Phase 2 - shared metadata with 2 workers", () => {
   });
 });
 
+describe("cache-purge Phase 2 - prefix invalidation with 2 workers", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-prefix-multiw.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("prefix invalidation works against shared tag metadata with worker_processes 2", async () => {
+    await fetch(`${TEST_URL}/api`);
+
+    const res = await purge(["user-"]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.match).toBe("prefix");
+    expect(body.requested).toBe(1);
+    expect(body.missing).toBe(0);
+    expect(body.purged).toBeGreaterThanOrEqual(2);
+
+    const second = await purge(["product-"]);
+    expect(second.status).toBe(200);
+    const secondBody = await second.json();
+    expect(secondBody.purged).toBeGreaterThan(0);
+    expect(secondBody.missing).toBe(0);
+  });
+});
+
+describe("cache-purge Phase 3 - allowlist authorization", () => {
+  describe("allowed caller", () => {
+    beforeAll(async () => {
+      await startNginz(`tests/${MODULE}/nginx-allowlist.conf`, MODULE);
+    });
+
+    afterAll(async () => {
+      await stopNginz();
+      cleanupRuntime(MODULE);
+    });
+
+    test("allowlisted caller can purge successfully", async () => {
+      await fetch(`${TEST_URL}/api`);
+
+      const res = await purge(["user-123"]);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.purged).toBeGreaterThan(0);
+      expect(body.missing).toBe(0);
+    });
+  });
+
+  describe("denied caller", () => {
+    beforeAll(async () => {
+      await startNginz(`tests/${MODULE}/nginx-allowlist-denied.conf`, MODULE);
+    });
+
+    afterAll(async () => {
+      await stopNginz();
+      cleanupRuntime(MODULE);
+    });
+
+    test("non-allowlisted caller receives deterministic 403", async () => {
+      const res = await purge(["user-123"]);
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.module).toBe("cache_purge");
+      expect(body.status).toBe("error");
+      expect(body.error).toContain("not authorized");
+    });
+  });
+});
+
 describe("cache-purge Phase 3 - worker-events notifications", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx-worker-events.conf`, MODULE);
@@ -484,5 +651,75 @@ describe("cache-purge Phase 3 - worker-events notifications", () => {
       expect.objectContaining({ match: "exact", target: "user-123" }),
     );
     expect(payload.purged).toBeGreaterThan(0);
+  });
+});
+
+describe("cache-purge Phase 3 - escaped worker-events payloads", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-worker-events-escaped.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("worker-events payload stays valid JSON for quoted tag values", async () => {
+    const quotedTag = 'user-"quoted';
+    await fetch(`${TEST_URL}/api`);
+    const before = await getWorkerEvents();
+
+    const res = await purge([quotedTag]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.results[0].target).toBe(quotedTag);
+    expect(body.results[0].purged).toBeGreaterThan(0);
+
+    const events = await waitForWorkerEvents(
+      (state) => state.events.length === 1,
+      "cache",
+      4000,
+      before.newest_generation,
+    );
+    const payload = JSON.parse(events.events[0].payload);
+    expect(payload).toEqual(
+      expect.objectContaining({ match: "exact", target: quotedTag }),
+    );
+    expect(payload.purged).toBeGreaterThan(0);
+  });
+});
+
+describe("cache-purge Phase 3 - prefix worker-events notifications", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-prefix-worker-events.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("prefix purge emits one event per mutated tag entry", async () => {
+    await fetch(`${TEST_URL}/api`);
+    const before = await getWorkerEvents();
+
+    const res = await purge(["user-"]);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.match).toBe("prefix");
+    expect(body.purged).toBeGreaterThanOrEqual(2);
+
+    const events = await waitForWorkerEvents(
+      (state) => state.events.length === 1,
+      "cache",
+      4000,
+      before.newest_generation,
+    );
+    expect(events.events[0].type).toBe("purged");
+    const payload = JSON.parse(events.events[0].payload);
+    expect(payload).toEqual(
+      expect.objectContaining({ match: "prefix", target: "user-" }),
+    );
+    expect(payload.purged).toBeGreaterThanOrEqual(2);
   });
 });
