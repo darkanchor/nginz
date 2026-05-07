@@ -4,7 +4,7 @@ Runtime upstream reconfiguration module for updating peer tables without a full 
 
 ### Status
 
-**Phase 1 + Phase 2 complete; Phase 3 nearly complete** — truthful introspection, atomic full-snapshot replacement, worker-events fanout, operational status fields, bounded static-file polling, and health-aware activation are implemented and tested. `consul` source support is the remaining Phase 3 gap.
+**Phase 1 + Phase 2 + Phase 3 complete** — truthful introspection, atomic full-snapshot replacement, worker-events fanout, operational status fields, bounded static-file polling, health-aware activation, and consul service-discovery source are all implemented and tested.
 
 ### Purpose and Boundaries
 
@@ -58,6 +58,11 @@ This module should **not** own:
 | `dynamic_upstreams_target` | `<upstream_name>` | `location` | Bind the endpoint to an upstream group |
 | `dynamic_upstreams_refresh` | `<milliseconds>` | `location` | Configure background reconciliation cadence |
 | `dynamic_upstreams_worker_events_channel` | `<channel>` | `location` | Publish snapshot activation notifications to the worker-events default zone |
+| `dynamic_upstreams_consul_address` | `<ip:port>` | `location` | Consul agent address (IP literal + port, default port 8500) |
+| `dynamic_upstreams_consul_service` | `<name>` | `location` | Consul service name to query via `/v1/health/service/<name>?passing=true` |
+| `dynamic_upstreams_consul_tag` | `<tag>` | `location` | Optional tag filter applied to the health query |
+| `dynamic_upstreams_consul_token` | `<token>` | `location` | Optional Consul ACL token sent as `X-Consul-Token` |
+| `dynamic_upstreams_consul_dc` | `<datacenter>` | `location` | Optional datacenter query parameter |
 
 ### Integration Points
 
@@ -179,7 +184,7 @@ Current write contract:
 - [x] worker-events fanout on activation is implemented
 - [x] operational fields for last success and last error are exposed
 - [x] health-aware activation is implemented
-- [ ] `consul` source mode remains the last meaningful gap
+- [x] `consul` source mode implemented with blocking TCP adapter
 
 ### Failure Handling
 
@@ -298,7 +303,7 @@ That separation is sound. The challenge is making the handoff between those two 
 
 ---
 
-## Implementation Status (as of 2026-05-07)
+## Implementation Status (as of 2026-05-07, Phase 3 complete)
 
 ### Phase 1 — Complete
 
@@ -330,7 +335,7 @@ Shared-memory snapshot replacement via `PUT`.
 | `dynamic_upstreams_managed` | `upstream {}` | Registers shared-memory zone and balancer vtable hook for this upstream |
 | `dynamic_upstreams_api` | `location` | Installs the GET/PUT control handler |
 | `dynamic_upstreams_target <name>` | `location` | Binds the endpoint to a named upstream; resolved at config time |
-| `dynamic_upstreams_source static` | `location` | Enables static-source semantics; `consul` still fails config load |
+| `dynamic_upstreams_source static\|consul` | `location` | Selects the reconciliation source; `consul` requires `dynamic_upstreams_consul_address` and `dynamic_upstreams_consul_service` |
 | `dynamic_upstreams_source_file <path>` | `location` | Absolute or config-prefixed JSON file used by the refresh timer |
 | `dynamic_upstreams_refresh <ms>` | `location` | Enables worker-0 polling of the static source file at the configured interval |
 | `dynamic_upstreams_worker_events_channel <channel>` | `location` | Optional worker-events fanout channel for `snapshot_activated` notifications |
@@ -348,9 +353,7 @@ Implemented in this slice:
 - **No-op refresh on unchanged source**: polling the same peer list does not churn generations or emit duplicate activation events.
 - **Health-aware activation**: both `PUT` and timer-driven refresh filter candidate peers through `ngz_healthcheck_is_peer_eligible()` before activation and keep the last good snapshot if every peer is currently ineligible.
 
-Still pending:
-
-- **`consul` source mode**: source-driven reconciliation is implemented only for `static` files in this phase.
+- **`consul` source mode**: worker-0 timer polls `GET /v1/health/service/<name>?passing=true` via a blocking HTTP/1.0 TCP connection, converts the response into a peer snapshot, and activates it with the same last-good semantics as the static source.  The consul address must be an IP literal (no DNS).  Connection and read timeouts are 5 seconds.
 
 ---
 
@@ -370,8 +373,8 @@ All slab allocations for a new snapshot (Snapshot struct, peers struct, N × pee
 
 **Better**: a dedicated per-store spinlock or an atomic compare-and-swap loop for the refcount increment, leaving the slab mutex for allocations only. Deferred to Phase 3 hardening.
 
-### 3. `consul` source mode is still absent
+### 3. Blocking consul HTTP in the event loop
 
-Phase 3 now covers operational metadata, worker-events fanout, bounded static-file polling, and health-aware activation, but `consul` is still rejected at config load because this module does not yet expose a source-specific discovery contract.
+The consul timer refresh uses a blocking POSIX TCP socket (HTTP/1.0, 5-second timeout) in worker 0's event loop.  For typical Consul deployments on localhost this is a sub-millisecond operation.  If Consul is slow or unreachable, worker 0's event loop stalls for up to 5 seconds per refresh cycle, delaying timers for other modules.
 
-**Fix**: add a documented `consul` source adapter with the same last-good semantics as the static file source.
+**Better**: implement async Consul polling via nginx's non-blocking event machinery (similar to the upstream health-check module).  Deferred to a future hardening pass.

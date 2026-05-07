@@ -74,6 +74,37 @@ const DU_ERROR_REFRESH_NOT_CONFIGURED: u32 = 4004;
 const DU_ERROR_ALL_PEERS_UNHEALTHY: u32 = 5031;
 const MAX_REFRESH_ENTRIES: usize = 32;
 
+// ── C socket API for consul polling ──────────────────────────────────────────
+
+const AF_INET: c_int = 2;
+const SOCK_STREAM: c_int = 1;
+const IPPROTO_TCP: c_int = 6;
+const SOL_SOCKET: c_int = 1;
+const SO_RCVTIMEO: c_int = 20;
+const SO_SNDTIMEO: c_int = 21;
+const CONSUL_RECV_BUF_SIZE: usize = 256 * 1024;
+
+const linux_timeval = extern struct {
+    tv_sec: c_long,
+    tv_usec: c_long,
+};
+
+const sockaddr_in = extern struct {
+    sin_family: u16,
+    sin_port: u16,
+    sin_addr: u32,
+    sin_zero: [8]u8,
+};
+
+extern fn socket(domain: c_int, typ: c_int, protocol: c_int) c_int;
+extern fn connect(sockfd: c_int, addr: ?*const anyopaque, addrlen: c_uint) c_int;
+extern fn send(sockfd: c_int, buf: [*c]const u8, len: usize, flags: c_int) isize;
+extern fn recv(sockfd: c_int, buf: [*c]u8, len: usize, flags: c_int) isize;
+extern fn close(fd: c_int) c_int;
+extern fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: ?*const anyopaque, optlen: c_uint) c_int;
+extern fn htons(hostshort: u16) u16;
+extern fn inet_pton(af: c_int, src: [*c]const u8, dst: ?*anyopaque) c_int;
+
 // ── Per-location config ─────────────────────────────────────────────────────
 
 const dynamic_upstreams_loc_conf = extern struct {
@@ -85,6 +116,13 @@ const dynamic_upstreams_loc_conf = extern struct {
     target_uscf: [*c]ngx_http_upstream_srv_conf_t,
     worker_events_channel: ngx_str_t,
     refresh_registered: ngx_flag_t,
+    // consul source fields
+    consul_host: ngx_str_t,     // null-terminated IP string
+    consul_port: ngx_uint_t,    // default 8500
+    consul_service: ngx_str_t,
+    consul_tag: ngx_str_t,
+    consul_token: ngx_str_t,
+    consul_dc: ngx_str_t,
 };
 
 const RefreshEntry = struct {
@@ -296,6 +334,12 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     lccf.*.target_uscf = core.nullptr(ngx_http_upstream_srv_conf_t);
     lccf.*.worker_events_channel = ngx_null_str;
     lccf.*.refresh_registered = 0;
+    lccf.*.consul_host = ngx_null_str;
+    lccf.*.consul_port = 8500;
+    lccf.*.consul_service = ngx_null_str;
+    lccf.*.consul_tag = ngx_null_str;
+    lccf.*.consul_token = ngx_null_str;
+    lccf.*.consul_dc = ngx_null_str;
     return lccf;
 }
 
@@ -313,6 +357,12 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
         c.*.target_uscf = prev.*.target_uscf;
     }
     if (c.*.worker_events_channel.len == 0) c.*.worker_events_channel = prev.*.worker_events_channel;
+    if (c.*.consul_host.len == 0) c.*.consul_host = prev.*.consul_host;
+    if (c.*.consul_port == 8500 and prev.*.consul_port != 8500) c.*.consul_port = prev.*.consul_port;
+    if (c.*.consul_service.len == 0) c.*.consul_service = prev.*.consul_service;
+    if (c.*.consul_tag.len == 0) c.*.consul_tag = prev.*.consul_tag;
+    if (c.*.consul_token.len == 0) c.*.consul_token = prev.*.consul_token;
+    if (c.*.consul_dc.len == 0) c.*.consul_dc = prev.*.consul_dc;
 
     if (c.*.api_enabled != 0 and c.*.target_uscf == core.nullptr(ngx_http_upstream_srv_conf_t)) {
         ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
@@ -321,11 +371,25 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     }
 
     if (c.*.refresh_ms > 0) {
-        if (c.*.source.len > 0 and !std.mem.eql(u8, core.slicify(u8, c.*.source.data, c.*.source.len), "static")) {
-            return @constCast("dynamic_upstreams_refresh currently supports only dynamic_upstreams_source static");
+        const src = if (c.*.source.len > 0)
+            core.slicify(u8, c.*.source.data, c.*.source.len)
+        else
+            @as([]const u8, "static");
+        const is_consul = std.mem.eql(u8, src, "consul");
+        if (!std.mem.eql(u8, src, "static") and !is_consul) {
+            return @constCast("dynamic_upstreams: unsupported source; supported: static, consul");
         }
-        if (c.*.source_file.len == 0 or c.*.source_file.data == null) {
-            return @constCast("dynamic_upstreams_refresh requires dynamic_upstreams_source_file");
+        if (!is_consul) {
+            if (c.*.source_file.len == 0 or c.*.source_file.data == null) {
+                return @constCast("dynamic_upstreams_refresh requires dynamic_upstreams_source_file");
+            }
+        } else {
+            if (c.*.consul_host.len == 0 or c.*.consul_host.data == null) {
+                return @constCast("dynamic_upstreams_consul_address is required for consul source");
+            }
+            if (c.*.consul_service.len == 0 or c.*.consul_service.data == null) {
+                return @constCast("dynamic_upstreams_consul_service is required for consul source");
+            }
         }
         if (c.*.refresh_registered == 0) {
             if (refresh_entry_count >= MAX_REFRESH_ENTRIES) {
@@ -476,9 +540,10 @@ fn set_dynamic_upstreams_source(
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             const val = core.slicify(u8, arg.*.data, arg.*.len);
-            if (!std.mem.eql(u8, val, "static")) {
+            if (!std.mem.eql(u8, val, "static") and !std.mem.eql(u8, val, "consul")) {
                 ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cf.*.log, 0,
-                    "dynamic_upstreams: only 'static' source is supported in this version\x00", .{});
+                    "dynamic_upstreams: unsupported source '%.*s'; supported: static, consul\x00",
+                    .{ @as(c_int, @intCast(arg.*.len)), arg.*.data });
                 return conf.NGX_CONF_ERROR;
             }
             lccf.*.source = arg.*;
@@ -566,6 +631,35 @@ fn set_dynamic_upstreams_worker_events_channel(
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             lccf.*.worker_events_channel = arg.*;
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
+fn set_dynamic_upstreams_consul_address(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(dynamic_upstreams_loc_conf, loc)) |lccf| {
+        var i: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
+            const slice = core.slicify(u8, arg.*.data, arg.*.len);
+            var host_len = slice.len;
+            var port: ngx_uint_t = 8500;
+            if (std.mem.lastIndexOfScalar(u8, slice, ':')) |colon| {
+                host_len = colon;
+                port = std.fmt.parseInt(ngx_uint_t, slice[colon + 1 ..], 10) catch {
+                    return @constCast("dynamic_upstreams_consul_address: invalid port");
+                };
+            }
+            const data = core.castPtr(u8, core.ngx_pnalloc(cf.*.pool, host_len + 1)) orelse
+                return conf.NGX_CONF_ERROR;
+            @memcpy(core.slicify(u8, data, host_len), slice[0..host_len]);
+            data[host_len] = 0;
+            lccf.*.consul_host = ngx_str_t{ .data = data, .len = host_len };
+            lccf.*.consul_port = port;
         }
     }
     return conf.NGX_CONF_OK;
@@ -1207,6 +1301,282 @@ fn reap_draining(store: [*c]UpstreamStore, shpool: [*c]core.ngx_slab_pool_t) voi
     shm.ngx_shmtx_unlock(&shpool.*.mutex);
 }
 
+// ── Consul source adapter ─────────────────────────────────────────────────────
+
+fn consul_build_path(
+    pool: [*c]core.ngx_pool_t,
+    service: ngx_str_t,
+    tag: ngx_str_t,
+    dc: ngx_str_t,
+) ?ngx_str_t {
+    const base = "/v1/health/service/";
+    const passing = "?passing=true";
+    const tag_prefix = "&tag=";
+    const dc_prefix = "&dc=";
+    const extra = tag.len + dc.len + tag_prefix.len + dc_prefix.len + 4;
+    const est = base.len + service.len + passing.len + extra;
+    const data = core.castPtr(u8, core.ngx_pnalloc(pool, est)) orelse return null;
+    var pos: usize = 0;
+    @memcpy(data[0..base.len], base);
+    pos += base.len;
+    @memcpy(data[pos..][0..service.len], core.slicify(u8, service.data, service.len));
+    pos += service.len;
+    @memcpy(data[pos..][0..passing.len], passing);
+    pos += passing.len;
+    if (tag.len > 0 and tag.data != null) {
+        @memcpy(data[pos..][0..tag_prefix.len], tag_prefix);
+        pos += tag_prefix.len;
+        @memcpy(data[pos..][0..tag.len], core.slicify(u8, tag.data, tag.len));
+        pos += tag.len;
+    }
+    if (dc.len > 0 and dc.data != null) {
+        @memcpy(data[pos..][0..dc_prefix.len], dc_prefix);
+        pos += dc_prefix.len;
+        @memcpy(data[pos..][0..dc.len], core.slicify(u8, dc.data, dc.len));
+        pos += dc.len;
+    }
+    data[pos] = 0;
+    return ngx_str_t{ .data = data, .len = pos };
+}
+
+// Blocking HTTP/1.0 GET — only safe from timer context (worker 0 background).
+// Returns the response body as a pool-allocated slice on HTTP 200.
+fn consul_http_get(
+    pool: [*c]core.ngx_pool_t,
+    host: ngx_str_t,   // null-terminated IP
+    port: u16,
+    path: ngx_str_t,
+    token: ngx_str_t,
+    lg: [*c]ngx.log.ngx_log_t,
+) !ngx_str_t {
+    var addr: sockaddr_in = std.mem.zeroes(sockaddr_in);
+    addr.sin_family = @intCast(AF_INET);
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host.data, &addr.sin_addr) != 1) {
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0,
+            "consul: invalid address %.*s\x00", .{ @as(c_int, @intCast(host.len)), host.data });
+        return error.InvalidAddress;
+    }
+
+    const fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0, "consul: socket() failed\x00", .{});
+        return error.SocketFailed;
+    }
+    defer _ = close(fd);
+
+    const tv = linux_timeval{ .tv_sec = 5, .tv_usec = 0 };
+    _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, @sizeOf(linux_timeval));
+    _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, @sizeOf(linux_timeval));
+
+    if (connect(fd, &addr, @sizeOf(sockaddr_in)) != 0) {
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0,
+            "consul: connect to %.*s:%d failed\x00",
+            .{ @as(c_int, @intCast(host.len)), host.data, @as(c_int, port) });
+        return error.ConnectFailed;
+    }
+
+    var req_buf: [1024]u8 = undefined;
+    var req_len: usize = 0;
+
+    // Use HTTP/1.0 to avoid chunked transfer encoding
+    const req_line = std.fmt.bufPrint(
+        req_buf[req_len..],
+        "GET {s} HTTP/1.0\r\nHost: {s}\r\n",
+        .{ core.slicify(u8, path.data, path.len), core.slicify(u8, host.data, host.len) },
+    ) catch return error.RequestTooLarge;
+    req_len += req_line.len;
+
+    if (token.len > 0 and token.data != null) {
+        const tok_line = std.fmt.bufPrint(req_buf[req_len..], "X-Consul-Token: {s}\r\n",
+            .{core.slicify(u8, token.data, token.len)}) catch return error.RequestTooLarge;
+        req_len += tok_line.len;
+    }
+    req_buf[req_len] = '\r'; req_len += 1;
+    req_buf[req_len] = '\n'; req_len += 1;
+
+    var sent: usize = 0;
+    while (sent < req_len) {
+        const n = send(fd, req_buf[sent..].ptr, req_len - sent, 0);
+        if (n <= 0) {
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0, "consul: send failed\x00", .{});
+            return error.SendFailed;
+        }
+        sent += @intCast(n);
+    }
+
+    const rbuf = core.castPtr(u8, core.ngx_pnalloc(pool, CONSUL_RECV_BUF_SIZE)) orelse
+        return error.OutOfMemory;
+    var total: usize = 0;
+    while (total < CONSUL_RECV_BUF_SIZE - 1) {
+        const n = recv(fd, rbuf + total, CONSUL_RECV_BUF_SIZE - 1 - total, 0);
+        if (n < 0) {
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0, "consul: recv failed\x00", .{});
+            return error.RecvFailed;
+        }
+        if (n == 0) break;
+        total += @intCast(n);
+    }
+
+    const response = core.slicify(u8, rbuf, total);
+    const sep = "\r\n\r\n";
+    const hdr_end = std.mem.indexOf(u8, response, sep) orelse return error.InvalidResponse;
+
+    const sp1 = std.mem.indexOfScalar(u8, response[0..@min(20, response.len)], ' ') orelse
+        return error.InvalidResponse;
+    if (sp1 + 4 > response.len) return error.InvalidResponse;
+    const status = std.fmt.parseInt(u16, response[sp1 + 1 .. sp1 + 4], 10) catch
+        return error.InvalidResponse;
+
+    if (status != 200) {
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0,
+            "consul: HTTP %d from %.*s\x00", .{ @as(c_int, status), @as(c_int, @intCast(host.len)), host.data });
+        return error.BadStatus;
+    }
+
+    const body_off = hdr_end + sep.len;
+    return ngx_str_t{ .data = rbuf + body_off, .len = total - body_off };
+}
+
+// Parse Consul health endpoint JSON and build a {"peers":[...]} JSON string.
+fn consul_peers_json(
+    pool: [*c]core.ngx_pool_t,
+    consul_body: ngx_str_t,
+    lg: [*c]ngx.log.ngx_log_t,
+) ?ngx_str_t {
+    var cj = CJSON.init(pool);
+    const parsed = cj.decode(consul_body) catch {
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0,
+            "consul: failed to parse health response JSON\x00", .{});
+        return null;
+    };
+    // Pool-allocated; freed with pool at end of run_consul_refresh_entry.
+
+    const n: usize = @intCast(@max(0, cjson.cJSON_GetArraySize(parsed)));
+    const est = 20 + n * 64;
+    const out = core.castPtr(u8, core.ngx_pnalloc(pool, est)) orelse return null;
+    var pos: usize = 0;
+
+    const pfx = "{\"peers\":[";
+    @memcpy(out[0..pfx.len], pfx);
+    pos += pfx.len;
+
+    var it = CJSON.Iterator.init(parsed);
+    var first = true;
+    var count: usize = 0;
+
+    while (it.next()) |entry| {
+        if (count >= MAX_PEERS_PER_PUT) break;
+
+        const svc_node = cjson.cJSON_GetObjectItem(entry, "Service");
+        if (svc_node == core.nullptr(cjson.cJSON)) continue;
+
+        // Prefer Service.Address, fall back to Node.Address
+        var addr_str: ngx_str_t = ngx_null_str;
+        const sa = cjson.cJSON_GetObjectItem(svc_node, "Address");
+        if (sa != core.nullptr(cjson.cJSON)) {
+            if (CJSON.stringValue(sa)) |s| {
+                if (s.len > 0) addr_str = s;
+            }
+        }
+        if (addr_str.len == 0) {
+            const node_obj = cjson.cJSON_GetObjectItem(entry, "Node");
+            if (node_obj != core.nullptr(cjson.cJSON)) {
+                const na = cjson.cJSON_GetObjectItem(node_obj, "Address");
+                if (na != core.nullptr(cjson.cJSON)) {
+                    if (CJSON.stringValue(na)) |s| addr_str = s;
+                }
+            }
+        }
+        if (addr_str.len == 0) continue;
+
+        const port_node = cjson.cJSON_GetObjectItem(svc_node, "Port");
+        if (port_node == core.nullptr(cjson.cJSON)) continue;
+        const port_val = CJSON.intValue(port_node) orelse continue;
+        if (port_val <= 0 or port_val > 65535) continue;
+
+        var peer_addr_buf: [64]u8 = undefined;
+        const peer_addr = std.fmt.bufPrint(&peer_addr_buf, "{s}:{d}", .{
+            core.slicify(u8, addr_str.data, addr_str.len), @as(u16, @intCast(port_val)),
+        }) catch continue;
+
+        // {"address":"...","weight":1} + comma = peer_addr.len + 24
+        if (pos + peer_addr.len + 25 > est) break;
+
+        if (!first) {
+            out[pos] = ',';
+            pos += 1;
+        }
+        first = false;
+        count += 1;
+
+        const ep = "{\"address\":\"";
+        @memcpy(out[pos..][0..ep.len], ep);
+        pos += ep.len;
+        @memcpy(out[pos..][0..peer_addr.len], peer_addr);
+        pos += peer_addr.len;
+        const es = "\",\"weight\":1}";
+        @memcpy(out[pos..][0..es.len], es);
+        pos += es.len;
+    }
+
+    const sfx = "]}";
+    @memcpy(out[pos..][0..sfx.len], sfx);
+    pos += sfx.len;
+
+    return ngx_str_t{ .data = out, .len = pos };
+}
+
+fn run_consul_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
+    const lccf = entry.lccf;
+    if (lccf == core.nullptr(dynamic_upstreams_loc_conf)) return;
+    if (lccf.*.target_uscf == core.nullptr(ngx_http_upstream_srv_conf_t)) return;
+
+    const ducf = get_ducf(lccf.*.target_uscf) orelse return;
+    if (ducf.*.managed == 0) return;
+
+    if (lccf.*.consul_host.len == 0 or lccf.*.consul_host.data == null) {
+        record_store_error(ducf, DU_ERROR_REFRESH_NOT_CONFIGURED);
+        return;
+    }
+    if (lccf.*.consul_service.len == 0 or lccf.*.consul_service.data == null) {
+        record_store_error(ducf, DU_ERROR_REFRESH_NOT_CONFIGURED);
+        return;
+    }
+
+    const pool = core.ngx_create_pool(512 * 1024, lg);
+    if (pool == core.nullptr(core.ngx_pool_t)) {
+        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+        return;
+    }
+    defer core.ngx_destroy_pool(pool);
+
+    const path = consul_build_path(pool, lccf.*.consul_service, lccf.*.consul_tag, lccf.*.consul_dc) orelse {
+        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+        return;
+    };
+
+    const body = consul_http_get(
+        pool, lccf.*.consul_host, @intCast(lccf.*.consul_port), path, lccf.*.consul_token, lg,
+    ) catch {
+        record_store_error(ducf, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    };
+
+    const peers_str = consul_peers_json(pool, body, lg) orelse {
+        record_store_error(ducf, DU_ERROR_INVALID_JSON);
+        return;
+    };
+
+    var cj = CJSON.init(pool);
+    const json = cj.decode(peers_str) catch {
+        record_store_error(ducf, DU_ERROR_INVALID_JSON);
+        return;
+    };
+
+    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true);
+}
+
 fn run_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
     const lccf = entry.lccf;
     if (lccf == core.nullptr(dynamic_upstreams_loc_conf)) return;
@@ -1246,7 +1616,15 @@ fn dynamic_upstreams_refresh_timer_handler(ev: [*c]core.ngx_event_t) callconv(.c
         event.ngx_event_del_timer(ev);
     }
     const entry = core.castPtr(RefreshEntry, ev.*.data) orelse return;
-    run_refresh_entry(entry, ev.*.log);
+    const lccf = entry.*.lccf;
+    const use_consul = lccf != core.nullptr(dynamic_upstreams_loc_conf) and
+        lccf.*.source.len == 6 and
+        std.mem.eql(u8, core.slicify(u8, lccf.*.source.data, lccf.*.source.len), "consul");
+    if (use_consul) {
+        run_consul_refresh_entry(entry, ev.*.log);
+    } else {
+        run_refresh_entry(entry, ev.*.log);
+    }
     const interval: ngx_msec_t = @intCast(entry.*.lccf.*.refresh_ms);
     event.ngx_event_add_timer(&entry.*.timer, interval);
 }
@@ -1441,6 +1819,46 @@ export const ngx_http_dynamic_upstreams_commands = [_]ngx_command_t{
         .set = set_dynamic_upstreams_worker_events_channel,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("dynamic_upstreams_consul_address"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = set_dynamic_upstreams_consul_address,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("dynamic_upstreams_consul_service"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(dynamic_upstreams_loc_conf, "consul_service"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("dynamic_upstreams_consul_tag"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(dynamic_upstreams_loc_conf, "consul_tag"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("dynamic_upstreams_consul_token"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(dynamic_upstreams_loc_conf, "consul_token"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("dynamic_upstreams_consul_dc"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(dynamic_upstreams_loc_conf, "consul_dc"),
         .post = null,
     },
     conf.ngx_null_command,
