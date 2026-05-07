@@ -47,7 +47,8 @@
       "Bash(nm -C zig-out/bin/nginz)",
       "Bash(nm -n zig-out/bin/nginz)",
       "Bash(addr2line -e zig-out/bin/nginz -f 0x16347a9)",
-      "Bash(objdump -d zig-out/bin/nginz)"
+      "Bash(objdump -d zig-out/bin/nginz)",
+      "Bash(nginx -t -c /tmp/bad-nginx.conf)"
     ]
   }
 }
