@@ -21,6 +21,10 @@ const ngx_http_upstream_rr_peer_t = http.ngx_http_upstream_rr_peer_t;
 
 extern var ngx_http_upstream_module: ngx_module_t;
 
+// Provided by the healthcheck module. Returns 1 if the peer is eligible
+// (healthy or not monitored), 0 if a configured probe marks it unhealthy.
+extern fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
+
 extern fn ngx_http_upstream_init_round_robin(
     cf: [*c]ngx_conf_t,
     us: [*c]ngx_http_upstream_srv_conf_t,
@@ -264,22 +268,29 @@ export fn upstream_balancer_init_peer(
     return core.NGX_OK;
 }
 
-// Count non-down peers in the primary peer linked list.
+// A peer is eligible if nginx hasn't marked it down AND the healthcheck module
+// (when loaded) considers it healthy. Fail-open: no probe entry → eligible.
+fn is_eligible(p: [*c]ngx_http_upstream_rr_peer_t) bool {
+    if (p.*.down != 0) return false;
+    return ngz_healthcheck_is_peer_eligible(p.*.name.data, p.*.name.len) != 0;
+}
+
+// Count eligible peers in the primary peer linked list.
 fn count_eligible(peers: [*c]ngx_http_upstream_rr_peer_t) ngx_uint_t {
     var n: ngx_uint_t = 0;
     var p = peers;
     while (p != null) : (p = p.*.next) {
-        if (p.*.down == 0) n += 1;
+        if (is_eligible(p)) n += 1;
     }
     return n;
 }
 
-// Walk the linked list and return the peer at the given position among non-down peers.
+// Walk the linked list and return the peer at the given position among eligible peers.
 fn peer_at(peers: [*c]ngx_http_upstream_rr_peer_t, pos: ngx_uint_t) ?[*c]ngx_http_upstream_rr_peer_t {
     var idx: ngx_uint_t = 0;
     var p = peers;
     while (p != null) : (p = p.*.next) {
-        if (p.*.down != 0) continue;
+        if (!is_eligible(p)) continue;
         if (idx == pos) return p;
         idx += 1;
     }

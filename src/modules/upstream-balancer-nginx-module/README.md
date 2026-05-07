@@ -4,9 +4,7 @@ Sticky-session upstream balancer for nginx peer selection in Zig.
 
 ### Status
 
-**Phase 1 and Phase 2 complete** — cookie and header affinity selection is live. Directives are parsed into real upstream-scoped config, the module owns nginx's upstream callback chain, and deterministic sticky selection with explicit fallback semantics is implemented and integration-tested.
-
-Phase 3 (peer identity contract, `dynamic-upstreams` handoff, observability) is not started.
+**Phases 1, 2, and 3 complete** — cookie and header affinity selection is live, multi-worker consistency is verified, and healthcheck peer health state is now wired into peer eligibility via a narrow cross-module API. 15 integration tests pass.
 
 ### Purpose and Boundaries
 
@@ -48,6 +46,8 @@ This module should **not** own:
 - missing cookie + fallback next → 200
 - missing cookie + fallback off → 502
 - cookie and header directives in the same upstream block are rejected at parse time (checked via `nginx -t` stderr)
+- multi-worker affinity consistency (20 requests across 2 workers, same key → same backend)
+- healthcheck integration: unhealthy peers (probe failing) are excluded from sticky selection; traffic returns to the healthy peer; recovery is observed when the probe resumes succeeding
 
 ### Directive Surface
 
@@ -67,7 +67,7 @@ Mutual exclusion: `sticky_cookie` and `sticky_header` cannot both appear in the 
 - `src/ngz_zig_modules.zig`
 - `project/build_package.zig`
 - nginx upstream peer hook surface: wrap `ngx_http_upstream_peer_t` callback ownership explicitly rather than introducing a parallel routing path
-- future consumers: `dynamic-upstreams`, `healthcheck`
+- cross-module API: `ngz_healthcheck_is_peer_eligible` exported from `healthcheck`, declared `extern` in this module, wired into `is_eligible(p)` helper used by `count_eligible` and `peer_at`
 
 ### Milestone 2 Reminder
 
@@ -136,7 +136,7 @@ Allocated from `r->pool` per request in `init_peer`:
 | Affinity hash is named and stable | This README: CRC32-IsoHdlc, `hash % eligible_peer_count` |
 | Affinity is consistent across workers | "multi-worker consistency" describe block — 20 requests × 2 workers, same key, same backend |
 | Peer identity contract is defined | Peer Identity Contract section in this README |
-| Healthcheck integration gap is documented | Healthcheck Integration Gap section in this README |
+| Healthcheck integration is implemented | `ngz_healthcheck_is_peer_eligible` cross-module API; "upstream-balancer healthcheck integration" test block |
 
 ### Phase Plan
 
@@ -236,14 +236,14 @@ Harden the selection path for future dynamic upstream work and operational visib
 - [x] Document and stabilize peer identity and generation expectations (see Peer Identity Contract below)
 - [x] Debug logging at hit/miss/fallback decision points is the minimal observability surface (no counters needed for Phase 3)
 - [x] Document compatibility expectations for `dynamic-upstreams` integration (see Peer Identity Contract)
-- [ ] Integrate `healthcheck` peer health state into peer eligibility — see Healthcheck Integration Gap below
+- [x] Integrate `healthcheck` peer health state into peer eligibility via `ngz_healthcheck_is_peer_eligible` cross-module API
 
 **Exit criteria**
 
 - ✅ The README names the peer identity, hash, and fallback contract that `dynamic-upstreams` must preserve
 - ✅ Debug logs distinguish affinity hit, miss, and fallback path per request (NGX_LOG_DEBUG level, enabled with `error_log ... debug`)
 - ✅ Multi-worker consistency is empirically verified — 20 requests across 2 workers with the same key always land on the same backend
-- ⚠️ Healthcheck state does not yet influence peer eligibility — documented gap, requires cross-module API design
+- ✅ Healthcheck peer health state influences peer eligibility via `ngz_healthcheck_is_peer_eligible` cross-module API
 
 ### Failure Handling
 
@@ -269,7 +269,7 @@ This is sufficient to trace the decision path for any single request. No shared-
 
 This section is the stability contract that `dynamic-upstreams` must preserve.
 
-**Identity definition**: A peer's identity is its position among non-down peers in `ngx_http_upstream_rr_peers_t.peer` linked list, counted at `init_upstream` time. That position is implicit — there is no stable peer ID field. The mapping from cookie/header key to peer is: `CRC32(key) % eligible_peer_count` where eligible means `peer.down == 0` at the time of the request.
+**Identity definition**: A peer's identity is its position among eligible peers in `ngx_http_upstream_rr_peers_t.peer` linked list, counted at request time. That position is implicit — there is no stable peer ID field. The mapping from cookie/header key to peer is: `CRC32(key) % eligible_peer_count` where eligible means `peer.down == 0` AND `ngz_healthcheck_is_peer_eligible(peer.name) == 1`.
 
 **Generation boundary**: A configuration reload is a generation boundary. After a reload, `init_upstream` is called again, the peer list is rebuilt, and `eligible_peer_count` may change. Any keys that previously mapped to peer index N may now map to a different peer if the list length or peer ordering changed. **This is acceptable, documented behavior — affinity is not guaranteed across config reloads.**
 
@@ -277,20 +277,24 @@ This section is the stability contract that `dynamic-upstreams` must preserve.
 
 **Worker consistency**: All nginx workers fork from the master after config parsing. The peer list and its order are identical across workers for a given generation. Because the hash is pure (CRC32 is deterministic, no per-worker state), every worker resolves the same key to the same peer index. This is verified empirically by the multi-worker tests.
 
-### Healthcheck Integration Gap
+### Healthcheck Integration
 
-The `healthcheck` module maintains per-upstream `probe_healthy` state in its own shared memory zone (`healthcheck_zone`). It does **not** set `peer.down` on `ngx_http_upstream_rr_peer_t`. As a result, this balancer's `count_eligible` function — which filters by `peer.down == 0` — does not skip peers that healthcheck has marked unhealthy.
+The `healthcheck` module maintains per-peer `probe_healthy` state in per-peer shared memory zones. It does **not** set `peer.down` on `ngx_http_upstream_rr_peer_t`. The integration uses a narrow cross-module API instead of relying on `peer.down`.
 
-**Intended future contract**: The healthcheck module should expose a narrow query function:
+**Implemented contract**:
 
 ```zig
-// Proposed — not yet implemented
-pub fn ngz_healthcheck_is_peer_eligible(peer_name: ngx_str_t) bool;
+// Exported from healthcheck module
+export fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
 ```
 
-The balancer's `count_eligible` and `peer_at` would call this function to filter unhealthy peers before applying the CRC32 mapping. This keeps probing logic out of the balancer and selection logic out of healthcheck.
+The balancer declares this as `extern` and calls it from the `is_eligible(p)` helper, which combines the nginx-native `peer.down` check with the healthcheck module's `probe_healthy` state. Both `count_eligible` and `peer_at` use `is_eligible`.
 
-**Until this is implemented**: Peers that healthcheck has marked unhealthy are still eligible for sticky selection. nginx's own connection-error retry path will handle them after the TCP connection fails, falling back to round-robin via the `sticky_used` flag. This degrades gracefully but does not give clean pre-emptive skipping of known-bad peers.
+**Fail-open semantics**: If a peer has no probe configured, `ngz_healthcheck_is_peer_eligible` returns 1 (eligible). This prevents startup-time exclusion of unprobed peers and ensures the module works correctly when healthcheck peer probes are not configured.
+
+**Probe settings inheritance**: Per-peer probe settings inherit from the upstream's `health_upstream_probe_interval/fails/passes` directives, so probe timing only needs to be set once per upstream block.
+
+**Integration test**: `tests/upstream-balancer/nginx-healthcheck-balancer.conf` + "upstream-balancer healthcheck integration" describe block verify that an unhealthy peer is excluded from sticky selection and traffic returns after probe recovery.
 
 ### Compatibility and Ordering Constraints
 
@@ -308,7 +312,6 @@ The balancer's `count_eligible` and `peer_at` would call this function to filter
 
 ### Open Questions
 
-- Should the healthcheck integration function be exposed as a Zig export from the healthcheck module, or through a shared ngx_shm_zone lookup? The answer determines whether the two modules have a compile-time or runtime dependency.
 - When `dynamic-upstreams` begins replacing peer sets at runtime, should the balancer get an explicit "generation changed" signal, or detect it implicitly by comparing `peers.number` against a cached value?
 
 ### Design Rationale
@@ -340,7 +343,7 @@ That separation matters because mixing these responsibilities into one module cr
 
 - *The generation problem*: Peer identity is currently positional — peer index 0 is the first non-down peer in the list. If `dynamic-upstreams` changes that list (adds a peer, removes one, reorders), the mapping shifts. The Peer Identity Contract section above defines the generation boundary and what `dynamic-upstreams` must do to respect it.
 
-- *Healthcheck is not yet wired*: `peer.down` is the standard nginx signal for "this peer is out of rotation." The healthcheck module uses its own shared-memory `probe_healthy` field and does not set `peer.down`. Until a cross-module API is defined and implemented, sticky selection can pick peers that healthcheck considers unhealthy. The Healthcheck Integration Gap section documents the intended design.
+- *Healthcheck wiring*: `peer.down` is the standard nginx signal for "this peer is out of rotation," but the healthcheck module uses its own shared-memory `probe_healthy` field and does not set `peer.down`. The `is_eligible(p)` helper combines both: `peer.down == 0` AND `ngz_healthcheck_is_peer_eligible(peer.name) != 0`. This keeps probing logic out of the balancer and selection logic out of healthcheck.
 
 ### Example Target Config
 
@@ -366,7 +369,7 @@ http {
 ### Documentation Audit Checklist
 
 - [x] Audit date: 2026-05-07
-- [x] Phases 1, 2, and 3 implemented and integration-tested (12/12 tests passing).
+- [x] Phases 1, 2, and 3 implemented and integration-tested (15/15 tests passing).
 - [x] Affinity hash function named: CRC32-IsoHdlc (`std.hash.crc.Crc32`), `hash % eligible_peer_count`.
 - [x] Fallback semantics documented and test-backed for both `next` and `off`.
 - [x] Mutual-exclusion config error is detected and reported at parse time.

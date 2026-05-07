@@ -210,3 +210,83 @@ describe("upstream-balancer multi-worker consistency", () => {
     }
   });
 });
+
+// Phase 4: healthcheck integration.
+// When a peer probe marks a backend unhealthy, the balancer must exclude it
+// from sticky selection. Fail-open: peers with no probe always stay eligible.
+describe("upstream-balancer healthcheck integration", () => {
+  let backend1;
+  let backend2;
+
+  beforeAll(async () => {
+    backend1 = createHTTPMock(MOCK_PORTS.HTTP_UPSTREAM_1);
+    backend1.get("/probe", { status: 200, body: { status: "ok" } });
+    backend1.setDefault({ status: 200, body: { server: "backend1" } });
+
+    backend2 = createHTTPMock(MOCK_PORTS.HTTP_UPSTREAM_2);
+    backend2.get("/probe", { status: 200, body: { status: "ok" } });
+    backend2.setDefault({ status: 200, body: { server: "backend2" } });
+
+    await startNginz(`tests/${MODULE}/nginx-healthcheck-balancer.conf`, MODULE);
+    // Give both probes time to fire once and mark backends healthy.
+    await Bun.sleep(400);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    backend1.stop();
+    backend2.stop();
+    cleanupRuntime(MODULE);
+  });
+
+  test("both backends are reachable when both probes pass", async () => {
+    const servers = new Set();
+    // Use different keys to hit both peers via CRC32 % 2 distribution.
+    for (const key of ["hc-key-a", "hc-key-b", "hc-key-c", "hc-key-d"]) {
+      const res = await fetch(`${TEST_URL}/`, {
+        headers: { Cookie: `route=${key}` },
+      });
+      expect(res.status).toBe(200);
+      servers.add((await res.json()).server);
+    }
+    // With 4 distinct keys across 2 backends we should see both.
+    expect(servers.size).toBe(2);
+  });
+
+  test("unhealthy backend is excluded: all traffic shifts to the healthy peer", async () => {
+    // Make backend2's probe fail → should become ineligible.
+    backend2.get("/probe", { status: 500, body: { status: "fail" } });
+
+    // Wait for the probe to fire and detect the failure (interval=100ms, fails=1).
+    await Bun.sleep(400);
+
+    // With only 1 eligible peer, every key maps to backend1.
+    const servers = new Set();
+    for (let i = 0; i < 8; i++) {
+      const res = await fetch(`${TEST_URL}/`, {
+        headers: { Cookie: `route=hc-key-${i}` },
+      });
+      expect(res.status).toBe(200);
+      servers.add((await res.json()).server);
+    }
+    expect(servers).toEqual(new Set(["backend1"]));
+
+    // Restore backend2 so subsequent tests aren't affected.
+    backend2.get("/probe", { status: 200, body: { status: "ok" } });
+  });
+
+  test("backend recovers: traffic returns to both peers after probe succeeds", async () => {
+    // backend2 probe already restored above; wait for recovery (passes=1).
+    await Bun.sleep(400);
+
+    const servers = new Set();
+    for (const key of ["hc-key-a", "hc-key-b", "hc-key-c", "hc-key-d"]) {
+      const res = await fetch(`${TEST_URL}/`, {
+        headers: { Cookie: `route=${key}` },
+      });
+      expect(res.status).toBe(200);
+      servers.add((await res.json()).server);
+    }
+    expect(servers.size).toBe(2);
+  });
+});

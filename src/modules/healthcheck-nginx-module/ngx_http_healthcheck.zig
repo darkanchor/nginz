@@ -946,6 +946,29 @@ fn recordPeerProbeResult(entry: *PeerProbeEntry, result: ProbeResult) void {
     }
 }
 
+// ── Cross-module API ─────────────────────────────────────────────────────────
+
+// Returns 1 if the peer at addr_data/addr_len is eligible for selection,
+// 0 if it is known-unhealthy according to a configured peer probe.
+// Peers with no probe configured are considered eligible (fail-open).
+// Called per-request from the upstream-balancer module; no lock taken —
+// reading a single ngx_flag_t word is atomic on x86-64 and acceptable
+// for selection-time decisions where a stale read degrades gracefully.
+export fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int {
+    if (peer_probe_count == 0) return 1;
+    const addr = core.slicify(u8, addr_data, addr_len);
+    for (0..peer_probe_count) |i| {
+        const entry = &peer_probes[i];
+        if (entry.addr_len != addr_len) continue;
+        if (!std.mem.eql(u8, addr, entry.addr_buf[0..entry.addr_len])) continue;
+        const zone = entry.zone;
+        if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null) return 1;
+        const store = core.castPtr(healthcheck_store, zone.*.data) orelse return 1;
+        return if (store.*.probe_healthy != 0) 1 else 0;
+    }
+    return 1; // no probe configured for this peer — eligible
+}
+
 // ── Snapshot readers ─────────────────────────────────────────────────────────
 
 fn readStoreSnapshot() healthcheck_snapshot {
@@ -1636,7 +1659,6 @@ fn ngx_conf_set_health_upstream_probe_slow_start(cf: [*c]ngx_conf_t, cmd: [*c]ng
 
 fn ngx_conf_set_health_upstream_peer_probe(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, data: ?*anyopaque) callconv(.c) [*c]u8 {
     _ = cmd;
-    _ = data;
     const uscf = core.castPtr(http.ngx_http_upstream_srv_conf_t, conf.ngx_http_conf_get_module_srv_conf(cf, &ngx_http_upstream_module)) orelse
         return configError(cf, "health_upstream_peer_probe: upstream context unavailable");
     if (peer_probe_count >= MAX_PEER_PROBES) return configError(cf, "too many health_upstream_peer_probe entries");
@@ -1672,12 +1694,20 @@ fn ngx_conf_set_health_upstream_peer_probe(cf: [*c]ngx_conf_t, cmd: [*c]ngx_comm
     entry.port = port;
     entry.flags = flags;
 
-    // Set defaults (can be overridden by following directive calls)
+    // Set defaults, then inherit any upstream probe settings already configured
+    // in this upstream block (health_upstream_probe_interval etc.).
     entry.interval_ms = 5000;
     entry.timeout_ms = 1000;
     entry.fail_threshold = 2;
     entry.pass_threshold = 1;
     entry.slow_start_ms = 0;
+    if (core.castPtr(healthcheck_ups_conf, data)) |ucf| {
+        if (ucf.*.probe_interval_ms > 0) entry.interval_ms = ucf.*.probe_interval_ms;
+        if (ucf.*.probe_timeout_ms > 0) entry.timeout_ms = ucf.*.probe_timeout_ms;
+        if (ucf.*.probe_fail_threshold > 0) entry.fail_threshold = ucf.*.probe_fail_threshold;
+        if (ucf.*.probe_pass_threshold > 0) entry.pass_threshold = ucf.*.probe_pass_threshold;
+        if (ucf.*.probe_slow_start_ms > 0) entry.slow_start_ms = ucf.*.probe_slow_start_ms;
+    }
 
     // Copy peer address
     entry.addr_len = addr_val.len;
