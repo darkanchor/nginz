@@ -8,6 +8,28 @@ import {
 
 const MODULE = "dynamic-upstreams";
 
+async function getWorkerEvents(channel = "upstreams", since = null) {
+  const params = new URLSearchParams({ channel });
+  if (since != null) {
+    params.set("since", String(since));
+  }
+  const res = await fetch(`${TEST_URL}/worker-events?${params.toString()}`);
+  expect(res.status).toBe(200);
+  return res.json();
+}
+
+async function waitForWorkerEvents(predicate, channel = "upstreams", timeout = 4000, since = null) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const body = await getWorkerEvents(channel, since);
+    if (predicate(body)) {
+      return body;
+    }
+    await Bun.sleep(75);
+  }
+  throw new Error(`Timed out waiting for worker-events on channel ${channel}`);
+}
+
 describe("dynamic-upstreams Phase 1 — read-only introspection", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
@@ -26,6 +48,7 @@ describe("dynamic-upstreams Phase 1 — read-only introspection", () => {
     const body = await res.json();
     expect(body.module).toBe("dynamic_upstreams");
     expect(body.target).toBe("api_backend");
+    expect(body.source).toBe("static");
     expect(typeof body.generation).toBe("number");
     expect(typeof body.peer_count).toBe("number");
     expect(body.peer_count).toBeGreaterThanOrEqual(1);
@@ -146,5 +169,114 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
       body: JSON.stringify({ peers: [{ address: "localhost:8080" }] }),
     });
     expect(res.status).toBe(400);
+  });
+
+  test("PUT with duplicate peer addresses returns 400", async () => {
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19002", weight: 2 },
+        ],
+      }),
+    });
+    expect(res.status).toBe(400);
+
+    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(after.generation).toBe(before.generation);
+    expect(after.peer_count).toBe(before.peer_count);
+  });
+});
+
+describe("dynamic-upstreams Phase 3 — operational fields and worker-events fanout", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-phase3.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("GET exposes operational timestamp/error fields", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.last_error_code).toBe(0);
+    expect(body.last_error_at_msec).toBe(0);
+    expect(body.last_success_at_msec).toBe(0);
+  });
+
+  test("PUT without application/json content-type returns 415 and records last error", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002" }] }),
+    });
+    expect(res.status).toBe(415);
+
+    const body = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(body.last_error_code).toBe(415);
+    expect(body.last_error_at_msec).toBeGreaterThan(0);
+    expect(body.last_success_at_msec).toBe(0);
+  });
+
+  test("successful PUT updates success metadata and emits worker-events notification across workers", async () => {
+    const before = await getWorkerEvents();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 2 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const putBody = await res.json();
+    expect(putBody.status).toBe("ok");
+
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(state.generation).toBeGreaterThan(0);
+    expect(state.peer_count).toBe(2);
+    expect(state.last_error_code).toBe(0);
+    expect(state.last_success_at_msec).toBeGreaterThan(0);
+
+    const events = await waitForWorkerEvents(
+      (snapshot) => snapshot.events.length === 1,
+      "upstreams",
+      4000,
+      before.newest_generation,
+    );
+    expect(events.events[0].type).toBe("snapshot_activated");
+    const payload = JSON.parse(events.events[0].payload);
+    expect(payload).toEqual({
+      target: "api_backend",
+      source: "static",
+      generation: state.generation,
+      peer_count: 2,
+    });
+  });
+
+  test("invalid JSON records last failure without replacing the active snapshot", async () => {
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: "{not-json",
+    });
+    expect(res.status).toBe(400);
+
+    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(after.generation).toBe(before.generation);
+    expect(after.peer_count).toBe(before.peer_count);
+    expect(after.last_error_code).toBe(4001);
+    expect(after.last_error_at_msec).toBeGreaterThanOrEqual(after.last_success_at_msec);
   });
 });

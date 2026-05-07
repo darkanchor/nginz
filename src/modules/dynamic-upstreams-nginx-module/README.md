@@ -4,7 +4,7 @@ Planned runtime upstream reconfiguration module for updating peer tables without
 
 ### Status
 
-**Phase 1 + Phase 2 complete** — truthful introspection and atomic full-snapshot replacement are implemented and tested. Phase 3 (source polling, worker-events fanout, health-aware filtering) is not started.
+**Phase 1 + Phase 2 complete; Phase 3 started** — truthful introspection and atomic full-snapshot replacement are implemented and tested. Worker-events fanout and operational status fields are now live; source polling and health-aware activation are still pending.
 
 ### Purpose and Boundaries
 
@@ -45,6 +45,7 @@ This module should **not** own:
 | `dynamic_upstreams_source` | `<consul|static>` | `location` | Select the reconciliation source for the endpoint |
 | `dynamic_upstreams_target` | `<upstream_name>` | `location` | Bind the endpoint to an upstream group |
 | `dynamic_upstreams_refresh` | `<milliseconds>` | `location` | Configure background reconciliation cadence |
+| `dynamic_upstreams_worker_events_channel` | `<channel>` | `location` | Publish snapshot activation notifications to the worker-events default zone |
 
 ### Integration Points
 
@@ -413,16 +414,22 @@ Shared-memory snapshot replacement via `PUT`.
 | `dynamic_upstreams_api` | `location` | Installs the GET/PUT control handler |
 | `dynamic_upstreams_target <name>` | `location` | Binds the endpoint to a named upstream; resolved at config time |
 | `dynamic_upstreams_source static` | `location` | Accepted but no-op in Phase 2; any other value fails config load |
-| `dynamic_upstreams_refresh <ms>` | `location` | Stored but unused until Phase 3 |
+| `dynamic_upstreams_refresh <ms>` | `location` | Parsed and validated; still unused until source polling lands |
+| `dynamic_upstreams_worker_events_channel <channel>` | `location` | Optional worker-events fanout channel for `snapshot_activated` notifications |
 
-### Phase 3 — Not started
+### Phase 3 — In progress
 
-Requires the Phase 2 snapshot lifecycle to be stable first. Scope:
+Implemented in this slice:
 
-- **Worker-events fanout**: broadcast a snapshot-activated event after each successful `PUT` so all workers invalidate per-worker cached state promptly. Correctness does not depend on this; it only improves convergence speed.
+- **Worker-events fanout**: successful `PUT` publishes a `snapshot_activated` event to the configured `dynamic_upstreams_worker_events_channel`.
+- **Operational fields**: `GET` now exposes `last_success_at_msec`, `last_error_at_msec`, and `last_error_code`.
+- **Write-path guardrail**: `PUT` now requires `Content-Type: application/json` and records request-level failures in shared state for inspection.
+- **Multi-worker verification**: a Phase 3 test config with `worker_processes 2` verifies snapshot activation plus worker-events visibility.
+
+Still pending:
+
 - **Source polling**: timer-driven reconciliation loop, initially for a `static` file source, then `consul`. Must preserve last-good snapshot on source failure and document bounded retry/backoff.
 - **Health-aware activation**: at `PUT` time, query healthcheck state and exclude peers that are currently failing. Must apply at activation boundaries only — healthcheck must not mutate the active snapshot out of band.
-- **Operational fields**: expose `last_success_at_msec`, `last_error_at_msec`, `last_error_code` from `UpstreamStore` in the `GET` response.
 - **`dynamic_upstreams_refresh` enforcement**: wire the stored interval into the Phase 3 polling timer.
 
 ---
@@ -443,20 +450,8 @@ All slab allocations for a new snapshot (Snapshot struct, peers struct, N × pee
 
 **Better**: a dedicated per-store spinlock or an atomic compare-and-swap loop for the refcount increment, leaving the slab mutex for allocations only. Deferred to Phase 3 hardening.
 
-### 3. `new_peers->name` is null in snapshots
+### 3. Source polling and health-aware activation are still absent
 
-`ngx_http_upstream_rr_peers_t.name` (the upstream group name string) is never populated in dynamically built snapshots. Nginx internal code that dereferences `peers->name` (e.g., logging in some balancer paths) will see a zero-length string. This has not caused crashes in tested paths but is strictly incomplete.
+Phase 3 now covers operational metadata and worker-events fanout, but the control plane still only supports explicit static `PUT` replacement. There is no timer-driven refresh loop yet, and no activation-time filtering against healthcheck state.
 
-**Fix**: allocate the upstream name string in slab and assign it to `new_peers->name` during snapshot construction.
-
-### 4. Stack allocation of `urls[256]` + `specs[256]` in PUT body handler
-
-The address-validation loop in `du_put_body_handler` declares `var specs: [256]PeerSpec` and `var urls: [256]ngx_url_t` on the stack. Combined size is roughly 30 KB. This is within nginx worker stack limits under normal conditions but leaves little headroom if the call depth is deeper than expected.
-
-**Fix**: allocate both arrays from `r->pool` instead of the stack. Low priority while `MAX_PEERS_PER_PUT` stays at 256.
-
-### 5. Phase 2 integration tests do not cover multi-worker visibility
-
-The test suite runs a single-worker nginx instance. The property that "one worker activates a snapshot and another worker serves traffic from the new generation" is correct by construction (shared memory, slab mutex) but is not exercised by any current test.
-
-**Fix**: add a Phase 3 multi-worker test that activates a snapshot via one worker's API port and then verifies the other worker's proxy traffic routes to the new peers.
+**Fix**: add bounded polling first, then layer health-aware activation on top of the existing healthcheck peer-eligibility contract.
