@@ -151,6 +151,8 @@ pub inline fn ngx_http_conf_get_module_loc_conf(cf: [*c]ngx_conf_t, m: *ngx_modu
 }
 
 pub inline fn ngx_http_conf_upstream_srv_conf(uscf: [*c]http.ngx_http_upstream_srv_conf_t, m: *ngx_module_t) ?*anyopaque {
+    // Implicit upstreams (proxy_pass http://ip:port) have srv_conf == null
+    if (uscf.*.srv_conf == null) return null;
     return uscf.*.srv_conf[m.ctx_index];
 }
 
