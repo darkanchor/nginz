@@ -3,9 +3,12 @@
 nginz is a `nginx` module writer. It allows one to write nginx modules in `zig`. so far it 
 is based on official nginx release 1.30.0 and zig 0.16. nginz is tested with linux only.
 
-A companion project [nginz-njs](https://github.com/kaiwu/nginz-njs), provides Gleam/njs modules
-for policy orchestration, JWT claim routing, rate-limit response shaping, session management,
-and more — built on top of the native primitives exposed here.
+A companion project [nginz-njs](https://github.com/kaiwu/nginz-njs) provides the scripted
+Gleam/njs composition layer on top of the native primitives exposed here. It currently ships
+reusable modules such as `http_client`, `authz`, `workflow`, `feature_flags`, `session`,
+`mlcache`, `response_transform`, `webhook`, `metrics`, and `request_tracing`, keeping policy,
+orchestration, response shaping, experimentation, and observability in the scripted layer while
+leaving hot-path primitives and deep nginx integration native.
 
 The typical nginz workflow is following: 
 
