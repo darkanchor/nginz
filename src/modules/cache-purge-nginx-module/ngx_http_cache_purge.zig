@@ -95,6 +95,13 @@ const AuthMode = enum(c_uint) {
     unset = 255,
 };
 
+const WorkerEventsMode = enum(c_uint) {
+    off = 0,
+    per_target = 1,
+    summary = 2,
+    unset = 255,
+};
+
 // ── Location config ───────────────────────────────────────────────────────────
 
 const DEFAULT_MAX_KEYS: ngx_uint_t = 256;
@@ -106,6 +113,7 @@ const cache_purge_loc_conf = extern struct {
     auth_mode: AuthMode,
     max_keys: ngx_uint_t,
     worker_events_channel: ngx_str_t,
+    worker_events_mode: WorkerEventsMode,
     allowlist_entries: NArray(ngx_str_t),
 };
 
@@ -117,6 +125,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.auth_mode = .unset;
         p.*.max_keys = 0;
         p.*.worker_events_channel = ngx_null_str;
+        p.*.worker_events_mode = .unset;
         return p;
     }
     return null;
@@ -141,6 +150,9 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
         c.*.auth_mode = if (prev.*.auth_mode == .unset) .off else prev.*.auth_mode;
     }
     if (c.*.worker_events_channel.len == 0) c.*.worker_events_channel = prev.*.worker_events_channel;
+    if (c.*.worker_events_mode == .unset) {
+        c.*.worker_events_mode = if (prev.*.worker_events_mode == .unset) .per_target else prev.*.worker_events_mode;
+    }
     if (!c.*.allowlist_entries.inited() and prev.*.allowlist_entries.inited()) {
         c.*.allowlist_entries = prev.*.allowlist_entries;
     }
@@ -174,25 +186,32 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
 // ── Tag helpers ───────────────────────────────────────────────────────────────
 
 fn find_tag_idx(store: [*c]cache_tags_store, tag: []const u8) ?usize {
+    if (store.*.tag_count == 0) return null;
+    var active_seen: usize = 0;
     for (&store[0].tags, 0..) |*entry, i| {
         if (store[0].tag_used[i] != @as(u8, 1)) continue;
+        active_seen += 1;
         if (entry.tag_len != tag.len) continue;
         const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
         if (std.mem.eql(u8, entry_tag, tag)) return i;
+        if (active_seen == store.*.tag_count) break;
     }
     return null;
 }
 
 fn remove_tag_at(store: [*c]cache_tags_store, idx: usize) usize {
-    for (&store[0].tags, 0..) |*entry, i| {
-        if (i != idx) continue;
-        const count = entry.uri_count;
-        entry.* = std.mem.zeroes(TagEntry);
-        store[0].tag_used[i] = @as(u8, 0);
-        store.*.tag_count -= 1;
-        return count;
-    }
-    return 0;
+    if (idx >= MAX_TAGS or store[0].tag_used[idx] != @as(u8, 1)) return 0;
+    const entry = &store[0].tags[idx];
+    const count = entry.uri_count;
+    entry.* = std.mem.zeroes(TagEntry);
+    store[0].tag_used[idx] = @as(u8, 0);
+    store.*.tag_count -= 1;
+    return count;
+}
+
+fn purge_exact_tag(store: [*c]cache_tags_store, target: []const u8) usize {
+    const idx = find_tag_idx(store, target) orelse return 0;
+    return remove_tag_at(store, idx);
 }
 
 fn match_mode_label(mode: MatchMode) []const u8 {
@@ -213,22 +232,34 @@ fn tag_matches(mode: MatchMode, candidate: []const u8, target: []const u8) bool 
 }
 
 fn purge_matching_tags(store: [*c]cache_tags_store, target: []const u8, mode: MatchMode) usize {
+    if (mode == .exact) {
+        return purge_exact_tag(store, target);
+    }
+
+    if (store.*.tag_count == 0) return 0;
     var total: usize = 0;
     var idx: usize = 0;
+    var active_seen: usize = 0;
     while (idx < MAX_TAGS) {
         if (store[0].tag_used[idx] != @as(u8, 1)) {
             idx += 1;
             continue;
         }
 
+        active_seen += 1;
+
         const entry = &store[0].tags[idx];
         const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
         if (!tag_matches(mode, entry_tag, target)) {
+            if (active_seen == store.*.tag_count) break;
             idx += 1;
             continue;
         }
 
         total += remove_tag_at(store, idx);
+        active_seen -= 1;
+        if (store.*.tag_count == 0) break;
+        if (active_seen == store.*.tag_count) break;
     }
     return total;
 }
@@ -342,6 +373,74 @@ fn append_usize(p: *[*]u8, end: [*]u8, value: usize) void {
     append(p, end, tmp[0..n]);
 }
 
+fn trim_ascii_space(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \t\r\n");
+}
+
+fn try_parse_single_target_fast(body: []const u8) ?[]const u8 {
+    const trimmed = trim_ascii_space(body);
+    const prefix = "{\"targets\":[\"";
+    const suffix = "\"]}";
+
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    if (!std.mem.endsWith(u8, trimmed, suffix)) return null;
+
+    const inner = trimmed[prefix.len .. trimmed.len - suffix.len];
+    if (inner.len == 0 or inner.len > MAX_TAG_LEN) return null;
+    if (std.mem.indexOfScalar(u8, inner, '"') != null) return null;
+    if (std.mem.indexOfScalar(u8, inner, '\\') != null) return null;
+    return inner;
+}
+
+fn send_single_target_response(
+    r: [*c]ngx_http_request_t,
+    lccf: *cache_purge_loc_conf,
+    target: []const u8,
+    purged: usize,
+) void {
+    const match_label = match_mode_label(lccf.*.match_mode);
+    const est_size = 192 + lccf.*.zone_name.len + match_label.len + 2 * json_escape_len(target);
+    const resp_raw = core.ngx_pnalloc(r.*.pool, est_size) orelse {
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+    const resp_mem: [*c]u8 = @ptrCast(@alignCast(resp_raw));
+    var w: [*]u8 = resp_mem;
+    const w_end = w + est_size;
+
+    append(&w, w_end, "{\"module\":\"cache_purge\",\"zone\":\"");
+    if (lccf.*.zone_name.len > 0 and lccf.*.zone_name.data != null) {
+        append_escaped(&w, w_end, core.slicify(u8, lccf.*.zone_name.data, lccf.*.zone_name.len));
+    }
+    append(&w, w_end, "\",\"match\":\"");
+    append(&w, w_end, match_label);
+    append(&w, w_end, "\",\"requested\":1,\"purged\":");
+    append_usize(&w, w_end, purged);
+    append(&w, w_end, ",\"missing\":");
+    append_usize(&w, w_end, if (purged == 0) @as(usize, 1) else @as(usize, 0));
+    append(&w, w_end, ",\"rejected\":0,\"results\":[{\"target\":\"");
+    append_escaped(&w, w_end, target);
+    append(&w, w_end, "\",\"purged\":");
+    append_usize(&w, w_end, purged);
+    append(&w, w_end, "}]}");
+
+    const resp_body = ngx_str_t{
+        .data = resp_mem,
+        .len = @intCast(@intFromPtr(w) - @intFromPtr(resp_mem)),
+    };
+
+    if (purged > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
+        switch (lccf.*.worker_events_mode) {
+            .off => {},
+            .summary => publish_purge_summary_event(lccf.*.worker_events_channel, 1, purged, 0, lccf.*.match_mode),
+            .per_target, .unset => publish_purge_event(lccf.*.worker_events_channel, target, purged, lccf.*.match_mode),
+        }
+    }
+
+    _ = send_json_response(r, http.NGX_HTTP_OK, resp_body);
+    http.ngx_http_finalize_request(r, NGX_OK);
+}
+
 fn publish_purge_event(channel: ngx_str_t, target: []const u8, purged: usize, mode: MatchMode) void {
     const zone = ngx_http_worker_events_default_zone;
     if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
@@ -359,6 +458,40 @@ fn publish_purge_event(channel: ngx_str_t, target: []const u8, purged: usize, mo
     append_escaped(&w, w_end, target);
     append(&w, w_end, "\",\"purged\":");
     append_usize(&w, w_end, purged);
+    append(&w, w_end, "}");
+
+    const payload_str = ngx_str_t{
+        .len = @intCast(@intFromPtr(w) - @intFromPtr(&payload_buf)),
+        .data = @ptrCast(&payload_buf),
+    };
+    _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
+}
+
+fn publish_purge_summary_event(
+    channel: ngx_str_t,
+    requested: usize,
+    purged: usize,
+    missing: usize,
+    mode: MatchMode,
+) void {
+    const zone = ngx_http_worker_events_default_zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
+    if (channel.len == 0 or channel.data == null) return;
+
+    const event_type = ngx_string("purge_batch");
+    const mode_label = match_mode_label(mode);
+    var payload_buf: [256]u8 = undefined;
+    var w: [*]u8 = &payload_buf;
+    const w_end = w + payload_buf.len;
+
+    append(&w, w_end, "{\"match\":\"");
+    append(&w, w_end, mode_label);
+    append(&w, w_end, "\",\"requested\":");
+    append_usize(&w, w_end, requested);
+    append(&w, w_end, ",\"purged\":");
+    append_usize(&w, w_end, purged);
+    append(&w, w_end, ",\"missing\":");
+    append_usize(&w, w_end, missing);
     append(&w, w_end, "}");
 
     const payload_str = ngx_str_t{
@@ -443,6 +576,27 @@ fn purge_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST, ngx_string("{\"module\":\"cache_purge\",\"status\":\"error\",\"error\":\"empty request body\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
         return;
+    }
+
+    const body_slice = core.slicify(u8, body_str.data, body_str.len);
+
+    if (lccf.*.match_mode == .exact) {
+        if (try_parse_single_target_fast(body_slice)) |target| {
+            const store = get_tags_store();
+            const store_shpool = get_tags_shpool();
+            if (store == null or store_shpool == null) {
+                _ = send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE, ngx_string("{\"module\":\"cache_purge\",\"status\":\"error\",\"error\":\"purge metadata unavailable\"}"));
+                http.ngx_http_finalize_request(r, http.NGX_HTTP_SERVICE_UNAVAILABLE);
+                return;
+            }
+
+            shm.ngx_shmtx_lock(&store_shpool.?.*.mutex);
+            const purged = purge_exact_tag(store.?, target);
+            shm.ngx_shmtx_unlock(&store_shpool.?.*.mutex);
+
+            send_single_target_response(r, lccf, target, purged);
+            return;
+        }
     }
 
     var cj = CJSON.init(r.*.pool);
@@ -615,11 +769,25 @@ fn purge_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     };
 
     if (target_count > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
-        for (0..target_count) |i| {
-            const result = results.?[i];
-            if (result.found != 1 or result.purged == 0 or result.target_len == 0) continue;
-            const target: []const u8 = @ptrCast(result.target[0..result.target_len]);
-            publish_purge_event(lccf.*.worker_events_channel, target, result.purged, lccf.*.match_mode);
+        switch (lccf.*.worker_events_mode) {
+            .off => {},
+            .summary => {
+                if (total_purged > 0) {
+                    publish_purge_summary_event(
+                        lccf.*.worker_events_channel,
+                        target_count,
+                        total_purged,
+                        total_missing,
+                        lccf.*.match_mode,
+                    );
+                }
+            },
+            .per_target, .unset => for (0..target_count) |i| {
+                const result = results.?[i];
+                if (result.found != 1 or result.purged == 0 or result.target_len == 0) continue;
+                const target: []const u8 = @ptrCast(result.target[0..result.target_len]);
+                publish_purge_event(lccf.*.worker_events_channel, target, result.purged, lccf.*.match_mode);
+            },
         }
     }
 
@@ -807,6 +975,30 @@ fn ngx_conf_set_cache_purge_worker_events_channel(
     return conf.NGX_CONF_OK;
 }
 
+fn ngx_conf_set_cache_purge_worker_events_mode(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(cache_purge_loc_conf, loc)) |lccf| {
+        var i: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
+            const slice = core.slicify(u8, arg.*.data, arg.*.len);
+            if (std.mem.eql(u8, slice, "off")) {
+                lccf.*.worker_events_mode = .off;
+            } else if (std.mem.eql(u8, slice, "per_target")) {
+                lccf.*.worker_events_mode = .per_target;
+            } else if (std.mem.eql(u8, slice, "summary")) {
+                lccf.*.worker_events_mode = .summary;
+            } else {
+                return @constCast("cache_purge_worker_events_mode must be off, per_target, or summary");
+            }
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
 // ── Postconfiguration ─────────────────────────────────────────────────────────
 
 fn zone_init_noop(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) callconv(.c) ngx_int_t {
@@ -894,6 +1086,14 @@ export const ngx_http_cache_purge_commands = [_]ngx_command_t{
         .name = ngx_string("cache_purge_max_keys"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
         .set = ngx_conf_set_cache_purge_max_keys,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("cache_purge_worker_events_mode"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = ngx_conf_set_cache_purge_worker_events_mode,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,

@@ -171,6 +171,10 @@ fn getMetricsShpool() ?[*c]core.ngx_slab_pool_t {
     return core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr);
 }
 
+fn atomicLoadMetric(ptr: *const u64) u64 {
+    return @atomicLoad(u64, ptr, .monotonic);
+}
+
 const BalancerMetric = enum {
     requests_total,
     sticky_cookie_requests_total,
@@ -192,36 +196,47 @@ const BalancerMetric = enum {
 
 fn incrementMetric(metric: BalancerMetric) void {
     const store = getMetricsStore() orelse return;
-    const shpool = getMetricsShpool() orelse return;
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
     switch (metric) {
-        .requests_total => store.*.requests_total += 1,
-        .sticky_cookie_requests_total => store.*.sticky_cookie_requests_total += 1,
-        .sticky_header_requests_total => store.*.sticky_header_requests_total += 1,
-        .runtime_peer_source_requests_total => store.*.runtime_peer_source_requests_total += 1,
-        .direct_peer_hits => store.*.direct_peer_hits += 1,
-        .hash_hits => store.*.hash_hits += 1,
-        .key_absent_misses => store.*.key_absent_misses += 1,
-        .direct_peer_misses => store.*.direct_peer_misses += 1,
-        .fallback_next_total => store.*.fallback_next_total += 1,
-        .fallback_off_total => store.*.fallback_off_total += 1,
-        .cookies_issued_total => store.*.cookies_issued_total += 1,
-        .cookies_rotated_total => store.*.cookies_rotated_total += 1,
-        .peer_rejections_tried_total => store.*.peer_rejections_tried_total += 1,
-        .peer_rejections_unhealthy_total => store.*.peer_rejections_unhealthy_total += 1,
-        .peer_rejections_fail_window_total => store.*.peer_rejections_fail_window_total += 1,
-        .peer_rejections_max_conns_total => store.*.peer_rejections_max_conns_total += 1,
+        .requests_total => _ = @atomicRmw(u64, &store.*.requests_total, .Add, 1, .monotonic),
+        .sticky_cookie_requests_total => _ = @atomicRmw(u64, &store.*.sticky_cookie_requests_total, .Add, 1, .monotonic),
+        .sticky_header_requests_total => _ = @atomicRmw(u64, &store.*.sticky_header_requests_total, .Add, 1, .monotonic),
+        .runtime_peer_source_requests_total => _ = @atomicRmw(u64, &store.*.runtime_peer_source_requests_total, .Add, 1, .monotonic),
+        .direct_peer_hits => _ = @atomicRmw(u64, &store.*.direct_peer_hits, .Add, 1, .monotonic),
+        .hash_hits => _ = @atomicRmw(u64, &store.*.hash_hits, .Add, 1, .monotonic),
+        .key_absent_misses => _ = @atomicRmw(u64, &store.*.key_absent_misses, .Add, 1, .monotonic),
+        .direct_peer_misses => _ = @atomicRmw(u64, &store.*.direct_peer_misses, .Add, 1, .monotonic),
+        .fallback_next_total => _ = @atomicRmw(u64, &store.*.fallback_next_total, .Add, 1, .monotonic),
+        .fallback_off_total => _ = @atomicRmw(u64, &store.*.fallback_off_total, .Add, 1, .monotonic),
+        .cookies_issued_total => _ = @atomicRmw(u64, &store.*.cookies_issued_total, .Add, 1, .monotonic),
+        .cookies_rotated_total => _ = @atomicRmw(u64, &store.*.cookies_rotated_total, .Add, 1, .monotonic),
+        .peer_rejections_tried_total => _ = @atomicRmw(u64, &store.*.peer_rejections_tried_total, .Add, 1, .monotonic),
+        .peer_rejections_unhealthy_total => _ = @atomicRmw(u64, &store.*.peer_rejections_unhealthy_total, .Add, 1, .monotonic),
+        .peer_rejections_fail_window_total => _ = @atomicRmw(u64, &store.*.peer_rejections_fail_window_total, .Add, 1, .monotonic),
+        .peer_rejections_max_conns_total => _ = @atomicRmw(u64, &store.*.peer_rejections_max_conns_total, .Add, 1, .monotonic),
     }
-    shm.ngx_shmtx_unlock(&shpool.*.mutex);
 }
 
 fn snapshotMetrics() ?balancer_metrics_store {
     const store = getMetricsStore() orelse return null;
-    const shpool = getMetricsShpool() orelse return null;
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
-    const snapshot = store.*;
-    shm.ngx_shmtx_unlock(&shpool.*.mutex);
-    return snapshot;
+    return balancer_metrics_store{
+        .initialized = store.*.initialized,
+        .requests_total = atomicLoadMetric(&store.*.requests_total),
+        .sticky_cookie_requests_total = atomicLoadMetric(&store.*.sticky_cookie_requests_total),
+        .sticky_header_requests_total = atomicLoadMetric(&store.*.sticky_header_requests_total),
+        .runtime_peer_source_requests_total = atomicLoadMetric(&store.*.runtime_peer_source_requests_total),
+        .direct_peer_hits = atomicLoadMetric(&store.*.direct_peer_hits),
+        .hash_hits = atomicLoadMetric(&store.*.hash_hits),
+        .key_absent_misses = atomicLoadMetric(&store.*.key_absent_misses),
+        .direct_peer_misses = atomicLoadMetric(&store.*.direct_peer_misses),
+        .fallback_next_total = atomicLoadMetric(&store.*.fallback_next_total),
+        .fallback_off_total = atomicLoadMetric(&store.*.fallback_off_total),
+        .cookies_issued_total = atomicLoadMetric(&store.*.cookies_issued_total),
+        .cookies_rotated_total = atomicLoadMetric(&store.*.cookies_rotated_total),
+        .peer_rejections_tried_total = atomicLoadMetric(&store.*.peer_rejections_tried_total),
+        .peer_rejections_unhealthy_total = atomicLoadMetric(&store.*.peer_rejections_unhealthy_total),
+        .peer_rejections_fail_window_total = atomicLoadMetric(&store.*.peer_rejections_fail_window_total),
+        .peer_rejections_max_conns_total = atomicLoadMetric(&store.*.peer_rejections_max_conns_total),
+    };
 }
 
 fn balancer_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) callconv(.c) ngx_int_t {

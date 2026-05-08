@@ -4,7 +4,7 @@ Planned selective cache-purge API for operational cache invalidation beyond raw 
 
 ### Status
 
-**Feature Ready for bounded operator workflows** - the module exposes a real `POST` JSON purge API, exact and prefix invalidation against the shared `cache-tags` metadata store, optional IP/CIDR allowlist authorization, multi-worker metadata mutation, and per-target worker-events notifications when configured. `glob` matching and `signed-token` authorization remain intentionally deferred.
+**Feature Ready for bounded operator workflows** - the module exposes a real `POST` JSON purge API, exact and prefix invalidation against the shared `cache-tags` metadata store, optional IP/CIDR allowlist authorization, multi-worker metadata mutation, and configurable worker-events fanout when configured. `glob` matching and `signed-token` authorization remain intentionally deferred.
 
 ### Purpose and Boundaries
 
@@ -28,7 +28,10 @@ This module should **not** own:
 - `cache_purge_api` installs a `POST`-only JSON purge endpoint.
 - Request body shape is `{"targets":["tag-a","tag-b"]}`.
 - Exact and prefix invalidation remove matching entries from the shared `cache-tags` metadata store and return per-target accounting.
-- `cache_purge_worker_events_channel <channel>` optionally publishes one `purged` event per mutated target through the worker-events default zone.
+- Exact invalidation uses a direct shared-store lookup/remove path; it does not scan the full tag table unless a broader match mode requires it.
+- The common exact single-target request shape `{"targets":["tag-a"]}` has a narrow fast path that skips the general JSON parser and falls back to the normal parser for any more complex body shape.
+- `cache_purge_worker_events_channel <channel>` optionally publishes purge notifications through the worker-events default zone.
+- `cache_purge_worker_events_mode <off|per_target|summary>` lets operators trade event detail for lower purge-path fanout cost.
 - `cache_purge_authorize allowlist` gates the purge endpoint by client IP/CIDR via `cache_purge_allowlist`.
 - `cache_purge_match glob` and `cache_purge_authorize signed-token` remain config-time rejections until their cost and request contracts are defined.
 - `cache_purge_zone` is currently limited to the single cache-tags metadata store and only accepts `default` or `cache_tags_zone`.
@@ -58,7 +61,18 @@ This module should **not** own:
 | `cache_purge_authorize` | `<off|allowlist|signed-token>` | `location` | Define the planned authorization mode |
 | `cache_purge_allowlist` | `<ip-or-cidr> [ip-or-cidr ...]` | `location` | Define the client IP/CIDR allowlist used when `cache_purge_authorize allowlist` is enabled |
 | `cache_purge_max_keys` | `<count>` | `location` | Bound batch invalidation request size |
+| `cache_purge_worker_events_mode` | `<off|per_target|summary>` | `location` | Control whether successful purges emit no events, one event per mutated target, or one batch summary event |
 | `cache_purge_worker_events_channel` | `<channel>` | `location` | Optionally publish per-target invalidation events to the worker-events default zone |
+
+There is currently **no separate performance directive** for the fast exact-path behavior. If the request uses `cache_purge_match exact`, the module applies the cheaper path automatically when the body is the compact single-target JSON shape and falls back to the general parser otherwise.
+
+`cache_purge_worker_events_mode` is the explicit runtime tradeoff knob:
+
+- `per_target` keeps the original high-detail behavior and emits one `purged` event for each mutated target
+- `summary` emits one `purge_batch` event containing `requested`, `purged`, and `missing`
+- `off` skips worker-events publication entirely on the purge path
+
+`per_target` remains the default so existing integrations keep working unchanged.
 
 ### Integration Points
 
@@ -235,6 +249,17 @@ Add optional advanced matching, authorization depth, and fanout integration.
 - Invalid match/auth modes should fail at config time or return deterministic validation errors
 - Shared-memory or metadata lookup failures must not produce silent partial invalidation
 - Zero-hit invalidations should be explicit and inspectable rather than ambiguous success
+
+### Performance Notes
+
+- The first tuning priority is the exact-match operator path, because that is the common control-plane action in the combo perf harness.
+- `cache_purge_match exact` is the cheapest mode. It uses direct lookup/removal against the shared metadata store.
+- `cache_purge_match prefix` is intentionally more expensive because it must scan the bounded metadata set for matches.
+- The single-target exact fast path is deliberately narrow:
+  - accepted fast-shape: `{"targets":["tag-a"]}`
+  - no escapes inside the target string
+  - any other valid request body still works, but uses the normal parser path
+- This is an implementation optimization, not a separate API contract. Users do not need to opt in.
 
 ### Observability
 

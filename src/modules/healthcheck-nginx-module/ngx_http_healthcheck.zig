@@ -226,6 +226,7 @@ const ProbeResult = struct {
 
 const MAX_PEER_PROBES: usize = 64;
 const MAX_PEER_ADDR_LEN: usize = 63;
+const PEER_PROBE_INDEX_SLOTS: usize = 128;
 
 const PeerProbeEntry = struct {
     interval_ms: ngx_msec_t,
@@ -301,6 +302,7 @@ var upstream_probe_count: usize = 0;
 
 var peer_probes: [MAX_PEER_PROBES]PeerProbeEntry = undefined;
 var peer_probe_count: usize = 0;
+var peer_probe_index_slots: [PEER_PROBE_INDEX_SLOTS]u8 = [_]u8{0} ** PEER_PROBE_INDEX_SLOTS;
 
 // ── Shared memory helpers ────────────────────────────────────────────────────
 
@@ -946,6 +948,43 @@ fn recordPeerProbeResult(entry: *PeerProbeEntry, result: ProbeResult) void {
     }
 }
 
+fn peerProbeHash(addr: []const u8) usize {
+    return @as(usize, std.hash.crc.Crc32.hash(addr)) % PEER_PROBE_INDEX_SLOTS;
+}
+
+fn rebuildPeerProbeIndex() void {
+    @memset(peer_probe_index_slots[0..], 0);
+    for (0..peer_probe_count) |i| {
+        const entry = &peer_probes[i];
+        if (entry.addr_len == 0) continue;
+        var slot = peerProbeHash(entry.addr_buf[0..entry.addr_len]);
+        var remaining = PEER_PROBE_INDEX_SLOTS;
+        while (remaining > 0) : (remaining -= 1) {
+            if (peer_probe_index_slots[slot] == 0) {
+                peer_probe_index_slots[slot] = @as(u8, @intCast(i + 1));
+                break;
+            }
+            slot = (slot + 1) % PEER_PROBE_INDEX_SLOTS;
+        }
+    }
+}
+
+fn findPeerProbeEntry(addr: []const u8) ?*const PeerProbeEntry {
+    if (peer_probe_count == 0) return null;
+    var slot = peerProbeHash(addr);
+    var remaining = PEER_PROBE_INDEX_SLOTS;
+    while (remaining > 0) : (remaining -= 1) {
+        const entry_idx_plus_one = peer_probe_index_slots[slot];
+        if (entry_idx_plus_one == 0) return null;
+        const entry = &peer_probes[entry_idx_plus_one - 1];
+        if (entry.addr_len == addr.len and std.mem.eql(u8, addr, entry.addr_buf[0..entry.addr_len])) {
+            return entry;
+        }
+        slot = (slot + 1) % PEER_PROBE_INDEX_SLOTS;
+    }
+    return null;
+}
+
 // ── Cross-module API ─────────────────────────────────────────────────────────
 
 // Returns 1 if the peer at addr_data/addr_len is eligible for selection,
@@ -957,20 +996,15 @@ fn recordPeerProbeResult(entry: *PeerProbeEntry, result: ProbeResult) void {
 export fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int {
     if (peer_probe_count == 0) return 1;
     const addr = core.slicify(u8, addr_data, addr_len);
-    for (0..peer_probe_count) |i| {
-        const entry = &peer_probes[i];
-        if (entry.addr_len != addr_len) continue;
-        if (!std.mem.eql(u8, addr, entry.addr_buf[0..entry.addr_len])) continue;
-        const zone = entry.zone;
-        if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null) return 1;
-        const store = core.castPtr(healthcheck_store, zone.*.data) orelse return 1;
-        // Conservative slow-start contract for selection:
-        // a recovered peer stays out of sticky rotation until its slow-start
-        // ramp completes and probe_recovered_at_ms is cleared.
-        if (store.*.probe_healthy == 0) return 0;
-        if (store.*.probe_recovered_at_ms > 0) return 0;
-        return 1;
-    }
+    const entry = findPeerProbeEntry(addr) orelse return 1;
+    const zone = entry.zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null) return 1;
+    const store = core.castPtr(healthcheck_store, zone.*.data) orelse return 1;
+    // Conservative slow-start contract for selection:
+    // a recovered peer stays out of sticky rotation until its slow-start
+    // ramp completes and probe_recovered_at_ms is cleared.
+    if (store.*.probe_healthy == 0) return 0;
+    if (store.*.probe_recovered_at_ms > 0) return 0;
     return 1; // no probe configured for this peer — eligible
 }
 
@@ -1748,6 +1782,7 @@ fn ngx_conf_set_health_upstream_peer_probe(cf: [*c]ngx_conf_t, cmd: [*c]ngx_comm
     }
     zone.*.init = upstream_probe_zone_init;
     entry.zone = zone;
+    rebuildPeerProbeIndex();
 
     return conf.NGX_CONF_OK;
 }
@@ -1878,6 +1913,7 @@ fn preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     // Reset per-config-cycle globals before directive parsing starts.
     upstream_probe_count = 0;
     peer_probe_count = 0;
+    @memset(peer_probe_index_slots[0..], 0);
     return NGX_OK;
 }
 

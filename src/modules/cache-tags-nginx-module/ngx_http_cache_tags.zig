@@ -206,19 +206,10 @@ fn ngx_http_cache_tags_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaqu
 
 // Find or create a tag entry
 fn findOrCreateTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
-    // First, look for existing tag
-    for (&store[0].tags, 0..) |*entry, i| {
-        const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
-        if (store[0].tag_used[i] == @as(u8, 1) and entry.tag_len == tag.len and std.mem.eql(u8, entry_tag, tag)) {
-            return entry;
-        }
-    }
-
-    // Create new tag entry
-    if (store.*.tag_count >= MAX_TAGS) return null;
-
-    for (&store[0].tags, 0..) |*entry, i| {
-        if (store[0].tag_used[i] == @as(u8, 0)) {
+    if (store.*.tag_count == 0) {
+        if (store.*.tag_count >= MAX_TAGS) return null;
+        for (&store[0].tags, 0..) |*entry, i| {
+            if (store[0].tag_used[i] != @as(u8, 0)) continue;
             entry.* = std.mem.zeroes(TagEntry);
             const len = @min(tag.len, MAX_TAG_LEN);
             entry.tag_len = len;
@@ -227,23 +218,53 @@ fn findOrCreateTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
             store.*.tag_count += 1;
             return entry;
         }
+        return null;
+    }
+
+    // First, look for existing tag
+    var active_seen: usize = 0;
+    for (&store[0].tags, 0..) |*entry, i| {
+        if (store[0].tag_used[i] != @as(u8, 1)) continue;
+        active_seen += 1;
+        const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
+        if (entry.tag_len == tag.len and std.mem.eql(u8, entry_tag, tag)) return entry;
+        if (active_seen == store.*.tag_count) break;
+    }
+
+    // Create new tag entry
+    if (store.*.tag_count >= MAX_TAGS) return null;
+
+    for (&store[0].tags, 0..) |*entry, i| {
+        if (store[0].tag_used[i] != @as(u8, 0)) continue;
+        entry.* = std.mem.zeroes(TagEntry);
+        const len = @min(tag.len, MAX_TAG_LEN);
+        entry.tag_len = len;
+        @memcpy(entry.tag[0..len], tag[0..len]);
+        store[0].tag_used[i] = @as(u8, 1);
+        store.*.tag_count += 1;
+        return entry;
     }
     return null;
 }
 
 // Find a tag entry (read-only)
 fn findTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
+    if (store.*.tag_count == 0) return null;
+    var active_seen: usize = 0;
     for (&store[0].tags, 0..) |*entry, i| {
+        if (store[0].tag_used[i] != @as(u8, 1)) continue;
+        active_seen += 1;
         const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
-        if (store[0].tag_used[i] == @as(u8, 1) and entry.tag_len == tag.len and std.mem.eql(u8, entry_tag, tag)) {
-            return entry;
-        }
+        if (entry.tag_len == tag.len and std.mem.eql(u8, entry_tag, tag)) return entry;
+        if (active_seen == store.*.tag_count) break;
     }
     return null;
 }
 
 // Add a URI to a tag
 fn addUriToTag(tag_entry: *TagEntry, uri: []const u8) void {
+    if (tag_entry.uri_count >= MAX_URIS_PER_TAG) return;
+
     // Check if URI already exists
     for (0..tag_entry.uri_count) |i| {
         if (tag_entry.uri_lens[i] == uri.len and
@@ -252,9 +273,6 @@ fn addUriToTag(tag_entry: *TagEntry, uri: []const u8) void {
             return; // Already exists
         }
     }
-
-    // Add new URI
-    if (tag_entry.uri_count >= MAX_URIS_PER_TAG) return;
 
     const len = @min(uri.len, MAX_URI_LEN);
     @memcpy(tag_entry.uris[tag_entry.uri_count][0..len], uri[0..len]);
@@ -287,15 +305,20 @@ fn associateTagsWithUri(store: [*c]cache_tags_store, tags_str: []const u8, uri: 
 
 // Purge all URIs associated with a tag, returns count
 fn purgeByTag(store: [*c]cache_tags_store, tag: []const u8) usize {
+    if (store.*.tag_count == 0) return 0;
+    var active_seen: usize = 0;
     for (&store[0].tags, 0..) |*entry, i| {
+        if (store[0].tag_used[i] != @as(u8, 1)) continue;
+        active_seen += 1;
         const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
-        if (store[0].tag_used[i] == @as(u8, 1) and entry.tag_len == tag.len and std.mem.eql(u8, entry_tag, tag)) {
+        if (entry.tag_len == tag.len and std.mem.eql(u8, entry_tag, tag)) {
             const count = entry.uri_count;
             entry.* = std.mem.zeroes(TagEntry);
             store[0].tag_used[i] = @as(u8, 0);
             store.*.tag_count -= 1;
             return count;
         }
+        if (active_seen == store.*.tag_count) break;
     }
     return 0;
 }

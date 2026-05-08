@@ -37,6 +37,7 @@ This module should **not** own:
 - Sticky hashing applies only to the primary peer chain. If no primary peer is usable and `fallback next` is enabled, nginx's stock round-robin fallback may route to backup peers.
 - Cookie mode can issue sticky cookies when the request has no affinity key, and can rotate a stale direct-peer cookie onto a live peer during fallback.
 - `upstream_balancer_status` exposes a shared-memory JSON snapshot of sticky decisions, cookie lifecycle counters, and peer-rejection reasons.
+- Hot-path status counters are updated with atomic increments rather than a shared mutex, so enabling `upstream_balancer_status` does not add lock traffic to each sticky request.
 - A future runtime mutator can register a request-pinned peer source through `upstream_balancer_register_peer_source()` without changing the balancer callback contract.
 - Once a sticky-selected peer is chosen, connect/send/receive failures flow through nginx's normal upstream retry and failure-accounting path. The next request sees updated `max_fails` / `fail_timeout` state.
 - `upstream_balancer_sticky_cookie` and `upstream_balancer_sticky_header` are mutually exclusive; a config with both in one upstream block fails at parse time.
@@ -76,6 +77,8 @@ This module should **not** own:
 | `upstream_balancer_status` | `;` | `location` | Expose JSON metrics for sticky decisions and cookie lifecycle events |
 
 Mutual exclusion: `sticky_cookie` and `sticky_header` cannot both appear in the same upstream block. Config load fails immediately if they do.
+
+There is currently **no runtime or compile-time option** for the atomic counter path behind `upstream_balancer_status`. It is the default implementation because it keeps the observability surface while reducing steady-state request cost.
 
 ### Integration Points
 
@@ -300,6 +303,12 @@ The following events are logged at `NGX_LOG_DEBUG` level (requires `error_log ..
 - cookie issue/rotation totals
 - peer rejection totals by reason (`tried`, `unhealthy`, `fail window`, `max_conns`)
 - runtime peer-source request count
+
+Performance note:
+
+- The status surface is intentionally cheap enough to leave compiled in.
+- Counter updates are atomic and lock-free on the request path.
+- JSON status rendering still happens only when the status endpoint is requested; it is not part of normal proxy traffic.
 
 ### Peer Identity Contract
 

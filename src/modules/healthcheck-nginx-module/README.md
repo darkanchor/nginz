@@ -114,6 +114,7 @@ That remaining work belongs at the integration boundary with `upstream-balancer`
 - Fail/pass thresholds are there to avoid flapping under a noisy backend.
 - Service-level readiness currently follows the service-level `health_probe`; upstream and peer probe failures are reported, but do not yet change `/ready` by themselves.
 - Upstream peer selection can consume probe state through `upstream-balancer`, which excludes unhealthy peers and peers still inside slow-start recovery.
+- The peer-eligibility lookup used by `upstream-balancer` is indexed by peer address rather than linearly scanning every configured peer probe, so read-path cost stays bounded as probe count grows.
 - Slow-start metadata is not a general-purpose traffic shaper; it is currently used only by the balancer-side peer-eligibility check.
 
 ### Phases
