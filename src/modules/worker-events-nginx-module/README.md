@@ -346,16 +346,48 @@ Stabilize the event shapes emitted by native consumers so operators and future c
 
 **TODO**
 
-- [ ] Standardize event payload fields for `snapshot_activated`, `snapshot_restored`, `peer_draining`, `peer_undrained`, and refresh-failure notifications.
-- [ ] Keep payloads small and flat: upstream name, generation, source, peer count, peer address, and error code are in scope; full peer lists are not.
-- [ ] Document which events are best-effort observability signals versus those consumers may actively react to.
-- [ ] Preserve existing overwrite-oldest semantics; do not add acknowledgement logic for these new event types.
+- [x] Standardize event payload fields for `snapshot_activated`, `snapshot_restored`, `peer_draining`, `peer_undrained`, and refresh-failure notifications.
+- [x] Keep payloads small and flat: upstream name, generation, source, peer count, peer address, and error code are in scope; full peer lists are not.
+- [x] Document which events are best-effort observability signals versus those consumers may actively react to.
+- [x] Preserve existing overwrite-oldest semantics; do not add acknowledgement logic for these new event types.
+- [x] Wire `refresh_failed` events at static and consul source error paths in `dynamic-upstreams`.
 
 **Verification scope**
 
 - Add integration coverage from `dynamic-upstreams` proving the documented event types and fields are emitted exactly once per successful activation or restore.
 - Add overflow regression tests with the new event mix so dropped-event accounting remains accurate.
 - Add compatibility tests proving older consumers that only look at `type` continue to work when payload fields expand.
+
+**Phase 4 implementation summary (2026-05-09)**
+
+The canonical event catalog for all native consumers is defined below. All events are best-effort observability signals; no consumer should block on receiving them, and overflow (dropped events) is always possible under ring pressure.
+
+#### Event catalog
+
+**`dynamic-upstreams` consumer:**
+
+| Type | When | Payload fields |
+|---|---|---|
+| `snapshot_activated` | Successful PUT or source-driven activation | `target`, `source`, `generation`, `peer_count` |
+| `snapshot_restored` | Successful cold-start journal restore (Phase 4, not yet implemented) | `target`, `source`, `generation`, `peer_count`, `restored_at_msec` |
+| `refresh_failed` | Static file or Consul source read/parse error | `target`, `source`, `error_code` |
+| `peer_draining` | Operator drain of one peer (Phase 7, not yet implemented) | `target`, `address`, `generation` |
+| `peer_undrained` | Operator undrain of one peer (Phase 7, not yet implemented) | `target`, `address`, `generation` |
+
+**`healthcheck` consumer:**
+
+| Type | When | Payload fields |
+|---|---|---|
+| `transition` | Service-level probe health flip | `scope`, `healthy`, `status`, `checked_at_msec` |
+
+**`cache-purge` consumer:**
+
+| Type | When | Payload fields |
+|---|---|---|
+| `purged` | Single-tag invalidation (`per_target` mode) | `match`, `target`, `purged` |
+| `purge_batch` | Multi-tag batch invalidation (`summary` mode) | `match`, `requested`, `purged`, `missing` |
+
+All string fields are bounded to the ring entry payload size (≤512 bytes). Full peer lists are never included in payloads. Events whose implementations are deferred are documented above with shape only; the type string is reserved.
 
 ### Phase 5 - Consumer-oriented inspection ergonomics
 

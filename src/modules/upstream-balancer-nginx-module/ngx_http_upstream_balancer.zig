@@ -31,6 +31,10 @@ extern var ngx_http_core_module: ngx_module_t;
 // (healthy or not monitored), 0 if a configured probe marks it unhealthy.
 extern fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
 
+// Provided by the dynamic-upstreams module. Returns 1 if the peer has been
+// explicitly marked draining via PATCH /drain, 0 otherwise (fail-open).
+extern fn ngz_du_is_peer_draining(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
+
 extern fn ngx_http_upstream_init_round_robin(
     cf: [*c]ngx_conf_t,
     us: [*c]ngx_http_upstream_srv_conf_t,
@@ -627,11 +631,14 @@ export fn upstream_balancer_init_peer(
     return core.NGX_OK;
 }
 
-// A peer is eligible if nginx hasn't marked it down AND the healthcheck module
-// (when loaded) considers it healthy. Fail-open: no probe entry → eligible.
+// A peer is eligible if nginx hasn't marked it down, the healthcheck module
+// (when loaded) considers it healthy, and it is not explicitly draining.
+// All checks fail-open: unknown peer → eligible.
 fn is_eligible(p: [*c]ngx_http_upstream_rr_peer_t) bool {
     if (p.*.down != 0) return false;
-    return ngz_healthcheck_is_peer_eligible(p.*.name.data, p.*.name.len) != 0;
+    if (ngz_healthcheck_is_peer_eligible(p.*.name.data, p.*.name.len) == 0) return false;
+    if (ngz_du_is_peer_draining(p.*.name.data, p.*.name.len) != 0) return false;
+    return true;
 }
 
 fn peers_wlock(peers: [*c]ngx_http_upstream_rr_peers_t) void {

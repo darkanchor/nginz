@@ -375,6 +375,24 @@ describe("dynamic-upstreams Phase 3 — static source polling", () => {
     expect(after.peer_count).toBe(before.peer_count);
     expect(after.peers).toEqual(before.peers);
   });
+
+  test("invalid source file emits refresh_failed event with error_code", async () => {
+    const beforeEvents = await getWorkerEvents();
+    writeFileSync(REFRESH_SOURCE_FILE, "{bad-json");
+
+    const events = await waitForWorkerEvents(
+      (snapshot) => snapshot.events.some((e) => e.type === "refresh_failed"),
+      "upstreams",
+      4000,
+      beforeEvents.newest_generation,
+    );
+    const ev = events.events.find((e) => e.type === "refresh_failed");
+    const payload = JSON.parse(ev.payload);
+    expect(payload.target).toBe("api_backend");
+    expect(payload.source).toBe("static");
+    expect(typeof payload.error_code).toBe("number");
+    expect(payload.error_code).toBeGreaterThan(0);
+  });
 });
 
 describe("dynamic-upstreams Phase 3 — health-aware activation", () => {
@@ -526,5 +544,214 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
     );
     expect(body.last_error_code).toBe(0);
     expect(body.peers).toEqual([]);
+  });
+});
+
+describe("dynamic-upstreams Phase 4 — cold-start journal persistence", () => {
+  const JOURNAL_PATH = "/tmp/nginz-journal-test.json";
+
+  beforeAll(async () => {
+    // Remove any stale journal before first run
+    try { const { unlinkSync } = await import("fs"); unlinkSync(JOURNAL_PATH); } catch {}
+    await startNginz(`tests/${MODULE}/nginx-journal.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+    try { const { unlinkSync } = await import("fs"); unlinkSync(JOURNAL_PATH); } catch {}
+  });
+
+  test("GET response includes restored_from_journal and restore_error_code fields", async () => {
+    const body = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(typeof body.restored_from_journal).toBe("boolean");
+    expect(typeof body.restore_error_code).toBe("number");
+  });
+
+  test("successful PUT writes journal file to disk", async () => {
+    const { existsSync } = await import("fs");
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 2 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    // Journal is written synchronously after activation
+    await Bun.sleep(100);
+    expect(existsSync(JOURNAL_PATH)).toBe(true);
+
+    const { readFileSync } = await import("fs");
+    const journal = JSON.parse(readFileSync(JOURNAL_PATH, "utf8"));
+    expect(journal.schema).toBe(1);
+    expect(journal.target).toBe("api_backend");
+    expect(journal.source).toBe("static");
+    expect(typeof journal.generation).toBe("number");
+    expect(journal.generation).toBeGreaterThan(0);
+    expect(Array.isArray(journal.peers)).toBe(true);
+    expect(journal.peers).toHaveLength(2);
+    expect(journal.peers[0].address).toBe("127.0.0.1:19002");
+    expect(journal.peers[0].weight).toBe(2);
+  });
+
+  test("cold restart restores snapshot from journal before first refresh", async () => {
+    // PUT a known snapshot and let it journal
+    const putRes = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 3 }] }),
+    });
+    expect(putRes.status).toBe(200);
+    const putBody = await putRes.json();
+    const journaledGen = putBody.generation;
+    await Bun.sleep(100); // let journal flush
+
+    // Restart nginx (cold restart — shared memory is not inherited)
+    await stopNginz();
+    await startNginz(`tests/${MODULE}/nginx-journal.conf`, MODULE);
+
+    // Active snapshot should be restored immediately, before any PUT or timer
+    const state = await waitForDynamicState((s) => s.peer_count > 0, 4000);
+    expect(state.peer_count).toBe(1);
+    expect(state.peers[0].address).toBe("127.0.0.1:19002");
+    expect(state.restored_from_journal).toBe(true);
+    expect(state.restore_error_code).toBe(0);
+    // The restored generation is a new local generation, not necessarily equal to journaledGen
+    expect(state.generation).toBeGreaterThan(0);
+    void journaledGen;
+  });
+
+  test("corrupt journal is non-fatal: nginx starts with restore_error_code set", async () => {
+    const { writeFileSync } = await import("fs");
+    writeFileSync(JOURNAL_PATH, "{bad-json");
+
+    await stopNginz();
+    await startNginz(`tests/${MODULE}/nginx-journal.conf`, MODULE);
+
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    // No snapshot restored from corrupt journal
+    expect(state.restored_from_journal).toBe(false);
+    expect(state.restore_error_code).toBeGreaterThan(0);
+  });
+});
+
+describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("GET response includes drain_count field", async () => {
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(typeof state.drain_count).toBe("number");
+    expect(state.drain_count).toBe(0);
+  });
+
+  test("PATCH drain adds address to drain table and updates drain_count", async () => {
+    // First activate a snapshot so there is a managed store
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 1 }] }),
+    });
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+    expect(body.action).toBe("drain");
+    expect(body.address).toBe("127.0.0.1:19002");
+    expect(body.drain_count).toBe(1);
+
+    // GET reflects the updated drain_count
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(state.drain_count).toBe(1);
+  });
+
+  test("PATCH drain is idempotent for already-draining address", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.drain_count).toBe(1); // still 1, not 2
+  });
+
+  test("PATCH undrain removes address and updates drain_count", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ undrain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+    expect(body.action).toBe("undrain");
+    expect(body.drain_count).toBe(0);
+
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(state.drain_count).toBe(0);
+  });
+
+  test("PATCH undrain is idempotent for non-draining address", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ undrain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.drain_count).toBe(0); // idempotent
+  });
+
+  test("PATCH rejects missing drain/undrain field", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ peers: [] }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("PATCH rejects address longer than 64 bytes", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "a".repeat(65) }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("PATCH rejects invalid JSON", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: "not-json",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("PATCH rejects missing Content-Type", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      body: JSON.stringify({ drain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(415);
   });
 });

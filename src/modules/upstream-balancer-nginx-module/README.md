@@ -427,10 +427,10 @@ Teach the balancer to exclude operator-draining peers from new selections withou
 
 **TODO**
 
-- [ ] Extend the runtime peer-source contract so the balancer can distinguish `active` peers from `draining` peers on the currently pinned generation.
-- [ ] Keep `draining` peers out of new sticky hash selection and round-robin fallback selection when an equivalent non-draining peer is available.
-- [ ] Preserve current retry behavior: if a request already pinned a generation before the drain transition, the request may continue through nginx's normal retry path on that pinned generation.
-- [ ] Keep backup-peer semantics unchanged; drain only affects the peer-source generation exposed by `dynamic-upstreams`, not nginx's built-in backup-chain rules.
+- [x] Extend the runtime peer-source contract so the balancer can distinguish `active` peers from `draining` peers on the currently pinned generation.
+- [x] Keep `draining` peers out of new sticky hash selection and round-robin fallback selection when an equivalent non-draining peer is available.
+- [x] Preserve current retry behavior: if a request already pinned a generation before the drain transition, the request may continue through nginx's normal retry path on that pinned generation.
+- [x] Keep backup-peer semantics unchanged; drain only affects the peer-source generation exposed by `dynamic-upstreams`, not nginx's built-in backup-chain rules.
 - [ ] Make status output expose drain-related rejection counts so operators can tell whether a peer is skipped because it is unhealthy or because it is intentionally draining.
 
 **Verification scope**
@@ -438,6 +438,14 @@ Teach the balancer to exclude operator-draining peers from new selections withou
 - Add integration tests proving a drained peer stops receiving new requests while sibling peers continue serving traffic.
 - Add retry-path regression tests where a request pinned before drain still completes or retries without crashing the worker.
 - Add multi-worker affinity tests proving all workers honor the same drain state for the same generation.
+
+**Phase 4 implementation summary (2026-05-09)**
+
+- `is_eligible()` now calls three guards in order: `p.down != 0` → `ngz_healthcheck_is_peer_eligible` → `ngz_du_is_peer_draining`. All three are fail-open: an unknown peer is considered eligible, healthy, and not draining.
+- `extern fn ngz_du_is_peer_draining(addr_data, addr_len) c_int` is declared in this module and exported from `dynamic-upstreams`. Hot path (no draining peers) costs a single atomic load per managed upstream, which returns 0 immediately.
+- The drain table (`drain_count` + `drain_table[32]DrainEntry`) lives in the slab-allocated `UpstreamStore` alongside `active` and `draining_head`. It is populated by the PATCH /drain endpoint (Phase 5). Until then, `drain_count` is always 0 and the slow path never executes.
+- Retry semantics are unchanged: a request that pinned a generation before a drain transition retries against the same pinned snapshot, which may still include the draining peer for nginx's internal retry loop.
+- The drain check is address-keyed (`p.name.data/len`), matching the same address used by `ngz_healthcheck_is_peer_eligible` — so both checks use the same peer identity.
 
 ### Phase 5 - Affinity stability across partial mutation
 

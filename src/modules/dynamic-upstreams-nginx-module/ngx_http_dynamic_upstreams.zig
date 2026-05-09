@@ -116,6 +116,8 @@ const dynamic_upstreams_loc_conf = extern struct {
     target_uscf: [*c]ngx_http_upstream_srv_conf_t,
     worker_events_channel: ngx_str_t,
     refresh_registered: ngx_flag_t,
+    journal_path: ngx_str_t,
+    journal_registered: ngx_flag_t,
     // consul source fields
     consul_host: ngx_str_t,     // null-terminated IP string
     consul_port: ngx_uint_t,    // default 8500
@@ -130,8 +132,17 @@ const RefreshEntry = struct {
     timer: core.ngx_event_t,
 };
 
+const JournalEntry = struct {
+    lccf: [*c]dynamic_upstreams_loc_conf,
+};
+
 var refresh_entries: [MAX_REFRESH_ENTRIES]RefreshEntry = undefined;
 var refresh_entry_count: usize = 0;
+var journal_entries: [MAX_REFRESH_ENTRIES]JournalEntry = undefined;
+var journal_entry_count: usize = 0;
+// Tracks all managed DynamicUpstreamsSrvConf pointers for ngz_du_is_peer_draining
+var managed_ducfs: [MAX_REFRESH_ENTRIES][*c]DynamicUpstreamsSrvConf = undefined;
+var managed_ducf_count: usize = 0;
 
 // ── Per-upstream config (stored in uscf->srv_conf) ─────────────────────────
 
@@ -143,6 +154,13 @@ const DynamicUpstreamsSrvConf = extern struct {
 
 // ── Shared-memory structures ─────────────────────────────────────────────────
 
+// Drain table entry — one slot per peer address marked draining.
+const MAX_DRAIN_PEERS = 32;
+const DrainEntry = extern struct {
+    addr: [64]u8,
+    addr_len: u8,
+};
+
 // Control block — one per managed upstream, lives in the slab pool.
 const UpstreamStore = extern struct {
     next_generation: u64,
@@ -151,6 +169,12 @@ const UpstreamStore = extern struct {
     last_error_code: u32,
     last_error_at_msec: i64,
     last_success_at_msec: i64,
+    // Journal restore status (set only at cold-start, before any request is served)
+    restored_from_journal: u8,
+    restore_error_code: u32,
+    // Drain table — peers explicitly marked draining via PATCH /drain
+    drain_count: u32,
+    drain_table: [MAX_DRAIN_PEERS]DrainEntry,
 };
 
 // Immutable peer snapshot, pinned per-request.
@@ -282,6 +306,185 @@ fn publish_snapshot_event(channel: ngx_str_t, target: ngx_str_t, source: ngx_str
     _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
 }
 
+fn publish_refresh_failed_event(channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, error_code: u32) void {
+    const zone = ngx_http_worker_events_default_zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
+    if (channel.len == 0 or channel.data == null) return;
+
+    const event_type = ngx_string("refresh_failed");
+    const source_slice = if (source.len == 0 or source.data == null)
+        "static"
+    else
+        core.slicify(u8, source.data, source.len);
+
+    var payload_buf: [256]u8 = undefined;
+    const payload = std.fmt.bufPrint(
+        &payload_buf,
+        "{{\"target\":\"{s}\",\"source\":\"{s}\",\"error_code\":{d}}}",
+        .{ core.slicify(u8, target.data, target.len), source_slice, error_code },
+    ) catch return;
+    const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
+    _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
+}
+
+// ── Journal persistence ───────────────────────────────────────────────────────
+
+fn writeFileAtomic(path_str: ngx_str_t, content: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path_slice = core.slicify(u8, path_str.data, path_str.len);
+
+    var tmp_buf: [1024]u8 = undefined;
+    if (path_str.len + 5 > tmp_buf.len) return error.PathTooLong;
+    @memcpy(tmp_buf[0..path_str.len], path_slice);
+    @memcpy(tmp_buf[path_str.len..][0..4], ".tmp");
+    tmp_buf[path_str.len + 4] = 0;
+    const tmp_path = tmp_buf[0..path_str.len + 4];
+
+    var final_buf: [1024]u8 = undefined;
+    @memcpy(final_buf[0..path_str.len], path_slice);
+    final_buf[path_str.len] = 0;
+
+    var f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, content);
+
+    if (std.c.rename(@ptrCast(tmp_buf[0..].ptr), @ptrCast(final_buf[0..].ptr)) != 0) {
+        return error.RenameFailed;
+    }
+}
+
+// Build and write journal JSON for the activated peer set.
+// Called after successful activation; best-effort (errors are silently ignored).
+fn write_journal_if_configured(
+    lccf: [*c]dynamic_upstreams_loc_conf,
+    specs: [*c]PeerSpec,
+    count: usize,
+    generation: u64,
+) void {
+    if (lccf.*.journal_path.len == 0 or lccf.*.journal_path.data == null) return;
+
+    // Estimate: metadata header ~200 bytes + per peer ~60 bytes
+    const max_len = 256 + count * 64;
+    if (max_len > 16 * 1024) return; // guard against absurd peer counts
+
+    var jbuf: [16 * 1024]u8 = undefined;
+    var w: [*]u8 = &jbuf;
+    const w_end = w + jbuf.len;
+
+    const source_slice = if (lccf.*.source.len > 0 and lccf.*.source.data != null)
+        core.slicify(u8, lccf.*.source.data, lccf.*.source.len)
+    else
+        "static";
+    const target_slice = core.slicify(u8, lccf.*.target.data, lccf.*.target.len);
+
+    appendRaw(&w, w_end, "{\"schema\":1,\"target\":\"");
+    appendRaw(&w, w_end, target_slice);
+    appendRaw(&w, w_end, "\",\"source\":\"");
+    appendRaw(&w, w_end, source_slice);
+    appendRaw(&w, w_end, "\",\"generation\":");
+    appendUint(&w, w_end, generation);
+    appendRaw(&w, w_end, ",\"persisted_at_msec\":");
+    const ts: i64 = currentTimeMsec();
+    appendUint(&w, w_end, @intCast(if (ts > 0) ts else 0));
+    appendRaw(&w, w_end, ",\"peers\":[");
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (i > 0) appendRaw(&w, w_end, ",");
+        appendRaw(&w, w_end, "{\"address\":\"");
+        appendRaw(&w, w_end, core.slicify(u8, specs[i].addr_data, specs[i].addr_len));
+        appendRaw(&w, w_end, "\",\"weight\":");
+        appendUint(&w, w_end, @intCast(@max(0, specs[i].weight)));
+        appendRaw(&w, w_end, "}");
+    }
+    appendRaw(&w, w_end, "]}");
+
+    const used = @intFromPtr(w) - @intFromPtr(&jbuf);
+    writeFileAtomic(lccf.*.journal_path, jbuf[0..used]) catch {};
+}
+
+fn appendRaw(w: *[*]u8, end: [*]u8, s: []const u8) void {
+    const avail = @intFromPtr(end) - @intFromPtr(w.*);
+    const n = @min(s.len, avail);
+    @memcpy(w.*[0..n], s[0..n]);
+    w.* += n;
+}
+
+fn appendUint(w: *[*]u8, end: [*]u8, val: u64) void {
+    var tmp: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch return;
+    appendRaw(w, end, s);
+}
+
+// Attempt to restore the active snapshot from the journal file.
+// Only called at cold-start by worker 0, before any requests are served.
+fn restore_from_journal(entry: *JournalEntry, lg: [*c]ngx.log.ngx_log_t) void {
+    const lccf = entry.lccf;
+    if (lccf == core.nullptr(dynamic_upstreams_loc_conf)) return;
+    if (lccf.*.journal_path.len == 0 or lccf.*.journal_path.data == null) return;
+    if (lccf.*.target_uscf == core.nullptr(ngx_http_upstream_srv_conf_t)) return;
+
+    const ducf = get_ducf(lccf.*.target_uscf) orelse return;
+    if (ducf.*.managed == 0) return;
+
+    const store = ducf.*.store;
+    if (store == core.nullptr(UpstreamStore)) return;
+
+    // Skip restore if a snapshot is already active (reload reused inherited zone)
+    if (store.*.active != null) return;
+
+    const pool = core.ngx_create_pool(32 * 1024, lg);
+    if (pool == core.nullptr(core.ngx_pool_t)) {
+        store.*.restore_error_code = DU_ERROR_ALLOCATION_FAILED;
+        return;
+    }
+    defer core.ngx_destroy_pool(pool);
+
+    const body_str = file.ngz_open_file(lccf.*.journal_path, lg, pool) catch {
+        // Journal file not present — normal on first startup
+        return;
+    };
+
+    var cj = CJSON.init(pool);
+    const json = cj.decode(body_str) catch {
+        store.*.restore_error_code = DU_ERROR_INVALID_JSON;
+        return;
+    };
+    defer cj.free(json);
+
+    // Validate schema version
+    const schema_node = cjson.cJSON_GetObjectItem(json, "schema");
+    if (schema_node == core.nullptr(cjson.cJSON) or schema_node.*.valueint != 1) {
+        store.*.restore_error_code = DU_ERROR_INVALID_PAYLOAD;
+        return;
+    }
+
+    // Validate target name matches current config
+    const target_node = cjson.cJSON_GetObjectItem(json, "target");
+    if (target_node == core.nullptr(cjson.cJSON) or target_node.*.valuestring == null) {
+        store.*.restore_error_code = DU_ERROR_INVALID_PAYLOAD;
+        return;
+    }
+    const journal_target = std.mem.sliceTo(target_node.*.valuestring, 0);
+    const config_target = core.slicify(u8, lccf.*.target.data, lccf.*.target.len);
+    if (!std.mem.eql(u8, journal_target, config_target)) {
+        store.*.restore_error_code = DU_ERROR_INVALID_PAYLOAD;
+        return;
+    }
+
+    // Activate snapshot; bypass health filtering so cold-start restores all journal peers
+    const result = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, false, false, true);
+    switch (result) {
+        .ok => {
+            store.*.restored_from_journal = 1;
+            store.*.restore_error_code = 0;
+        },
+        .err => {
+            store.*.restore_error_code = DU_ERROR_INVALID_PAYLOAD;
+        },
+    }
+}
+
 // ── Zone init callback ────────────────────────────────────────────────────────
 
 // Called once per worker per config cycle.
@@ -334,6 +537,8 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     lccf.*.target_uscf = core.nullptr(ngx_http_upstream_srv_conf_t);
     lccf.*.worker_events_channel = ngx_null_str;
     lccf.*.refresh_registered = 0;
+    lccf.*.journal_path = ngx_null_str;
+    lccf.*.journal_registered = 0;
     lccf.*.consul_host = ngx_null_str;
     lccf.*.consul_port = 8500;
     lccf.*.consul_service = ngx_null_str;
@@ -357,6 +562,7 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
         c.*.target_uscf = prev.*.target_uscf;
     }
     if (c.*.worker_events_channel.len == 0) c.*.worker_events_channel = prev.*.worker_events_channel;
+    if (c.*.journal_path.len == 0) c.*.journal_path = prev.*.journal_path;
     if (c.*.consul_host.len == 0) c.*.consul_host = prev.*.consul_host;
     if (c.*.consul_port == 8500 and prev.*.consul_port != 8500) c.*.consul_port = prev.*.consul_port;
     if (c.*.consul_service.len == 0) c.*.consul_service = prev.*.consul_service;
@@ -404,6 +610,15 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
         }
     }
 
+    // Register journal entry so restore_from_journal runs at cold-start
+    if (c.*.journal_path.len > 0 and c.*.journal_path.data != null and c.*.journal_registered == 0) {
+        if (journal_entry_count < MAX_REFRESH_ENTRIES) {
+            journal_entries[journal_entry_count] = .{ .lccf = c };
+            journal_entry_count += 1;
+            c.*.journal_registered = 1;
+        }
+    }
+
     return conf.NGX_CONF_OK;
 }
 
@@ -422,6 +637,38 @@ fn merge_srv_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     return conf.NGX_CONF_OK;
 }
 
+// ── Drain contract ────────────────────────────────────────────────────────────
+
+// Called by upstream-balancer at request time to exclude draining peers from
+// new connection selection. Fail-open: unknown peer → not draining.
+// Hot path: drain_count is 0 until a PATCH /drain request populates the table.
+export fn ngz_du_is_peer_draining(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int {
+    if (addr_data == null or addr_len == 0 or addr_len > 64) return 0;
+    const addr = core.slicify(u8, addr_data, addr_len);
+    var i: usize = 0;
+    while (i < managed_ducf_count) : (i += 1) {
+        const ducf = managed_ducfs[i];
+        const store_cptr = ducf.*.store;
+        if (store_cptr == null) continue;
+        // Cast away the [*c] indirection so array field access works correctly.
+        const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
+        // Fast path: no draining peers in this upstream
+        if (@atomicLoad(u32, &store.drain_count, .monotonic) == 0) continue;
+        // Slow path: search drain table populated by PATCH /drain (Phase 5)
+        const count: usize = @min(store.drain_count, MAX_DRAIN_PEERS);
+        var j: usize = 0;
+        while (j < count) : (j += 1) {
+            const elen: usize = store.drain_table[j].addr_len;
+            if (elen == addr_len and
+                std.mem.eql(u8, store.drain_table[j].addr[0..addr_len], addr))
+            {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // ── Postconfiguration ─────────────────────────────────────────────────────────
 
 fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
@@ -435,6 +682,11 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         const uscf = uscfp.*;
         const ducf = get_ducf(uscf) orelse continue;
         if (ducf.*.managed == 0) continue;
+
+        if (managed_ducf_count < MAX_REFRESH_ENTRIES) {
+            managed_ducfs[managed_ducf_count] = ducf;
+            managed_ducf_count += 1;
+        }
 
         // Install the balancer's init_peer wrapper (needed so peer source is used)
         if (upstream_balancer_ensure_hook(uscf) != core.NGX_OK) {
@@ -636,6 +888,21 @@ fn set_dynamic_upstreams_worker_events_channel(
     return conf.NGX_CONF_OK;
 }
 
+fn set_dynamic_upstreams_journal(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(dynamic_upstreams_loc_conf, loc)) |lccf| {
+        var i: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
+            lccf.*.journal_path = arg.*;
+        }
+    }
+    return conf.NGX_CONF_OK;
+}
+
 fn set_dynamic_upstreams_consul_address(
     cf: [*c]ngx_conf_t,
     cmd: [*c]ngx_command_t,
@@ -752,6 +1019,18 @@ fn handle_get(r: [*c]ngx_http_request_t) ngx_int_t {
         ducf.?.*.store.*.last_success_at_msec
     else
         0;
+    const restored_from_journal: u8 = if (managed and ducf != null and ducf.?.*.store != core.nullptr(UpstreamStore))
+        ducf.?.*.store.*.restored_from_journal
+    else
+        0;
+    const restore_error_code: u32 = if (managed and ducf != null and ducf.?.*.store != core.nullptr(UpstreamStore))
+        ducf.?.*.store.*.restore_error_code
+    else
+        0;
+    const drain_count: u32 = if (managed and ducf != null and ducf.?.*.store != core.nullptr(UpstreamStore)) blk: {
+        const s: *UpstreamStore = @alignCast(@ptrCast(ducf.?.*.store));
+        break :blk @atomicLoad(u32, &s.drain_count, .acquire);
+    } else 0;
 
     // Count peers (from snapshot or static fallback)
     var peer_count: usize = 0;
@@ -766,7 +1045,7 @@ fn handle_get(r: [*c]ngx_http_request_t) ngx_int_t {
     }
 
     // Estimate JSON size
-    const est: usize = 256 + target_name.len + source_name.len + peer_count * 80;
+    const est: usize = 320 + target_name.len + source_name.len + peer_count * 80;
     var jb = JsonBuilder.init(r.*.pool, est) orelse return core.NGX_ERROR;
     const start = jb.w;
 
@@ -786,6 +1065,12 @@ fn handle_get(r: [*c]ngx_http_request_t) ngx_int_t {
     jb.appendFmt("{d}", .{last_error_at_msec});
     jb.append(",\"last_success_at_msec\":");
     jb.appendFmt("{d}", .{last_success_at_msec});
+    jb.append(",\"restored_from_journal\":");
+    jb.append(if (restored_from_journal != 0) "true" else "false");
+    jb.append(",\"restore_error_code\":");
+    jb.appendFmt("{d}", .{restore_error_code});
+    jb.append(",\"drain_count\":");
+    jb.appendFmt("{d}", .{drain_count});
     jb.append(",\"peers\":[");
 
     var first = true;
@@ -883,6 +1168,7 @@ fn build_and_activate_snapshot(
     json: [*c]cjson.cJSON,
     allow_noop_if_same: bool,
     allow_empty_peers: bool,
+    skip_health_filter: bool,
 ) ActivationResult {
     const peers_node = cjson.cJSON_GetObjectItem(json, "peers");
     if (peers_node == core.nullptr(cjson.cJSON) or cjson.cJSON_IsArray(peers_node) != 1) {
@@ -993,13 +1279,13 @@ fn build_and_activate_snapshot(
     var eligible_count: usize = 0;
     var idx: usize = 0;
     while (idx < addr_count) : (idx += 1) {
-        if (ngz_healthcheck_is_peer_eligible(specs[idx].addr_data, specs[idx].addr_len) == 0) continue;
+        if (!skip_health_filter and ngz_healthcheck_is_peer_eligible(specs[idx].addr_data, specs[idx].addr_len) == 0) continue;
         eligible_specs[eligible_count] = specs[idx];
         eligible_urls[eligible_count] = urls[idx];
         eligible_count += 1;
     }
 
-    if (eligible_count == 0 and addr_count > 0) {
+    if (eligible_count == 0 and addr_count > 0 and !skip_health_filter) {
         record_store_error(ducf, DU_ERROR_ALL_PEERS_UNHEALTHY);
         return .{ .err = .{ .status = http.NGX_HTTP_SERVICE_UNAVAILABLE, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"no eligible peers after health filtering\"}") } };
     }
@@ -1153,7 +1439,9 @@ fn build_and_activate_snapshot(
     record_store_success_locked(store);
 
     const old_active = store.*.active;
-    store.*.active = new_snapshot;
+    // Release store so the lockless reader sees all snapshot fields before the pointer.
+    const store_typed: *UpstreamStore = @alignCast(@ptrCast(store));
+    @atomicStore(usize, @as(*usize, @ptrCast(&store_typed.active)), @intFromPtr(new_snapshot), .release);
     store.*.next_generation = gen + 1;
     if (old_active) |old_ptr| {
         if (core.castPtr(Snapshot, old_ptr)) |old_snap| {
@@ -1169,6 +1457,7 @@ fn build_and_activate_snapshot(
     if (lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
         publish_snapshot_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, gen, eligible_count);
     }
+    write_journal_if_configured(lccf, eligible_specs, eligible_count, gen);
     return .{ .ok = .{ .generation = gen, .peer_count = eligible_count, .changed = true } };
 }
 
@@ -1250,7 +1539,7 @@ export fn du_put_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     };
     defer cj.free(json);
 
-    const result = build_and_activate_snapshot(r.*.pool, ducf, uscf, lccf, json, false, false);
+    const result = build_and_activate_snapshot(r.*.pool, ducf, uscf, lccf, json, false, false, false);
     switch (result) {
         .err => |e| {
             _ = send_json_response(r, e.status, e.body);
@@ -1274,6 +1563,189 @@ export fn du_put_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
             http.ngx_http_finalize_request(r, core.NGX_OK);
         },
     }
+}
+
+// ── PATCH /drain handler ──────────────────────────────────────────────────────
+
+fn handle_patch(r: [*c]ngx_http_request_t) ngx_int_t {
+    const lccf = core.castPtr(
+        dynamic_upstreams_loc_conf,
+        conf.ngx_http_get_module_loc_conf(r, &ngx_http_dynamic_upstreams_module),
+    ) orelse return core.NGX_ERROR;
+
+    const uscf = lccf.*.target_uscf;
+    if (uscf == core.nullptr(ngx_http_upstream_srv_conf_t)) {
+        return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"target not configured\"}"));
+    }
+    const ducf = get_ducf(uscf) orelse return core.NGX_ERROR;
+    if (ducf.*.managed == 0) {
+        return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"upstream is not managed\"}"));
+    }
+    if (ducf.*.zone == core.nullptr(core.ngx_shm_zone_t) or ducf.*.store == core.nullptr(UpstreamStore)) {
+        return send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store not initialized\"}"));
+    }
+    if (!is_json_content_type(r)) {
+        _ = http.ngx_http_discard_request_body(r);
+        return send_json_response(r, 415,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"content-type must be application/json\"}"));
+    }
+    const rc = http.ngx_http_read_client_request_body(r, du_patch_body_handler);
+    if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) return rc;
+    return core.NGX_DONE;
+}
+
+export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
+    const lccf = core.castPtr(
+        dynamic_upstreams_loc_conf,
+        conf.ngx_http_get_module_loc_conf(r, &ngx_http_dynamic_upstreams_module),
+    ) orelse {
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+
+    const uscf = lccf.*.target_uscf;
+    const ducf = get_ducf(uscf) orelse {
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+
+    if (r.*.request_body == core.nullptr(http.ngx_http_request_body_t) or
+        r.*.request_body.*.bufs == core.nullptr(ngx_chain_t))
+    {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"missing request body\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    const body_str = buf.ngz_chain_content(r.*.request_body.*.bufs, r.*.pool) catch {
+        _ = send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to read body\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+
+    var cj = CJSON.init(r.*.pool);
+    const json = cj.decode(body_str) catch {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"invalid JSON\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    };
+    defer cj.free(json);
+
+    // Determine action and address
+    const drain_node = cjson.cJSON_GetObjectItem(json, "drain");
+    const undrain_node = cjson.cJSON_GetObjectItem(json, "undrain");
+    const is_drain: bool = drain_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsString(drain_node) == 1;
+    const is_undrain: bool = undrain_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsString(undrain_node) == 1;
+
+    if (!is_drain and !is_undrain) {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'drain' or 'undrain' string field required\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    const addr_ngx = if (is_drain) CJSON.stringValue(drain_node) else CJSON.stringValue(undrain_node);
+    const addr_str = addr_ngx orelse {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"address must be non-empty\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    };
+    if (addr_str.len == 0 or addr_str.len > 64) {
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"address must be 1..64 bytes\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+    const addr = core.slicify(u8, addr_str.data, addr_str.len);
+
+    const shpool = get_shpool(ducf.*.zone) orelse {
+        _ = send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"slab pool unavailable\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_SERVICE_UNAVAILABLE);
+        return;
+    };
+    const store_cptr = ducf.*.store;
+    if (store_cptr == core.nullptr(UpstreamStore)) {
+        _ = send_json_response(r, http.NGX_HTTP_SERVICE_UNAVAILABLE,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store unavailable\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_SERVICE_UNAVAILABLE);
+        return;
+    }
+    const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
+
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+
+    const new_count: u32 = blk: {
+        if (is_drain) {
+            // Check for duplicate
+            var k: u32 = 0;
+            while (k < store.drain_count and k < MAX_DRAIN_PEERS) : (k += 1) {
+                const elen: usize = store.drain_table[k].addr_len;
+                if (elen == addr_str.len and
+                    std.mem.eql(u8, store.drain_table[k].addr[0..addr_str.len], addr))
+                {
+                    // Already draining — idempotent
+                    break :blk store.drain_count;
+                }
+            }
+            if (store.drain_count >= MAX_DRAIN_PEERS) {
+                shm.ngx_shmtx_unlock(&shpool.*.mutex);
+                _ = send_json_response(r, 409,
+                    ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"drain table full\"}"));
+                http.ngx_http_finalize_request(r, 409);
+                return;
+            }
+            const idx = store.drain_count;
+            store.drain_table[idx].addr_len = @intCast(addr_str.len);
+            @memcpy(store.drain_table[idx].addr[0..addr_str.len], addr);
+            break :blk store.drain_count + 1;
+        } else {
+            // Undrain: find and remove by swapping with last (idempotent if not found)
+            var k: u32 = 0;
+            while (k < store.drain_count and k < MAX_DRAIN_PEERS) : (k += 1) {
+                const elen: usize = store.drain_table[k].addr_len;
+                if (elen == addr_str.len and
+                    std.mem.eql(u8, store.drain_table[k].addr[0..addr_str.len], addr))
+                {
+                    const last = store.drain_count - 1;
+                    if (k != last) {
+                        store.drain_table[k] = store.drain_table[last];
+                    }
+                    break :blk store.drain_count - 1;
+                }
+            }
+            break :blk store.drain_count; // not found — idempotent
+        }
+    };
+
+    // Write drain_count with release semantics so readers see updated table entries first.
+    @atomicStore(u32, &store.drain_count, new_count, .release);
+
+    shm.ngx_shmtx_unlock(&shpool.*.mutex);
+
+    var rbuf: [192]u8 = undefined;
+    const action = if (is_drain) "drain" else "undrain";
+    const resp = std.fmt.bufPrint(&rbuf,
+        "{{\"module\":\"dynamic_upstreams\",\"status\":\"ok\",\"action\":\"{s}\",\"address\":\"{s}\",\"drain_count\":{d}}}",
+        .{ action, addr, new_count }) catch {
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+    const resp_mem = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, resp.len)) orelse {
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    };
+    @memcpy(resp_mem[0..resp.len], resp);
+    const resp_str = ngx_str_t{ .data = resp_mem, .len = resp.len };
+    _ = send_json_response(r, http.NGX_HTTP_OK, resp_str);
+    http.ngx_http_finalize_request(r, core.NGX_OK);
 }
 
 fn free_snapshot_locked(shpool: [*c]core.ngx_slab_pool_t, sn: [*c]Snapshot) void {
@@ -1573,21 +2045,27 @@ fn run_consul_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) voi
         pool, lccf.*.consul_host, @intCast(lccf.*.consul_port), path, lccf.*.consul_token, lg,
     ) catch {
         record_store_error(ducf, DU_ERROR_SOURCE_READ_FAILED);
+        if (lccf.*.worker_events_channel.len > 0)
+            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_SOURCE_READ_FAILED);
         return;
     };
 
     const peers_str = consul_peers_json(pool, body, lg) orelse {
         record_store_error(ducf, DU_ERROR_INVALID_JSON);
+        if (lccf.*.worker_events_channel.len > 0)
+            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_INVALID_JSON);
         return;
     };
 
     var cj = CJSON.init(pool);
     const json = cj.decode(peers_str) catch {
         record_store_error(ducf, DU_ERROR_INVALID_JSON);
+        if (lccf.*.worker_events_channel.len > 0)
+            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_INVALID_JSON);
         return;
     };
 
-    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, true);
+    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, true, false);
 }
 
 fn run_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
@@ -1611,17 +2089,21 @@ fn run_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
 
     const body_str = file.ngz_open_file(lccf.*.source_file, lg, pool) catch {
         record_store_error(ducf, DU_ERROR_SOURCE_READ_FAILED);
+        if (lccf.*.worker_events_channel.len > 0)
+            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_SOURCE_READ_FAILED);
         return;
     };
 
     var cj = CJSON.init(pool);
     const json = cj.decode(body_str) catch {
         record_store_error(ducf, DU_ERROR_INVALID_JSON);
+        if (lccf.*.worker_events_channel.len > 0)
+            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_INVALID_JSON);
         return;
     };
     defer cj.free(json);
 
-    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, false);
+    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, false, false);
 }
 
 fn dynamic_upstreams_refresh_timer_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
@@ -1644,11 +2126,18 @@ fn dynamic_upstreams_refresh_timer_handler(ev: [*c]core.ngx_event_t) callconv(.c
 
 fn preconfiguration(_: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     refresh_entry_count = 0;
+    journal_entry_count = 0;
+    managed_ducf_count = 0;
     return core.NGX_OK;
 }
 
 fn dynamic_upstreams_init_process(cycle: [*c]core.ngx_cycle_t) callconv(.c) ngx_int_t {
     if (ngx_worker != 0) return core.NGX_OK;
+
+    // Restore from journal before first refresh timer fires (cold-start only)
+    for (0..journal_entry_count) |i| {
+        restore_from_journal(&journal_entries[i], cycle.*.log);
+    }
 
     for (0..refresh_entry_count) |i| {
         const entry = &refresh_entries[i];
@@ -1688,28 +2177,37 @@ fn du_get_active_peers(
     const ducf = core.castPtr(DynamicUpstreamsSrvConf, source_ctx) orelse
         return core.nullptr(ngx_http_upstream_rr_peers_t);
 
-    const store = ducf.*.store;
-    if (store == core.nullptr(UpstreamStore)) return core.nullptr(ngx_http_upstream_rr_peers_t);
+    const store_cptr = ducf.*.store;
+    if (store_cptr == core.nullptr(UpstreamStore)) return core.nullptr(ngx_http_upstream_rr_peers_t);
+    // Cast away [*c] so that field-level atomic ops compile correctly.
+    const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
 
-    const shpool = get_shpool(ducf.*.zone) orelse return core.nullptr(ngx_http_upstream_rr_peers_t);
-
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
-
-    const snap_raw = store.*.active orelse {
-        shm.ngx_shmtx_unlock(&shpool.*.mutex);
-        return core.nullptr(ngx_http_upstream_rr_peers_t);
-    };
-    const snap = core.castPtr(Snapshot, snap_raw) orelse {
-        shm.ngx_shmtx_unlock(&shpool.*.mutex);
-        return core.nullptr(ngx_http_upstream_rr_peers_t);
-    };
-
-    // Pin snapshot for this request's lifetime
-    _ = @atomicRmw(c_ulong, &snap.*.refcount, .Add, 1, .monotonic);
-    generation_out.* = @intFromPtr(snap);
-
-    shm.ngx_shmtx_unlock(&shpool.*.mutex);
-    return snap.*.peers;
+    // Lockless snapshot pinning:
+    //   1. Load the active pointer atomically (.acquire pairs with the .release in activation).
+    //   2. Speculatively increment the refcount.
+    //   3. Re-read the active pointer — if it still matches, we hold a valid pin.
+    //   4. If it changed, a concurrent PUT replaced the snapshot; release and retry.
+    //
+    // Safety: a snapshot is only freed by reap_draining (under the slab mutex).
+    // The window between load and increment is a few instructions, making the
+    // probability of a concurrent free-then-reuse cycle completing in that window
+    // negligible. A future epoch-based reclamation phase can eliminate the
+    // residual theoretical ABA risk.
+    var tries: u32 = 0;
+    while (tries < 4) : (tries += 1) {
+        const active_int = @atomicLoad(usize, @as(*const usize, @ptrCast(&store.active)), .acquire);
+        if (active_int == 0) return core.nullptr(ngx_http_upstream_rr_peers_t);
+        const snap: *Snapshot = @ptrFromInt(active_int);
+        _ = @atomicRmw(c_ulong, &snap.refcount, .Add, 1, .acquire);
+        const active_now = @atomicLoad(usize, @as(*const usize, @ptrCast(&store.active)), .acquire);
+        if (active_now == active_int) {
+            generation_out.* = active_int;
+            return snap.peers;
+        }
+        // Active pointer changed — release the speculative pin and retry.
+        _ = @atomicRmw(c_ulong, &snap.refcount, .Sub, 1, .acq_rel);
+    }
+    return core.nullptr(ngx_http_upstream_rr_peers_t);
 }
 
 fn du_release_generation(
@@ -1720,33 +2218,20 @@ fn du_release_generation(
     _ = peers;
     if (generation == 0) return;
 
-    const snap: [*c]Snapshot = @ptrFromInt(generation);
-    const prev = @atomicRmw(c_ulong, &snap.*.refcount, .Sub, 1, .acq_rel);
-    if (prev != 1) return; // not last reference
+    const snap: *Snapshot = @ptrFromInt(generation);
+    const prev = @atomicRmw(c_ulong, &snap.refcount, .Sub, 1, .acq_rel);
+    if (prev != 1) return; // not last reference — another holder will clean up
 
-    if (snap.*.draining == 0) return; // snapshot still active — should not happen, but safe
+    if (snap.draining == 0) return; // still active — should not happen, but safe
 
-    // We are the last reference to a draining snapshot; free it under lock
+    // We decremented the last reference on a draining snapshot.
+    // Delegate the free to reap_draining (runs under the slab mutex) so that the
+    // lockless reader in du_get_active_peers never races with a free.
     const ducf = core.castPtr(DynamicUpstreamsSrvConf, source_ctx) orelse return;
     const shpool = get_shpool(ducf.*.zone) orelse return;
     const store = ducf.*.store;
     if (store == core.nullptr(UpstreamStore)) return;
-
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
-
-    // Remove from draining list
-    var p = &store.*.draining_head;
-    while (p.*) |raw| {
-        const sn = core.castPtr(Snapshot, raw) orelse break;
-        if (sn == snap) {
-            p.* = sn.*.next_draining;
-            break;
-        }
-        p = &sn.*.next_draining;
-    }
-
-    free_snapshot_locked(shpool, snap);
-    shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    reap_draining(store, shpool);
 }
 
 // ── Main request handler ──────────────────────────────────────────────────────
@@ -1757,6 +2242,8 @@ export fn ngx_http_dynamic_upstreams_handler(r: [*c]ngx_http_request_t) callconv
         return handle_get(r);
     } else if (method == http.NGX_HTTP_PUT) {
         return handle_put(r);
+    } else if (method == http.NGX_HTTP_PATCH) {
+        return handle_patch(r);
     } else {
         _ = http.ngx_http_discard_request_body(r);
         return send_json_response(r, http.NGX_HTTP_NOT_ALLOWED,
@@ -1830,6 +2317,14 @@ export const ngx_http_dynamic_upstreams_commands = [_]ngx_command_t{
         .name = ngx_string("dynamic_upstreams_worker_events_channel"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
         .set = set_dynamic_upstreams_worker_events_channel,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("dynamic_upstreams_journal"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = set_dynamic_upstreams_journal,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,

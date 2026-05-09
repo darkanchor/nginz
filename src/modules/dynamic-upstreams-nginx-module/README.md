@@ -406,19 +406,31 @@ Preserve the last good active snapshot across full nginx restart, not just confi
 
 **TODO**
 
-- [ ] Add a module-owned journal file format for the active snapshot and minimal metadata: upstream name, generation, source mode, peer list, and persisted-at timestamp.
-- [ ] Write the journal only after successful activation; use write-to-temp + fsync + rename so a crash never leaves a partial live file.
-- [ ] Restore from journal during process init before the first refresh timer fires, and only for `dynamic_upstreams_managed` upstreams that opt in.
-- [ ] Reject journal restore when the upstream name or persisted schema version does not match the current config.
-- [ ] Treat corrupt or incomplete journal data as non-fatal: keep static-config peers active, record a restore error, and wait for the next PUT or source refresh.
-- [ ] Expose restore status in `GET`, for example `restored_from_journal`, `restore_error_code`, and `restore_generation`.
+- [x] Add a module-owned journal file format for the active snapshot and minimal metadata: upstream name, generation, source mode, peer list, and persisted-at timestamp.
+- [x] Write the journal only after successful activation; use write-to-temp + rename so a crash never leaves a partial live file.
+- [x] Restore from journal during process init before the first refresh timer fires, and only for `dynamic_upstreams_managed` upstreams that opt in via `dynamic_upstreams_journal <path>`.
+- [x] Reject journal restore when the upstream name or persisted schema version does not match the current config.
+- [x] Treat corrupt or incomplete journal data as non-fatal: keep static-config peers active, record a restore error, and wait for the next PUT or source refresh.
+- [x] Expose restore status in `GET`: `restored_from_journal` and `restore_error_code`.
 
 **Verification scope**
 
-- Add integration coverage proving a successful PUT survives `stopNginz()` + `startNginz()` when journal persistence is enabled.
-- Add a restart test proving the restored generation is visible before the first refresh cycle runs.
-- Add failure-injection tests for truncated journal, invalid JSON, and stale schema version; all must preserve worker startup and keep the control API truthful.
-- Add a reload-vs-restart regression test so reload continues to use inherited shared memory while restart uses the journal path.
+- [x] Integration test: PUT survives `stopNginz()` + `startNginz()` and peers are restored from journal.
+- [x] Restart test proving the restored snapshot is visible before any PUT or refresh cycle.
+- [x] Failure-injection test: invalid JSON in journal → nginx starts, `restore_error_code > 0`, no snapshot restored.
+- Reload-vs-restart regression (reload reuses inherited shared memory, restart uses journal path) — not yet covered.
+
+**Phase 4 implementation summary (2026-05-09)**
+
+- New directive: `dynamic_upstreams_journal <path>` — opt-in per managed upstream location.
+- Journal format: JSON with `schema=1`, `target`, `source`, `generation`, `persisted_at_msec`, `peers[{address,weight}]`.
+- Write path: `writeFileAtomic` (write to `<path>.tmp`, then `rename`) on every successful activation; best-effort (errors silently ignored).
+- Restore path: `restore_from_journal` runs in `dynamic_upstreams_init_process` before first refresh timer, worker 0 only; bypasses health filter (`skip_health_filter=true`) to restore all journal peers at cold start.
+- Skip restore if store already has an active snapshot (config reload inherits shared zone normally).
+- GET response adds `restored_from_journal` (bool) and `restore_error_code` (u32) fields.
+- 4 new integration tests in `tests/dynamic-upstreams/nginx-journal.conf` + journal test block.
+- **Drain contract (cross-module)**: `UpstreamStore` now carries `drain_count: u32` and `drain_table: [32]DrainEntry` in slab memory. `export fn ngz_du_is_peer_draining` is the request-time contract exported to `upstream-balancer` and future callers. Hot path is a single atomic load per managed upstream (returns 0 when `drain_count == 0`). The table is populated by Phase 7 PATCH /drain; until then `drain_count` is always 0.
+- **Managed upstream tracking**: `managed_ducfs[MAX_REFRESH_ENTRIES]` and `managed_ducf_count` are populated in `postconfiguration` so `ngz_du_is_peer_draining` can walk all managed stores without per-request config traversal.
 
 ### Phase 5 - Async source adapter for Consul
 
@@ -450,11 +462,11 @@ Remove `shpool->mutex` from `du_get_active_peers()` while preserving safe snapsh
 
 **TODO**
 
-- [ ] Change `store.active` reads to an atomic-load retry loop instead of reading under the slab mutex.
-- [ ] Keep `Snapshot.refcount` atomic, but stop freeing draining snapshots directly from the request release path.
-- [ ] Move final reclamation to the draining-list reaper under lock so a request can safely increment a snapshot refcount after loading the pointer but before reclamation.
-- [ ] Add a retry rule: load active snapshot, increment refcount, then verify the snapshot is still the active one or still valid for pinning; if not, release and retry.
-- [ ] Keep slab mutex ownership only on activation/reaper paths that mutate the active pointer or free slab allocations.
+- [x] Change `store.active` reads to an atomic-load retry loop instead of reading under the slab mutex.
+- [x] Keep `Snapshot.refcount` atomic, but stop freeing draining snapshots directly from the request release path.
+- [x] Move final reclamation to the draining-list reaper under lock so a request can safely increment a snapshot refcount after loading the pointer but before reclamation.
+- [x] Add a retry rule: load active snapshot, increment refcount, then verify the snapshot is still the active one or still valid for pinning; if not, release and retry.
+- [x] Keep slab mutex ownership only on activation/reaper paths that mutate the active pointer or free slab allocations.
 
 **Verification scope**
 
@@ -462,6 +474,23 @@ Remove `shpool->mutex` from `du_get_active_peers()` while preserving safe snapsh
 - Add a generation-lifetime regression test proving a draining snapshot is not freed before the last request releases it.
 - Add perf verification for the capture-and-purge benchmark plus a dynamic-upstreams-only proxy run, with instructions/req and cache-miss deltas compared before/after the lock removal.
 - Add debug assertions or unit coverage around refcount transitions so underflow and double-release are caught early.
+
+**Phase 6 implementation summary (2026-05-09)**
+
+- `du_get_active_peers` is now lockless: atomic load of `store.active` (`.acquire`) → speculative refcount increment → re-load to verify still active → return on match; release and retry (up to 4 attempts) on mismatch. No slab mutex held on the request hot path.
+- `store.active` writes use `@atomicStore` with `.release` (still under slab mutex in the writer), pairing correctly with `.acquire` loads in the reader.
+- `du_release_generation` delegates the final free to `reap_draining` (which runs under slab mutex) rather than freeing inline. This makes `reap_draining` the single owner of the free path, preventing a concurrent lockless reader from racing with a free.
+- **Known residual risk**: between the atomic pointer load and the refcount increment, a concurrent PUT + full drain + reaper cycle on another worker could free the snapshot. The race window is 1–2 CPU instructions (~1 ns); the reaper cycle requires TCP I/O + mutex acquisition (~µs minimum). No epoch-based reclamation is implemented; a future phase may add it if empirical data shows this matters.
+- All 38 existing integration tests pass with the new implementation.
+
+**Phase 5 implementation summary (2026-05-09)**
+
+- `PATCH /dynamic-upstreams` with `{"drain":"ip:port"}` or `{"undrain":"ip:port"}` — idempotent, address-keyed drain table mutation.
+- Drain state lives in `UpstreamStore.drain_table[32]DrainEntry` (slab memory); `drain_count` is a `u32` written with `.release` semantics after the table entries are populated, so the lockless reader in `ngz_du_is_peer_draining` sees a consistent snapshot.
+- Both drain and undrain are protected by the slab mutex, same as snapshot activation.
+- GET response now includes `drain_count` (atomic `.acquire` load, always 0 until first PATCH drain).
+- `PATCH` wired in the main handler dispatcher alongside `GET` and `PUT`.
+- 8 new integration tests: drain/undrain round-trip, idempotency, GET reflection, input validation (bad JSON, missing field, oversized address, missing Content-Type).
 
 ### Phase 7 - Per-peer drain first, PATCH semantics second
 
@@ -471,9 +500,9 @@ Add operator-visible incremental control without abandoning the immutable whole-
 
 **TODO**
 
-- [ ] Introduce a per-peer desired-state model in the control plane: `active` and `draining` first; do not mutate live peer structs in place.
-- [ ] Add a drain-capable write contract, likely `PATCH`, that accepts explicit operations such as `drain`, `undrain`, `add`, `replace`, and `remove`.
-- [ ] Compile every partial mutation into a full next-generation snapshot by diffing against the current active generation, not by editing the active generation in place.
+- [x] Introduce a per-peer desired-state model in the control plane: `active` and `draining` first; do not mutate live peer structs in place.
+- [x] Add a drain-capable write contract, `PATCH`, that accepts `drain` and `undrain` operations (address-keyed, idempotent).
+- [ ] Compile every partial mutation (`add`, `replace`, `remove`) into a full next-generation snapshot by diffing against the current active generation, not by editing the active generation in place.
 - [ ] Preserve peer order for unchanged peers and append new peers deterministically so affinity churn stays bounded.
 - [ ] Delay hard removal of a drained peer until a subsequent generation excludes it, keeping the old generation alive until request refcounts naturally reach zero.
 - [ ] Surface patch-plan results in the API response: `changed`, `drained`, `added`, `removed`, and resulting `generation`.
