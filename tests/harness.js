@@ -45,27 +45,45 @@ function createRuntimeDir(moduleName) {
 
 // Start nginz with given config
 export async function startNginz(configPath, moduleName) {
+  await waitForPortFree(TEST_PORT);
   const runtimeDir = createRuntimeDir(moduleName);
   const absConfig = isAbsolute(configPath)
     ? configPath
     : join(process.cwd(), configPath);
-  
+
   nginzProcess = spawn([NGINZ_BIN, "-c", absConfig, "-p", runtimeDir], {
     stdout: "inherit",
     stderr: "inherit",
     cwd: process.cwd(),
   });
-  
+
   await waitForPort(TEST_PORT);
   return runtimeDir;
 }
 
-// Stop nginz gracefully
+// Stop nginz (fast shutdown so open connections from timed-out tests don't block)
 export async function stopNginz() {
   if (nginzProcess) {
-    nginzProcess.kill("SIGQUIT");
+    nginzProcess.kill("SIGTERM");
     await nginzProcess.exited;
     nginzProcess = null;
+  }
+}
+
+// Wait until nothing is listening on the port (previous nginx fully gone)
+async function waitForPortFree(port, timeout = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    try {
+      const socket = await Bun.connect({
+        hostname: "127.0.0.1",
+        port,
+        socket: { data() {}, open(s) { s.end(); }, close() {}, error() {} },
+      });
+      await Bun.sleep(50);
+    } catch {
+      return;
+    }
   }
 }
 
