@@ -43,6 +43,18 @@ function stickyKeyForPeer(peerIndex, peerCount = 2, prefix = "sticky-key") {
   throw new Error(`failed to find sticky key for peer ${peerIndex}`);
 }
 
+function stickyKeyStableAcrossCounts(peerIndex, beforeCount, afterCount, prefix = "stable-key") {
+  for (let i = 0; i < 16384; i++) {
+    const key = `${prefix}-${i}`;
+    if (crc32IsoHdlc(key) % beforeCount === peerIndex && crc32IsoHdlc(key) % afterCount === peerIndex) {
+      return key;
+    }
+  }
+  throw new Error(
+    `failed to find sticky key for peer ${peerIndex} stable across ${beforeCount}->${afterCount}`
+  );
+}
+
 function countOccurrences(haystack, needle) {
   if (needle.length === 0) return 0;
   return haystack.split(needle).length - 1;
@@ -612,5 +624,128 @@ describe("upstream-balancer healthcheck integration", () => {
     });
     expect(res.status).toBe(200);
     expect((await res.json()).server).toBe("backend2");
+  });
+});
+
+describe("upstream-balancer partial-mutation affinity regressions", () => {
+  let backend1;
+  let backend2;
+  let backend3;
+
+  beforeAll(async () => {
+    backend1 = createHTTPMock(MOCK_PORTS.HTTP_UPSTREAM_1);
+    backend1.setDefault({ status: 200, body: { server: "backend1" } });
+
+    backend2 = createHTTPMock(MOCK_PORTS.HTTP_UPSTREAM_2);
+    backend2.setDefault({ status: 200, body: { server: "backend2" } });
+
+    backend3 = createHTTPMock(19004);
+    backend3.setDefault({ status: 200, body: { server: "backend3" } });
+
+    await startNginz(`tests/${MODULE}/nginx-dynamic-partial.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    backend1.stop();
+    backend2.stop();
+    backend3.stop();
+    cleanupRuntime(MODULE);
+  });
+
+  test("PATCH add appends a new peer without disturbing stable keys for unchanged order", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+
+    const stableKey = stickyKeyStableAcrossCounts(1, 2, 3, "append-stable-backend2");
+    let res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${stableKey}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend2");
+
+    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        add: [{ address: "127.0.0.1:19004", weight: 1 }],
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${stableKey}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend2");
+
+    const newPeerKey = stickyKeyForPeer(2, 3, "append-backend3");
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${newPeerKey}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend3");
+  });
+
+  test("removed direct-peer cookies are treated as stale and rotated onto a live peer", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+          { address: "127.0.0.1:19004", weight: 1 },
+        ],
+      }),
+    });
+    let res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ remove: ["127.0.0.1:19002"] }),
+    });
+    expect(res.status).toBe(200);
+
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: "route=peer:127.0.0.1:19002" },
+    });
+    expect(res.status).toBe(200);
+    expect(["backend2", "backend3"]).toContain((await res.json()).server);
+    expect(res.headers.get("set-cookie")).toContain("route=peer:");
+    expect(res.headers.get("set-cookie")).not.toContain("127.0.0.1:19002");
+  });
+
+  test("draining direct-peer cookies are treated as stale and rotated onto a non-draining peer", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+    let res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(200);
+
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: "route=peer:127.0.0.1:19002" },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend2");
+    expect(res.headers.get("set-cookie")).toContain("route=peer:127.0.0.1:19003");
   });
 });

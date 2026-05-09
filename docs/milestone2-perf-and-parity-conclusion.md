@@ -149,7 +149,7 @@ nginx Plus supports marking a server as `draining` — it receives no new reques
 
 ### Partial Server Mutation (PATCH semantics)
 
-nginx Plus allows adding or removing individual servers from an upstream group via the upstream API without replacing the entire peer set. The current `dynamic-upstreams` model is still whole-generation replacement: `PUT` or source-driven activation always builds a complete new snapshot and swaps it atomically. Partial mutation should therefore be implemented as **API semantics over the same immutable snapshot model**: diff against the current generation, merge the requested changes, then publish one complete next generation. This is addressable, but should follow explicit drain semantics so removal can be done safely.
+This gap is now closed for the current scope. `dynamic-upstreams` supports `PATCH add/remove/replace`, but those operations are only API sugar: each request diffs against the current active-or-static peer set, preserves unchanged peer relative order, appends new peers deterministically, and then activates the result through the existing immutable snapshot pipeline. Drain state remains separate from membership.
 
 ### Sticky Learn
 
@@ -207,10 +207,25 @@ The priority list above is the production-value ranking. The recommended **imple
 6. **Lockless request-time snapshot pinning**  
    Important, but harder than the control-plane work above. This is concurrency surgery on the common request path and should land only after the surrounding model is stable.
 
-7. **Affinity stability rules for partial mutation**  
-   Before adding PATCH, make the ordering and cookie-rotation behavior explicit so sticky churn stays bounded and testable.
+7. **Affinity stability rules for partial mutation** — **done**  
+   Ordering and stale-cookie rotation are now explicit: unchanged peers keep relative order, new peers append deterministically, and removed/draining direct-peer cookies rotate onto a live peer when issuance is enabled.
 
-8. **PATCH semantics**  
-   Last on purpose. Partial mutation should compile into the existing whole-snapshot activation path, not introduce a second live-mutation model.
+8. **PATCH semantics** — **done**  
+   Partial mutation compiles into the existing whole-snapshot activation path; no second live-mutation model was introduced.
 
 In short: **stabilize observability first, fix restart/bootstrap, remove the blocking source adapter, define drain semantics, then add richer mutation APIs**. That is the cleanest fit for the current codebase.
+
+---
+
+## Appendix: Current Status
+
+As of the latest audit pass, appendix items **1-8** are complete for the current milestone scope.
+
+- **Items 1-6** remain implemented and test-backed: worker-events contract hardening, cold-start restore, async Consul polling, drain contract, per-peer drain API, and lockless request-time pinning.
+- **Item 7** is complete with one additional planner fix from the final audit: a single `PATCH` request can no longer remove a current peer and then reuse that same address through `add` or `replace`, because that would act as an implicit reorder and break the intended affinity-stability rule.
+- **Item 8** is complete: partial mutation still compiles into the immutable full-snapshot activation path, with no second live-mutation model.
+
+Verification scope for the final `7/8` audit:
+
+- `bun test tests/dynamic-upstreams/dynamic-upstreams.test.js tests/worker-events/worker-events.test.js tests/upstream-balancer/upstream-balancer.test.js`
+- Result: `110 pass`, `0 fail`

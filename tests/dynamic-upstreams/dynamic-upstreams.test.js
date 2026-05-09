@@ -929,6 +929,267 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 });
 
+describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("PATCH add appends new peers in request order and preserves unchanged relative order", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 2 },
+        ],
+      }),
+    });
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        add: [
+          { address: "127.0.0.1:19004", weight: 3 },
+          { address: "127.0.0.1:19005", weight: 4 },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.action).toBe("patch");
+    expect(body.changed).toBe(true);
+    expect(body.added).toBe(2);
+    expect(body.removed).toBe(0);
+    expect(body.generation).toBeGreaterThan(before.generation);
+    expect(body.peer_count).toBe(4);
+
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(state.peers.map((peer) => peer.address)).toEqual([
+      "127.0.0.1:19002",
+      "127.0.0.1:19003",
+      "127.0.0.1:19004",
+      "127.0.0.1:19005",
+    ]);
+    expect(state.peers.map((peer) => peer.weight)).toEqual([1, 2, 3, 4]);
+  });
+
+  test("PATCH replace can swap one peer in-place while preserving slot order", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 2 },
+        ],
+      }),
+    });
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replace: [
+          {
+            current: "127.0.0.1:19003",
+            address: "127.0.0.1:19004",
+            weight: 5,
+          },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.changed).toBe(true);
+    expect(body.added).toBe(1);
+    expect(body.removed).toBe(1);
+    expect(body.peer_count).toBe(2);
+
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(state.peers.map((peer) => peer.address)).toEqual([
+      "127.0.0.1:19002",
+      "127.0.0.1:19004",
+    ]);
+    expect(state.peers.map((peer) => peer.weight)).toEqual([1, 5]);
+  });
+
+  test("PATCH remove keeps the remaining peers in their previous relative order", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 2 },
+          { address: "127.0.0.1:19004", weight: 3 },
+        ],
+      }),
+    });
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ remove: ["127.0.0.1:19003"] }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.changed).toBe(true);
+    expect(body.added).toBe(0);
+    expect(body.removed).toBe(1);
+    expect(body.peer_count).toBe(2);
+
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(state.peers.map((peer) => peer.address)).toEqual([
+      "127.0.0.1:19002",
+      "127.0.0.1:19004",
+    ]);
+  });
+
+  test("PATCH no-op replace returns changed=false and preserves the current generation", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 2 },
+        ],
+      }),
+    });
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        replace: [{ address: "127.0.0.1:19003", weight: 2 }],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.changed).toBe(false);
+    expect(body.added).toBe(0);
+    expect(body.removed).toBe(0);
+    expect(body.generation).toBe(before.generation);
+    expect(body.peer_count).toBe(before.peer_count);
+  });
+
+  test("PATCH rejects mixed drain and membership operations and preserves last good state", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 1 }] }),
+    });
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        drain: "127.0.0.1:19002",
+        add: [{ address: "127.0.0.1:19003", weight: 1 }],
+      }),
+    });
+    expect(res.status).toBe(400);
+
+    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(after.generation).toBe(before.generation);
+    expect(after.peers).toEqual(before.peers);
+  });
+
+  test("PATCH rejects duplicate adds against the current snapshot and keeps the last good generation", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        add: [{ address: "127.0.0.1:19003", weight: 9 }],
+      }),
+    });
+    expect(res.status).toBe(409);
+
+    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(after.generation).toBe(before.generation);
+    expect(after.peers).toEqual(before.peers);
+  });
+
+  test("PATCH rejects remove+add of the same current address because it would reorder an existing peer", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        remove: ["127.0.0.1:19002"],
+        add: [{ address: "127.0.0.1:19002", weight: 1 }],
+      }),
+    });
+    expect(res.status).toBe(409);
+
+    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(after.generation).toBe(before.generation);
+    expect(after.peers).toEqual(before.peers);
+  });
+
+  test("PATCH rejects replace that reuses an address removed earlier in the same patch", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+          { address: "127.0.0.1:19004", weight: 1 },
+        ],
+      }),
+    });
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        remove: ["127.0.0.1:19002"],
+        replace: [{ current: "127.0.0.1:19003", address: "127.0.0.1:19002", weight: 1 }],
+      }),
+    });
+    expect(res.status).toBe(409);
+
+    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(after.generation).toBe(before.generation);
+    expect(after.peers).toEqual(before.peers);
+  });
+});
+
 describe("dynamic-upstreams Phase 5 — drain state is scoped per upstream", () => {
   let backend;
 

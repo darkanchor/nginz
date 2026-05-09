@@ -898,17 +898,22 @@ export fn upstream_balancer_get_peer(
     pc.*.connection = null;
 
     peers_wlock(peers);
-    defer peers_unlock(peers);
+    var peers_locked = true;
+    defer if (peers_locked) peers_unlock(peers);
 
     if (peers.*.config != null and rrp.*.config != peers.*.config.*) {
         if (bcf.*.fallback_mode == FALLBACK_OFF) return core.NGX_BUSY;
+        peers_unlock(peers);
+        peers_locked = false;
         return orig_get(pc, ctx.original_data);
     }
 
-    const maybe_chosen = if (direct_target) |target_name|
-        select_direct_peer(source_ctx, rrp, target_name)
-    else
-        select_sticky_peer(source_ctx, rrp, hash);
+    var direct_target_missed = false;
+    const maybe_chosen = if (direct_target) |target_name| blk: {
+        if (select_direct_peer(source_ctx, rrp, target_name)) |selection| break :blk selection;
+        direct_target_missed = true;
+        break :blk select_sticky_peer(source_ctx, rrp, hash);
+    } else select_sticky_peer(source_ctx, rrp, hash);
     const chosen = maybe_chosen orelse {
         if (direct_target != null) incrementMetric(.direct_peer_misses);
         if (bcf.*.fallback_mode == FALLBACK_OFF) {
@@ -917,6 +922,8 @@ export fn upstream_balancer_get_peer(
             return core.NGX_BUSY;
         }
         incrementMetric(.fallback_next_total);
+        peers_unlock(peers);
+        peers_locked = false;
         const rc = orig_get(pc, ctx.original_data);
         if (rc == core.NGX_OK and direct_target != null) {
             if (rrp.*.current != null) {
@@ -934,7 +941,13 @@ export fn upstream_balancer_get_peer(
     rrp.*.current = chosen.peer;
     mark_peer_tried(rrp, chosen.index);
     ctx.sticky_used = 1;
-    incrementMetric(if (direct_target != null) .direct_peer_hits else .hash_hits);
+    if (direct_target_missed) {
+        incrementMetric(.direct_peer_misses);
+        incrementMetric(.hash_hits);
+        if (buildIssuedCookieValue(r, bcf, chosen.peer)) |cookie| queueIssuedCookie(ctx, cookie, true);
+    } else {
+        incrementMetric(if (direct_target != null) .direct_peer_hits else .hash_hits);
+    }
 
     ngx.log.ngz_log_error(ngx.log.NGX_LOG_DEBUG, pc.*.log, 0,
         "upstream_balancer: sticky hit\x00", .{});

@@ -4,7 +4,7 @@ Runtime upstream reconfiguration module for updating peer tables without a full 
 
 ### Status
 
-**Feature ready** — truthful introspection, atomic full-snapshot replacement, worker-events fanout, operational status fields, bounded static-file polling, health-aware activation, and consul service-discovery reconciliation are implemented and test-backed.
+**Feature ready** — truthful introspection, atomic full-snapshot replacement, PATCH add/remove/replace compilation into immutable snapshot activation, worker-events fanout, operational status fields, bounded static-file polling, health-aware activation, and consul service-discovery reconciliation are implemented and test-backed.
 
 ### Purpose and Boundaries
 
@@ -30,6 +30,9 @@ This module should **not** own:
 - `dynamic_upstreams_managed` registers a shared-memory snapshot store and the peer-source handoff used by `upstream-balancer`.
 - `GET` exposes the active generation, current peers, source mode, and operational fields such as `last_success_at_msec`, `last_error_at_msec`, and `last_error_code`.
 - `PUT` accepts whole-snapshot replacement with pool/slab-backed validation, duplicate-peer rejection, and last-good preservation on failure.
+- `PATCH` supports two exclusive modes: drain control (`drain` / `undrain`) and membership diff (`add`, `remove`, `replace`). Membership PATCH never mutates the live peer graph in place; it compiles the requested diff against the current active-or-static peer set and activates the result through the same immutable snapshot path as `PUT`.
+- Membership PATCH preserves unchanged peer relative order, removes peers in place, and appends new peers deterministically in request order. `replace` uses peer address as identity; replacing one address with another keeps the slot position while still producing a full next generation.
+- Drain state remains separate from snapshot membership: `drain` / `undrain` update only the drain table consulted by `upstream-balancer` for new request selection.
 - `dynamic_upstreams_source static` plus `dynamic_upstreams_source_file` and `dynamic_upstreams_refresh` enables worker-0 polling of a JSON source file with no-op refresh on unchanged content.
 - `dynamic_upstreams_source consul` reconciles healthy instances from Consul’s `/v1/health/service/<name>?passing=true` endpoint, forwards optional `tag` / `dc` / token metadata, and treats an empty healthy result as a valid empty upstream snapshot.
 - Successful activation can publish a `snapshot_activated` event through `dynamic_upstreams_worker_events_channel`.
@@ -42,8 +45,10 @@ This module should **not** own:
 
 - truthful `GET` / `HEAD` behavior for static peers and active snapshots
 - whole-snapshot replacement through `PUT`
+- PATCH add/remove/replace through immutable next-generation activation
 - validation failures preserve the previous generation
 - duplicate peers are rejected
+- mixed or invalid PATCH shapes are rejected without changing the active generation
 - content-type enforcement and deterministic `405` / `415` responses
 - worker-events fanout on activation
 - static-file polling with last-good preservation on source failure
@@ -149,11 +154,27 @@ Current write contract:
 - success responses return the activated generation and peer count
 - validation failures preserve the previously active generation
 
+Current PATCH contract:
+
+- allowed write method: `PATCH`
+- accepted content type: `application/json`
+- PATCH payloads are either:
+  - drain mode: `{ "drain": "IP:port" }` or `{ "undrain": "IP:port" }`
+  - membership mode: any combination of
+    - `add: [{ "address": "IP:port", "weight": N? }, ...]`
+    - `remove: ["IP:port", ...]`
+    - `replace: [{ "current": "IP:port", "address": "IP:port", "weight": N? }, ...]`
+- drain mode and membership mode are mutually exclusive in one request
+- `replace` defaults `current` to `address` when only a weight change is needed
+- membership PATCH validates against the current active generation when present, otherwise against the static upstream peer list
+- successful membership PATCH responses include `changed`, `added`, `removed`, `generation`, and `peer_count`
+- validation failures preserve the previously active generation and drain table
+
 ### Request / Worker Lifecycle
 
 - Control API lives at `location` scope
 - Reads should serve current active snapshot state
-- Writes should validate a full replacement snapshot before activation
+- Writes should validate a full replacement snapshot before activation; PATCH compiles its diff into that same replacement model rather than mutating peers in place
 - Background reconciliation should be a later phase, not a requirement for the first useful version
 
 ### Traceability and Audit Hooks
@@ -162,6 +183,7 @@ Current write contract:
 |---|---|
 | `GET` / `HEAD` are truthful about the bound upstream | `tests/dynamic-upstreams/dynamic-upstreams.test.js` Phase 1 block |
 | Snapshot replacement is atomic and preserves last good state on validation failure | same test file, Phase 2 block |
+| Membership PATCH compiles add/remove/replace into the same immutable activation path and preserves deterministic order | same test file, Phase 7 block |
 | Source-driven refresh preserves last good state on failure | same test file, refresh block |
 | Worker-events fanout publishes activation notifications | same test file, Phase 3 worker-events block |
 | Health-aware activation excludes ineligible peers and re-admits them after recovery | same test file, health-aware block |
@@ -502,10 +524,18 @@ Add operator-visible incremental control without abandoning the immutable whole-
 
 - [x] Introduce a per-peer desired-state model in the control plane: `active` and `draining` first; do not mutate live peer structs in place.
 - [x] Add a drain-capable write contract, `PATCH`, that accepts `drain` and `undrain` operations (address-keyed, idempotent).
-- [ ] Compile every partial mutation (`add`, `replace`, `remove`) into a full next-generation snapshot by diffing against the current active generation, not by editing the active generation in place.
-- [ ] Preserve peer order for unchanged peers and append new peers deterministically so affinity churn stays bounded.
+- [x] Compile every partial mutation (`add`, `replace`, `remove`) into a full next-generation snapshot by diffing against the current active generation, not by editing the active generation in place.
+- [x] Preserve peer order for unchanged peers and append new peers deterministically so affinity churn stays bounded.
 - [ ] Delay hard removal of a drained peer until a subsequent generation excludes it, keeping the old generation alive until request refcounts naturally reach zero.
-- [ ] Surface patch-plan results in the API response: `changed`, `drained`, `added`, `removed`, and resulting `generation`.
+- [x] Surface patch-plan results in the API response: `changed`, `added`, `removed`, and resulting `generation` / `peer_count`.
+
+**Phase 7 implementation summary (2026-05-09)**
+
+- `PATCH add/remove/replace` is now request-time diffing over the current active generation when present, or the static peer set before the first dynamic activation.
+- The synthesized peer list is always published through the existing immutable `activate_snapshot_from_specs(...)` path used by `PUT`; there is no second live-mutation model.
+- Unchanged peers keep their prior relative order. New peers append deterministically in request order. `replace` keeps the target slot position while treating peer address as cross-generation identity.
+- Drain state remains out-of-band in `UpstreamStore.drain_table`; membership PATCH does not mutate or derive drain entries.
+- Successful membership PATCH responses return `changed`, `added`, `removed`, `generation`, and `peer_count`. Drain/undrain responses continue to surface drain-specific fields.
 
 **Verification scope**
 

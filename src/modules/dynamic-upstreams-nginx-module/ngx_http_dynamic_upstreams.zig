@@ -1229,6 +1229,30 @@ const ApplyResult = struct {
     changed: bool,
 };
 
+const CurrentPeerSpecs = struct {
+    generation: u64,
+    specs: [*c]PeerSpec,
+    count: usize,
+};
+
+const CurrentPeerSpecsResult = union(enum) {
+    ok: CurrentPeerSpecs,
+    err: ErrorResponse,
+};
+
+const PatchPlan = struct {
+    specs: [*c]PeerSpec,
+    count: usize,
+    added: usize,
+    removed: usize,
+    changed: bool,
+};
+
+const PatchPlanResult = union(enum) {
+    ok: PatchPlan,
+    err: ErrorResponse,
+};
+
 const ErrorResponse = struct {
     status: ngx_uint_t,
     body: ngx_str_t,
@@ -1258,126 +1282,434 @@ fn active_snapshot_matches_specs(store: [*c]UpstreamStore, specs: [*c]PeerSpec, 
     return p == null and idx == count;
 }
 
-fn build_and_activate_snapshot(
+fn peer_spec_addr(spec: [*c]const PeerSpec) []const u8 {
+    return core.slicify(u8, spec.*.addr_data, spec.*.addr_len);
+}
+
+fn peer_weight_or_one(peer: [*c]ngx_http_upstream_rr_peer_t) ngx_int_t {
+    return if (peer.*.weight > 0) peer.*.weight else 1;
+}
+
+fn dup_pool_bytes(pool: [*c]core.ngx_pool_t, s: []const u8) ?[*c]u8 {
+    if (s.len == 0) return core.nullptr(u8);
+    const mem = core.castPtr(u8, core.ngx_pnalloc(pool, s.len)) orelse return null;
+    @memcpy(mem[0..s.len], s);
+    return mem;
+}
+
+fn parse_peer_spec_value(ducf: [*c]DynamicUpstreamsSrvConf, item: [*c]cjson.cJSON) union(enum) {
+    ok: PeerSpec,
+    err: ErrorResponse,
+} {
+    const addr_node = cjson.cJSON_GetObjectItem(item, "address");
+    if (addr_node == core.nullptr(cjson.cJSON) or cjson.cJSON_IsString(addr_node) != 1) {
+        record_store_error(ducf, DU_ERROR_INVALID_PEER);
+        return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"peer missing 'address' string\"}") } };
+    }
+    const addr_str = CJSON.stringValue(addr_node) orelse ngx_null_str;
+    if (addr_str.len == 0) {
+        record_store_error(ducf, DU_ERROR_INVALID_PEER);
+        return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"peer address must not be empty\"}") } };
+    }
+
+    var weight: ngx_int_t = 1;
+    const w_node = cjson.cJSON_GetObjectItem(item, "weight");
+    if (w_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsNumber(w_node) == 1) {
+        const wf = cjson.cJSON_GetNumberValue(w_node);
+        if (wf < 1 or wf > 65535) {
+            record_store_error(ducf, DU_ERROR_INVALID_PEER);
+            return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"weight must be 1..65535\"}") } };
+        }
+        weight = @intFromFloat(wf);
+    }
+
+    return .{ .ok = .{
+        .addr_data = addr_str.data,
+        .addr_len = addr_str.len,
+        .weight = weight,
+    } };
+}
+
+fn pin_active_snapshot_for_store(store: *UpstreamStore) ?u64 {
+    _ = @atomicRmw(c_ulong, &store.pin_readers, .Add, 1, .acq_rel);
+    defer _ = @atomicRmw(c_ulong, &store.pin_readers, .Sub, 1, .acq_rel);
+
+    const active_int = @atomicLoad(usize, @as(*const usize, @ptrCast(&store.active)), .acquire);
+    if (active_int == 0) return null;
+    const snap: *Snapshot = @ptrFromInt(active_int);
+    _ = @atomicRmw(c_ulong, &snap.refcount, .Add, 1, .acq_rel);
+    return active_int;
+}
+
+fn collect_current_peer_specs(
+    pool: [*c]core.ngx_pool_t,
+    ducf: [*c]DynamicUpstreamsSrvConf,
+    uscf: [*c]ngx_http_upstream_srv_conf_t,
+) CurrentPeerSpecsResult {
+    const store_cptr = ducf.*.store;
+    if (store_cptr == core.nullptr(UpstreamStore)) {
+        return .{ .err = .{ .status = http.NGX_HTTP_SERVICE_UNAVAILABLE, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"store unavailable\"}") } };
+    }
+    const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
+
+    var pinned_token: u64 = 0;
+    var generation: u64 = 0;
+    var active_snapshot: ?*Snapshot = null;
+    if (pin_active_snapshot_for_store(store)) |pinned_generation| {
+        pinned_token = pinned_generation;
+        generation = if (pinned_generation != 0) (@as(*Snapshot, @ptrFromInt(pinned_generation))).*.generation else 0;
+        active_snapshot = if (pinned_generation != 0) @ptrFromInt(pinned_generation) else null;
+    }
+    defer if (pinned_token != 0) {
+        const ctx: ?*anyopaque = @ptrCast(@alignCast(ducf));
+        du_release_generation(ctx, core.nullptr(ngx_http_upstream_rr_peers_t), pinned_token);
+    };
+
+    const peer_count: usize = if (active_snapshot) |sn|
+        sn.*.peer_count
+    else blk: {
+        var count: usize = 0;
+        const peers = core.castPtr(ngx_http_upstream_rr_peers_t, uscf.*.peer.data) orelse break :blk 0;
+        var p = peers.*.peer;
+        while (p != core.nullptr(ngx_http_upstream_rr_peer_t)) : (p = p.*.next) count += 1;
+        break :blk count;
+    };
+
+    const specs: [*c]PeerSpec = if (peer_count == 0)
+        core.nullptr(PeerSpec)
+    else
+        core.ngz_pcalloc_n(@intCast(peer_count), PeerSpec, pool) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+        };
+
+    var idx: usize = 0;
+    if (active_snapshot) |sn| {
+        var p = sn.*.peers.*.peer;
+        while (p != core.nullptr(ngx_http_upstream_rr_peer_t) and idx < peer_count) : (p = p.*.next) {
+            const name = core.slicify(u8, p.*.name.data, p.*.name.len);
+            const name_copy = dup_pool_bytes(pool, name) orelse {
+                record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+                return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+            };
+            specs[idx] = .{ .addr_data = name_copy, .addr_len = name.len, .weight = peer_weight_or_one(p) };
+            idx += 1;
+        }
+    } else {
+        const peers = core.castPtr(ngx_http_upstream_rr_peers_t, uscf.*.peer.data) orelse {
+            return .{ .ok = .{ .generation = 0, .specs = specs, .count = 0 } };
+        };
+        var p = peers.*.peer;
+        while (p != core.nullptr(ngx_http_upstream_rr_peer_t) and idx < peer_count) : (p = p.*.next) {
+            const name = core.slicify(u8, p.*.name.data, p.*.name.len);
+            const name_copy = dup_pool_bytes(pool, name) orelse {
+                record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+                return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+            };
+            specs[idx] = .{ .addr_data = name_copy, .addr_len = name.len, .weight = peer_weight_or_one(p) };
+            idx += 1;
+        }
+    }
+
+    return .{ .ok = .{ .generation = generation, .specs = specs, .count = idx } };
+}
+
+fn peer_spec_lists_equal(a_specs: [*c]PeerSpec, a_count: usize, b_specs: [*c]PeerSpec, b_count: usize) bool {
+    if (a_count != b_count) return false;
+    var i: usize = 0;
+    while (i < a_count) : (i += 1) {
+        if (!std.mem.eql(u8, peer_spec_addr(&a_specs[i]), peer_spec_addr(&b_specs[i]))) return false;
+        if (a_specs[i].weight != b_specs[i].weight) return false;
+    }
+    return true;
+}
+
+fn build_patch_plan(
+    pool: [*c]core.ngx_pool_t,
+    ducf: [*c]DynamicUpstreamsSrvConf,
+    current_specs: [*c]PeerSpec,
+    current_count: usize,
+    add_node: [*c]cjson.cJSON,
+    remove_node: [*c]cjson.cJSON,
+    replace_node: [*c]cjson.cJSON,
+) PatchPlanResult {
+    const add_count: usize = if (add_node != core.nullptr(cjson.cJSON)) @intCast(@max(0, cjson.cJSON_GetArraySize(add_node))) else 0;
+    const replace_count: usize = if (replace_node != core.nullptr(cjson.cJSON)) @intCast(@max(0, cjson.cJSON_GetArraySize(replace_node))) else 0;
+    const max_count = current_count + add_count + replace_count;
+
+    if (max_count > MAX_PEERS_PER_PUT) {
+        record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+        return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"too many peers\"}") } };
+    }
+
+    const working_specs: [*c]PeerSpec = if (max_count == 0)
+        core.nullptr(PeerSpec)
+    else
+        core.ngz_pcalloc_n(@intCast(max_count), PeerSpec, pool) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+        };
+    const removed_flags: [*c]u8 = if (current_count == 0)
+        core.nullptr(u8)
+    else
+        core.castPtr(u8, core.ngx_pcalloc(pool, current_count)) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+        };
+
+    var i: usize = 0;
+    while (i < current_count) : (i += 1) working_specs[i] = current_specs[i];
+
+    var working_count = current_count;
+
+    if (remove_node != core.nullptr(cjson.cJSON)) {
+        var it = CJSON.Iterator.init(remove_node);
+        while (it.next()) |item| {
+            if (cjson.cJSON_IsString(item) != 1) {
+                record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+                return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'remove' entries must be address strings\"}") } };
+            }
+            const addr_ngx = CJSON.stringValue(item) orelse ngx_null_str;
+            if (addr_ngx.len == 0) {
+                record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+                return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"remove address must be non-empty\"}") } };
+            }
+            const addr = core.slicify(u8, addr_ngx.data, addr_ngx.len);
+
+            var found = false;
+            var idx: usize = 0;
+            while (idx < current_count) : (idx += 1) {
+                if (removed_flags[idx] != 0) continue;
+                if (std.mem.eql(u8, peer_spec_addr(&working_specs[idx]), addr)) {
+                    removed_flags[idx] = 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                record_store_error(ducf, DU_ERROR_INVALID_PEER);
+                return .{ .err = .{ .status = http.NGX_HTTP_NOT_FOUND, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"remove address not present in current upstream\"}") } };
+            }
+        }
+    }
+
+    if (replace_node != core.nullptr(cjson.cJSON)) {
+        var it = CJSON.Iterator.init(replace_node);
+        while (it.next()) |item| {
+            if (cjson.cJSON_IsObject(item) != 1) {
+                record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+                return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'replace' entries must be peer objects\"}") } };
+            }
+            const current_node = cjson.cJSON_GetObjectItem(item, "current");
+            const next_spec = switch (parse_peer_spec_value(ducf, item)) {
+                .err => |e| return .{ .err = e },
+                .ok => |spec| spec,
+            };
+
+            const current_addr_ngx = if (current_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsString(current_node) == 1)
+                (CJSON.stringValue(current_node) orelse ngx_null_str)
+            else
+                ngx_str_t{ .data = next_spec.addr_data, .len = next_spec.addr_len };
+            if (current_addr_ngx.len == 0) {
+                record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+                return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"replace current address must be non-empty\"}") } };
+            }
+            const current_addr = core.slicify(u8, current_addr_ngx.data, current_addr_ngx.len);
+
+            var target_idx: ?usize = null;
+            var idx: usize = 0;
+            while (idx < current_count) : (idx += 1) {
+                if (removed_flags[idx] != 0) continue;
+                if (std.mem.eql(u8, peer_spec_addr(&working_specs[idx]), current_addr)) {
+                    target_idx = idx;
+                    break;
+                }
+            }
+            if (target_idx == null) {
+                record_store_error(ducf, DU_ERROR_INVALID_PEER);
+                return .{ .err = .{ .status = http.NGX_HTTP_NOT_FOUND, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"replace current address not present in current upstream\"}") } };
+            }
+
+            const next_addr = peer_spec_addr(&next_spec);
+            var dup_idx: usize = 0;
+            while (dup_idx < current_count) : (dup_idx += 1) {
+                if (dup_idx == target_idx.?) continue;
+                if (std.mem.eql(u8, peer_spec_addr(&working_specs[dup_idx]), next_addr)) {
+                    record_store_error(ducf, DU_ERROR_INVALID_PEER);
+                    return .{ .err = .{ .status = 409, .body = if (removed_flags[dup_idx] != 0)
+                        ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"cannot reuse a removed current peer address in the same patch\"}")
+                    else
+                        ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"duplicate peer address\"}") } };
+                }
+                if (removed_flags[dup_idx] != 0) continue;
+            }
+            var add_idx = current_count;
+            while (add_idx < working_count) : (add_idx += 1) {
+                if (std.mem.eql(u8, peer_spec_addr(&working_specs[add_idx]), next_addr)) {
+                    record_store_error(ducf, DU_ERROR_INVALID_PEER);
+                    return .{ .err = .{ .status = 409, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"duplicate peer address\"}") } };
+                }
+            }
+            working_specs[target_idx.?] = next_spec;
+        }
+    }
+
+    if (add_node != core.nullptr(cjson.cJSON)) {
+        var it = CJSON.Iterator.init(add_node);
+        while (it.next()) |item| {
+            if (cjson.cJSON_IsObject(item) != 1) {
+                record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+                return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'add' entries must be peer objects\"}") } };
+            }
+            const spec = switch (parse_peer_spec_value(ducf, item)) {
+                .err => |e| return .{ .err = e },
+                .ok => |s| s,
+            };
+            const addr = peer_spec_addr(&spec);
+
+            var idx: usize = 0;
+            while (idx < current_count) : (idx += 1) {
+                if (std.mem.eql(u8, peer_spec_addr(&working_specs[idx]), addr)) {
+                    record_store_error(ducf, DU_ERROR_INVALID_PEER);
+                    return .{ .err = .{ .status = 409, .body = if (removed_flags[idx] != 0)
+                        ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"cannot re-add a removed current peer in the same patch\"}")
+                    else
+                        ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"add address already present in current upstream\"}") } };
+                }
+            }
+            idx = current_count;
+            while (idx < working_count) : (idx += 1) {
+                if (std.mem.eql(u8, peer_spec_addr(&working_specs[idx]), addr)) {
+                    record_store_error(ducf, DU_ERROR_INVALID_PEER);
+                    return .{ .err = .{ .status = 409, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"duplicate peer address\"}") } };
+                }
+            }
+            working_specs[working_count] = spec;
+            working_count += 1;
+        }
+    }
+
+    const final_count = working_count - blk: {
+        var removed_total: usize = 0;
+        var idx: usize = 0;
+        while (idx < current_count) : (idx += 1) {
+            if (removed_flags[idx] != 0) removed_total += 1;
+        }
+        break :blk removed_total;
+    };
+    const final_specs: [*c]PeerSpec = if (final_count == 0)
+        core.nullptr(PeerSpec)
+    else
+        core.ngz_pcalloc_n(@intCast(final_count), PeerSpec, pool) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+        };
+
+    var out_idx: usize = 0;
+    i = 0;
+    while (i < current_count) : (i += 1) {
+        if (removed_flags[i] != 0) continue;
+        final_specs[out_idx] = working_specs[i];
+        out_idx += 1;
+    }
+    i = current_count;
+    while (i < working_count) : (i += 1) {
+        final_specs[out_idx] = working_specs[i];
+        out_idx += 1;
+    }
+
+    var added_total: usize = 0;
+    i = 0;
+    while (i < final_count) : (i += 1) {
+        const addr = peer_spec_addr(&final_specs[i]);
+        var found = false;
+        var idx: usize = 0;
+        while (idx < current_count) : (idx += 1) {
+            if (std.mem.eql(u8, peer_spec_addr(&current_specs[idx]), addr)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) added_total += 1;
+    }
+
+    var removed_total: usize = 0;
+    i = 0;
+    while (i < current_count) : (i += 1) {
+        const addr = peer_spec_addr(&current_specs[i]);
+        var found = false;
+        var idx: usize = 0;
+        while (idx < final_count) : (idx += 1) {
+            if (std.mem.eql(u8, peer_spec_addr(&final_specs[idx]), addr)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) removed_total += 1;
+    }
+
+    return .{ .ok = .{
+        .specs = final_specs,
+        .count = final_count,
+        .added = added_total,
+        .removed = removed_total,
+        .changed = !peer_spec_lists_equal(current_specs, current_count, final_specs, final_count),
+    } };
+}
+
+fn activate_snapshot_from_specs(
     pool: [*c]core.ngx_pool_t,
     ducf: [*c]DynamicUpstreamsSrvConf,
     uscf: [*c]ngx_http_upstream_srv_conf_t,
     lccf: [*c]dynamic_upstreams_loc_conf,
-    json: [*c]cjson.cJSON,
+    specs: [*c]PeerSpec,
+    addr_count: usize,
     allow_noop_if_same: bool,
     allow_empty_peers: bool,
     skip_health_filter: bool,
     publish_restored_event: bool,
 ) ActivationResult {
-    const peers_node = cjson.cJSON_GetObjectItem(json, "peers");
-    if (peers_node == core.nullptr(cjson.cJSON) or cjson.cJSON_IsArray(peers_node) != 1) {
-        record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-        return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'peers' array required\"}") } };
-    }
-
-    const n_peers: usize = @intCast(@max(0, cjson.cJSON_GetArraySize(peers_node)));
-    if (n_peers == 0 and !allow_empty_peers) {
+    if (addr_count == 0 and !allow_empty_peers) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
         return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"at least one peer required\"}") } };
     }
-    if (n_peers > MAX_PEERS_PER_PUT) {
+    if (addr_count > MAX_PEERS_PER_PUT) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
         return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"too many peers\"}") } };
     }
 
-    const specs: [*c]PeerSpec = if (n_peers == 0)
-        core.nullptr(PeerSpec)
-    else
-        core.ngz_pcalloc_n(@intCast(n_peers), PeerSpec, pool) orelse {
-            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
-            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
-        };
-    const urls: [*c]ngx_url_t = if (n_peers == 0)
+    const urls: [*c]ngx_url_t = if (addr_count == 0)
         core.nullptr(ngx_url_t)
     else
-        core.ngz_pcalloc_n(@intCast(n_peers), ngx_url_t, pool) orelse {
+        core.ngz_pcalloc_n(@intCast(addr_count), ngx_url_t, pool) orelse {
             record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
             return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate url scratch space\"}") } };
         };
-    const eligible_specs: [*c]PeerSpec = if (n_peers == 0)
+    const eligible_specs: [*c]PeerSpec = if (addr_count == 0)
         core.nullptr(PeerSpec)
     else
-        core.ngz_pcalloc_n(@intCast(n_peers), PeerSpec, pool) orelse {
+        core.ngz_pcalloc_n(@intCast(addr_count), PeerSpec, pool) orelse {
             record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
             return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
         };
-    const eligible_urls: [*c]ngx_url_t = if (n_peers == 0)
+    const eligible_urls: [*c]ngx_url_t = if (addr_count == 0)
         core.nullptr(ngx_url_t)
     else
-        core.ngz_pcalloc_n(@intCast(n_peers), ngx_url_t, pool) orelse {
+        core.ngz_pcalloc_n(@intCast(addr_count), ngx_url_t, pool) orelse {
             record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
             return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate url scratch space\"}") } };
         };
-
-    var addr_count: usize = 0;
-    var it = CJSON.Iterator.init(peers_node);
-    while (it.next()) |item| {
-        if (addr_count >= MAX_PEERS_PER_PUT) break;
-
-        const addr_node = cjson.cJSON_GetObjectItem(item, "address");
-        if (addr_node == core.nullptr(cjson.cJSON) or cjson.cJSON_IsString(addr_node) != 1) {
-            record_store_error(ducf, DU_ERROR_INVALID_PEER);
-            return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"peer missing 'address' string\"}") } };
-        }
-        const addr_str = CJSON.stringValue(addr_node) orelse ngx_null_str;
-        if (addr_str.len == 0) {
-            record_store_error(ducf, DU_ERROR_INVALID_PEER);
-            return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"peer address must not be empty\"}") } };
-        }
-
-        var weight: ngx_int_t = 1;
-        const w_node = cjson.cJSON_GetObjectItem(item, "weight");
-        if (w_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsNumber(w_node) == 1) {
-            const wf = cjson.cJSON_GetNumberValue(w_node);
-            if (wf < 1 or wf > 65535) {
-                record_store_error(ducf, DU_ERROR_INVALID_PEER);
-                return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"weight must be 1..65535\"}") } };
-            }
-            weight = @intFromFloat(wf);
-        }
-
-        urls[addr_count] = std.mem.zeroes(ngx_url_t);
-        urls[addr_count].url = addr_str;
-        urls[addr_count].flags.no_resolve = true;
-        if (http.ngx_parse_url(pool, &urls[addr_count]) != core.NGX_OK or urls[addr_count].naddrs == 0) {
-            record_store_error(ducf, DU_ERROR_INVALID_PEER);
-            return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"invalid peer address (IP:port required)\"}") } };
-        }
-
-        specs[addr_count] = .{
-            .addr_data = addr_str.data,
-            .addr_len = addr_str.len,
-            .weight = weight,
-        };
-
-        var dup_idx: usize = 0;
-        while (dup_idx < addr_count) : (dup_idx += 1) {
-            if (std.mem.eql(
-                u8,
-                core.slicify(u8, specs[dup_idx].addr_data, specs[dup_idx].addr_len),
-                core.slicify(u8, specs[addr_count].addr_data, specs[addr_count].addr_len),
-            )) {
-                record_store_error(ducf, DU_ERROR_INVALID_PEER);
-                return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"duplicate peer address\"}") } };
-            }
-        }
-
-        addr_count += 1;
-    }
-
-    if (addr_count == 0 and !allow_empty_peers) {
-        record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
-        return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"no valid peers after parsing\"}") } };
-    }
 
     var eligible_count: usize = 0;
     var idx: usize = 0;
     while (idx < addr_count) : (idx += 1) {
+        urls[idx] = std.mem.zeroes(ngx_url_t);
+        urls[idx].url = ngx_str_t{ .data = specs[idx].addr_data, .len = specs[idx].addr_len };
+        urls[idx].flags.no_resolve = true;
+        if (http.ngx_parse_url(pool, &urls[idx]) != core.NGX_OK or urls[idx].naddrs == 0) {
+            record_store_error(ducf, DU_ERROR_INVALID_PEER);
+            return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"invalid peer address (IP:port required)\"}") } };
+        }
         if (!skip_health_filter and ngz_healthcheck_is_peer_eligible(specs[idx].addr_data, specs[idx].addr_len) == 0) continue;
         eligible_specs[eligible_count] = specs[idx];
         eligible_urls[eligible_count] = urls[idx];
@@ -1516,7 +1848,10 @@ fn build_and_activate_snapshot(
     var any_weighted = false;
     var pi: usize = 0;
     while (pi < eligible_count) : (pi += 1) {
-        if (eligible_specs[pi].weight != 1) { any_weighted = true; break; }
+        if (eligible_specs[pi].weight != 1) {
+            any_weighted = true;
+            break;
+        }
     }
 
     new_peers.*.number = @intCast(eligible_count);
@@ -1538,7 +1873,6 @@ fn build_and_activate_snapshot(
     record_store_success_locked(store);
 
     const old_active = store.*.active;
-    // Release store so the lockless reader sees all snapshot fields before the pointer.
     const store_typed: *UpstreamStore = @alignCast(@ptrCast(store));
     @atomicStore(usize, @as(*usize, @ptrCast(&store_typed.active)), @intFromPtr(new_snapshot), .release);
     store.*.next_generation = gen + 1;
@@ -1562,6 +1896,59 @@ fn build_and_activate_snapshot(
     }
     write_journal_if_configured(lccf, eligible_specs, eligible_count, gen);
     return .{ .ok = .{ .generation = gen, .peer_count = eligible_count, .changed = true } };
+}
+
+fn build_and_activate_snapshot(
+    pool: [*c]core.ngx_pool_t,
+    ducf: [*c]DynamicUpstreamsSrvConf,
+    uscf: [*c]ngx_http_upstream_srv_conf_t,
+    lccf: [*c]dynamic_upstreams_loc_conf,
+    json: [*c]cjson.cJSON,
+    allow_noop_if_same: bool,
+    allow_empty_peers: bool,
+    skip_health_filter: bool,
+    publish_restored_event: bool,
+) ActivationResult {
+    const peers_node = cjson.cJSON_GetObjectItem(json, "peers");
+    if (peers_node == core.nullptr(cjson.cJSON) or cjson.cJSON_IsArray(peers_node) != 1) {
+        record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+        return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'peers' array required\"}") } };
+    }
+
+    const n_peers: usize = @intCast(@max(0, cjson.cJSON_GetArraySize(peers_node)));
+    const specs: [*c]PeerSpec = if (n_peers == 0)
+        core.nullptr(PeerSpec)
+    else
+        core.ngz_pcalloc_n(@intCast(n_peers), PeerSpec, pool) orelse {
+            record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+            return .{ .err = .{ .status = http.NGX_HTTP_INTERNAL_SERVER_ERROR, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"failed to allocate peer scratch space\"}") } };
+        };
+
+    var addr_count: usize = 0;
+    var it = CJSON.Iterator.init(peers_node);
+    while (it.next()) |item| {
+        if (addr_count >= MAX_PEERS_PER_PUT) break;
+        const spec = switch (parse_peer_spec_value(ducf, item)) {
+            .err => |e| return .{ .err = e },
+            .ok => |s| s,
+        };
+        specs[addr_count] = spec;
+
+        var dup_idx: usize = 0;
+        while (dup_idx < addr_count) : (dup_idx += 1) {
+            if (std.mem.eql(
+                u8,
+                core.slicify(u8, specs[dup_idx].addr_data, specs[dup_idx].addr_len),
+                core.slicify(u8, specs[addr_count].addr_data, specs[addr_count].addr_len),
+            )) {
+                record_store_error(ducf, DU_ERROR_INVALID_PEER);
+                return .{ .err = .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"duplicate peer address\"}") } };
+            }
+        }
+
+        addr_count += 1;
+    }
+    return activate_snapshot_from_specs(pool, ducf, uscf, lccf, specs, addr_count, allow_noop_if_same, allow_empty_peers, skip_health_filter, publish_restored_event);
 }
 
 fn handle_put(r: [*c]ngx_http_request_t) ngx_int_t {
@@ -1741,11 +2128,41 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     };
     defer cj.free(json);
 
+    if (cjson.cJSON_IsObject(json) != 1) {
+        record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"PATCH body must be a JSON object\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
     // Determine action and address
     const drain_node = cjson.cJSON_GetObjectItem(json, "drain");
     const undrain_node = cjson.cJSON_GetObjectItem(json, "undrain");
+    const add_node = cjson.cJSON_GetObjectItem(json, "add");
+    const remove_node = cjson.cJSON_GetObjectItem(json, "remove");
+    const replace_node = cjson.cJSON_GetObjectItem(json, "replace");
     const is_drain: bool = drain_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsString(drain_node) == 1;
     const is_undrain: bool = undrain_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsString(undrain_node) == 1;
+    const has_membership_patch = add_node != core.nullptr(cjson.cJSON) or remove_node != core.nullptr(cjson.cJSON) or replace_node != core.nullptr(cjson.cJSON);
+
+    var field_it = CJSON.Iterator.init(json);
+    while (field_it.next()) |item| {
+        const field_name = if (item.*.string != null) std.mem.sliceTo(item.*.string, 0) else "";
+        if (std.mem.eql(u8, field_name, "drain") or
+            std.mem.eql(u8, field_name, "undrain") or
+            std.mem.eql(u8, field_name, "add") or
+            std.mem.eql(u8, field_name, "remove") or
+            std.mem.eql(u8, field_name, "replace"))
+        {
+            continue;
+        }
+        record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"unsupported PATCH field\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
 
     if (is_drain and is_undrain) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
@@ -1755,11 +2172,83 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         return;
     }
 
-    if (!is_drain and !is_undrain) {
+    if ((is_drain or is_undrain) and has_membership_patch) {
         record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
         _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
-            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"'drain' or 'undrain' string field required\"}"));
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"drain/undrain cannot be mixed with add/remove/replace\"}"));
         http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    if (!is_drain and !is_undrain and !has_membership_patch) {
+        record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+        _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+            ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"PATCH requires drain/undrain or add/remove/replace\"}"));
+        http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    if (has_membership_patch) {
+        if ((add_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsArray(add_node) != 1) or
+            (remove_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsArray(remove_node) != 1) or
+            (replace_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsArray(replace_node) != 1))
+        {
+            record_store_error(ducf, DU_ERROR_INVALID_PAYLOAD);
+            _ = send_json_response(r, http.NGX_HTTP_BAD_REQUEST,
+                ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"add/remove/replace must be arrays\"}"));
+            http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
+            return;
+        }
+
+        const current = switch (collect_current_peer_specs(r.*.pool, ducf, uscf)) {
+            .err => |e| {
+                _ = send_json_response(r, e.status, e.body);
+                http.ngx_http_finalize_request(r, @intCast(e.status));
+                return;
+            },
+            .ok => |ok| ok,
+        };
+        const plan = switch (build_patch_plan(r.*.pool, ducf, current.specs, current.count, add_node, remove_node, replace_node)) {
+            .err => |e| {
+                _ = send_json_response(r, e.status, e.body);
+                http.ngx_http_finalize_request(r, @intCast(e.status));
+                return;
+            },
+            .ok => |ok| ok,
+        };
+
+        var generation = current.generation;
+        var peer_count = current.count;
+        if (plan.changed) {
+            const result = activate_snapshot_from_specs(r.*.pool, ducf, uscf, lccf, plan.specs, plan.count, false, false, false, false);
+            switch (result) {
+                .err => |e| {
+                    _ = send_json_response(r, e.status, e.body);
+                    http.ngx_http_finalize_request(r, @intCast(e.status));
+                    return;
+                },
+                .ok => |ok| {
+                    generation = ok.generation;
+                    peer_count = ok.peer_count;
+                },
+            }
+        }
+
+        var rbuf: [224]u8 = undefined;
+        const resp = std.fmt.bufPrint(&rbuf,
+            "{{\"module\":\"dynamic_upstreams\",\"status\":\"ok\",\"action\":\"patch\",\"changed\":{s},\"added\":{d},\"removed\":{d},\"generation\":{d},\"peer_count\":{d}}}",
+            .{ if (plan.changed) "true" else "false", plan.added, plan.removed, generation, peer_count }) catch {
+                http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+                return;
+            };
+        const resp_mem = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, resp.len)) orelse {
+            http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        };
+        @memcpy(resp_mem[0..resp.len], resp);
+        const resp_str = ngx_str_t{ .data = resp_mem, .len = resp.len };
+        _ = send_json_response(r, http.NGX_HTTP_OK, resp_str);
+        http.ngx_http_finalize_request(r, core.NGX_OK);
         return;
     }
 

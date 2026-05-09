@@ -36,6 +36,8 @@ This module should **not** own:
 - `upstream_balancer_fallback off`: affinity miss returns `NGX_BUSY` (502 to client).
 - Sticky hashing applies only to the primary peer chain. If no primary peer is usable and `fallback next` is enabled, nginx's stock round-robin fallback may route to backup peers.
 - Cookie mode can issue sticky cookies when the request has no affinity key, and can rotate a stale direct-peer cookie onto a live peer during fallback.
+- When `dynamic-upstreams` removes or drains the peer referenced by a direct-peer cookie, that cookie is treated as stale: the balancer falls back to the live eligible set and, when cookie issuance is enabled, rotates the cookie onto the selected live peer.
+- Partial mutation stability is ordering-based, not identity-table-based: if `dynamic-upstreams` preserves unchanged peer relative order and only appends new peers, sticky churn stays bounded to the documented generation change.
 - `upstream_balancer_status` exposes a shared-memory JSON snapshot of sticky decisions, cookie lifecycle counters, and peer-rejection reasons.
 - Hot-path status counters are updated with atomic increments rather than a shared mutex, so enabling `upstream_balancer_status` does not add lock traffic to each sticky request.
 - A future runtime mutator can register a request-pinned peer source through `upstream_balancer_register_peer_source()` without changing the balancer callback contract.
@@ -64,6 +66,7 @@ This module should **not** own:
 - retry/failure accounting: a sticky-selected peer failure is retried by nginx, and subsequent requests honor the updated peer fail window
 - sticky path preserves stock peer runtime limits (`max_conns`) instead of bypassing round-robin state
 - healthcheck integration: unhealthy peers (probe failing) are excluded from sticky selection; recovering peers stay out during slow-start; traffic returns after slow-start completes
+- partial-mutation regressions: appended peers do not disturb keys whose weighted slot stays constant, and stale direct-peer cookies rotate correctly for removed or draining peers
 
 ### Directive Surface
 
@@ -151,7 +154,8 @@ Allocated from `r->pool` per request in `init_peer`:
 - `upstream_balancer_fallback off` means the module returns `NGX_BUSY` rather than silently selecting a different peer, which nginx upstream translates to a 502 response without retrying.
 - Backup peers are not part of the sticky hash space. They are only reached through nginx's normal fallback path after primary selection cannot yield a usable peer.
 - In cookie mode, module-issued affinity cookies use the form `<cookie_name>=peer:<peer_name>` and default to `; Path=/; HttpOnly; SameSite=Lax` unless `upstream_balancer_cookie_attrs` overrides the suffix.
-- Peer identity is derived from the peer list order at `init_upstream` time. If `dynamic-upstreams` replaces the peer set, affinity keys may resolve to different peers — that handoff contract is a Phase 3 concern.
+- Peer identity is derived from the peer list order at request time for the pinned generation. If `dynamic-upstreams` publishes a new generation, affinity keys may resolve differently, but unchanged peers should keep relative order and new peers should append so churn stays bounded and deterministic.
+- Direct-peer cookies (`peer:<address>`) use peer address as the cross-generation identity key. If that address no longer exists or is currently draining, the cookie is stale and follows the documented fallback + rotation path.
 
 ### Traceability and Audit Hooks
 
@@ -455,10 +459,10 @@ Reduce avoidable sticky remapping when `dynamic-upstreams` starts applying parti
 
 **TODO**
 
-- [ ] Document and enforce the ordering contract expected from `dynamic-upstreams`: unchanged peers keep relative order, removed peers disappear, new peers append deterministically unless a future policy explicitly says otherwise.
-- [ ] Prefer peer address as the cross-generation identity key for handoff bookkeeping, even though request-time selection still walks the nginx peer list.
-- [ ] Keep cookie rotation behavior explicit when a direct-peer cookie points at a removed or draining peer: treat it as stale, then rotate onto the selected live peer when cookie issuance is enabled.
-- [ ] Update the peer-source handoff docs so “partial mutation” is clearly described as “new generation from merged state,” not live list surgery.
+- [x] Document and enforce the ordering contract expected from `dynamic-upstreams`: unchanged peers keep relative order, removed peers disappear, new peers append deterministically unless a future policy explicitly says otherwise.
+- [x] Prefer peer address as the cross-generation identity key for handoff bookkeeping, even though request-time selection still walks the nginx peer list.
+- [x] Keep cookie rotation behavior explicit when a direct-peer cookie points at a removed or draining peer: treat it as stale, then rotate onto the selected live peer when cookie issuance is enabled.
+- [x] Update the peer-source handoff docs so “partial mutation” is clearly described as “new generation from merged state,” not live list surgery.
 
 **Verification scope**
 
