@@ -18,6 +18,7 @@ const required_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patc
 const worker_events_test_file = "src/modules/worker-events-nginx-module/ngx_http_worker_events.zig";
 const healthcheck_test_file = "src/modules/healthcheck-nginx-module/ngx_http_healthcheck.zig";
 const upstream_balancer_test_file = "src/modules/upstream-balancer-nginx-module/ngx_http_upstream_balancer.zig";
+const dynamic_upstreams_test_file = "src/modules/dynamic-upstreams-nginx-module/ngx_http_dynamic_upstreams.zig";
 
 var modules = [_][]const u8{
     // Core modules
@@ -139,7 +140,11 @@ fn requires_healthcheck_test_support(path: []const u8) bool {
 }
 
 fn requires_upstream_balancer_test_support(path: []const u8) bool {
-    return std.mem.eql(u8, path, "src/modules/dynamic-upstreams-nginx-module/ngx_http_dynamic_upstreams.zig");
+    return std.mem.eql(u8, path, dynamic_upstreams_test_file);
+}
+
+fn requires_dynamic_upstreams_test_support(path: []const u8) bool {
+    return std.mem.eql(u8, path, upstream_balancer_test_file);
 }
 
 pub fn build(b: *std.Build) void {
@@ -288,6 +293,19 @@ pub fn build(b: *std.Build) void {
     upstream_balancer_test_support.root_module.addImport("ngx_libinjection", ngx_libinjection);
     upstream_balancer_test_support.root_module.addObject(healthcheck_test_support);
 
+    const dynamic_upstreams_test_support = b.addObject(.{
+        .name = "ngx_http_dynamic_upstreams_test_support",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(dynamic_upstreams_test_file),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    dynamic_upstreams_test_support.root_module.addIncludePath(b.path("src/ngx/"));
+    dynamic_upstreams_test_support.root_module.addImport("ngx", nginx);
+    dynamic_upstreams_test_support.root_module.addImport("ngx_libinjection", ngx_libinjection);
+
     for (tests) |case| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -320,6 +338,9 @@ pub fn build(b: *std.Build) void {
         }
         if (requires_upstream_balancer_test_support(case)) {
             t.root_module.addObject(upstream_balancer_test_support);
+        }
+        if (requires_dynamic_upstreams_test_support(case)) {
+            t.root_module.addObject(dynamic_upstreams_test_support);
         }
         t.root_module.addIncludePath(b.path("src/ngx/"));
         t.root_module.addImport("ngx", nginx);
