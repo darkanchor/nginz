@@ -387,3 +387,100 @@ All slab allocations for a new snapshot (Snapshot struct, peers struct, N × pee
 The consul timer refresh uses a blocking POSIX TCP socket (HTTP/1.0, 5-second timeout) in worker 0's event loop.  For typical Consul deployments on localhost this is a sub-millisecond operation.  If Consul is slow or unreachable, worker 0's event loop stalls for up to 5 seconds per refresh cycle, delaying timers for other modules.
 
 **Better**: implement async Consul polling via nginx's non-blocking event machinery (similar to the upstream health-check module).  Deferred to a future hardening pass.
+
+## Next-Term Roadmap
+
+### Priority adjustments from milestone-2 conclusion
+
+- **Confirmed**: async Consul polling is still a real correctness and operability gap.
+- **Confirmed, but narrowed**: persistence is still needed for **cold restart/bootstrap**. Graceful config reload already reuses the shared zone store through `du_zone_init_cb(...)`; the remaining gap is restart-time restore when no inherited zone exists.
+- **Confirmed, but narrowed**: the request path should still stop touching `shpool->mutex`, but the refcount is already atomic today. The next step is removing the slab mutex from `du_get_active_peers`, not introducing atomics from scratch.
+- **Confirmed, but reordered**: graceful drain should land before generic PATCH semantics. Drain is the safer primitive for zero-downtime removal, and PATCH can then compile into the same whole-snapshot activation pipeline instead of inventing a separate in-place mutation path.
+- **Challenged**: “graceful drain” is not completely absent. Snapshot-level draining and deferred reclamation are already implemented. What is missing is **operator-visible per-peer drain state** that keeps old requests alive while excluding the peer from new selections.
+
+### Phase 4 - Cold-start persistence and restore
+
+**Goal**
+
+Preserve the last good active snapshot across full nginx restart, not just config reload.
+
+**TODO**
+
+- [ ] Add a module-owned journal file format for the active snapshot and minimal metadata: upstream name, generation, source mode, peer list, and persisted-at timestamp.
+- [ ] Write the journal only after successful activation; use write-to-temp + fsync + rename so a crash never leaves a partial live file.
+- [ ] Restore from journal during process init before the first refresh timer fires, and only for `dynamic_upstreams_managed` upstreams that opt in.
+- [ ] Reject journal restore when the upstream name or persisted schema version does not match the current config.
+- [ ] Treat corrupt or incomplete journal data as non-fatal: keep static-config peers active, record a restore error, and wait for the next PUT or source refresh.
+- [ ] Expose restore status in `GET`, for example `restored_from_journal`, `restore_error_code`, and `restore_generation`.
+
+**Verification scope**
+
+- Add integration coverage proving a successful PUT survives `stopNginz()` + `startNginz()` when journal persistence is enabled.
+- Add a restart test proving the restored generation is visible before the first refresh cycle runs.
+- Add failure-injection tests for truncated journal, invalid JSON, and stale schema version; all must preserve worker startup and keep the control API truthful.
+- Add a reload-vs-restart regression test so reload continues to use inherited shared memory while restart uses the journal path.
+
+### Phase 5 - Async source adapter for Consul
+
+**Goal**
+
+Replace the worker-0 blocking Consul adapter with nginx-native non-blocking refresh machinery.
+
+**TODO**
+
+- [ ] Split the source refresh path into a common “fetch -> parse -> build_and_activate_snapshot” pipeline with source-specific transport adapters.
+- [ ] Replace `consul_http_get(...)` with an nginx event-driven client connection owned by worker 0, using explicit connect, write, read, timeout, and finalize states.
+- [ ] Allow at most one in-flight refresh per location entry; skip overlapping timer ticks instead of running concurrent refreshes.
+- [ ] Keep current last-good semantics: transport errors, timeout, invalid status, and invalid JSON update shared error state but never clear the active generation.
+- [ ] Preserve “empty healthy result is valid state” semantics for Consul while still distinguishing transport failure from an empty result.
+- [ ] Keep the IP-literal-only requirement for the first async version; DNS-based resolution is a separate roadmap item.
+
+**Verification scope**
+
+- Extend the Consul mock tests to cover success, timeout, connect failure, malformed JSON, and empty healthy result.
+- Add a timer-liveness regression test proving another worker-0 timer continues to fire while Consul is slow.
+- Add a no-op refresh regression test so identical Consul membership does not churn generations or emit duplicate `snapshot_activated` events.
+- Add multi-worker coverage proving only worker 0 owns the async refresh state machine while all workers observe the same activated generation.
+
+### Phase 6 - Lockless request-time snapshot pinning
+
+**Goal**
+
+Remove `shpool->mutex` from `du_get_active_peers()` while preserving safe snapshot lifetime.
+
+**TODO**
+
+- [ ] Change `store.active` reads to an atomic-load retry loop instead of reading under the slab mutex.
+- [ ] Keep `Snapshot.refcount` atomic, but stop freeing draining snapshots directly from the request release path.
+- [ ] Move final reclamation to the draining-list reaper under lock so a request can safely increment a snapshot refcount after loading the pointer but before reclamation.
+- [ ] Add a retry rule: load active snapshot, increment refcount, then verify the snapshot is still the active one or still valid for pinning; if not, release and retry.
+- [ ] Keep slab mutex ownership only on activation/reaper paths that mutate the active pointer or free slab allocations.
+
+**Verification scope**
+
+- Add a stress-style integration test that hammers proxied traffic while concurrently issuing repeated PUT updates; no crashes, hangs, or malformed responses are acceptable.
+- Add a generation-lifetime regression test proving a draining snapshot is not freed before the last request releases it.
+- Add perf verification for the capture-and-purge benchmark plus a dynamic-upstreams-only proxy run, with instructions/req and cache-miss deltas compared before/after the lock removal.
+- Add debug assertions or unit coverage around refcount transitions so underflow and double-release are caught early.
+
+### Phase 7 - Per-peer drain first, PATCH semantics second
+
+**Goal**
+
+Add operator-visible incremental control without abandoning the immutable whole-snapshot activation model.
+
+**TODO**
+
+- [ ] Introduce a per-peer desired-state model in the control plane: `active` and `draining` first; do not mutate live peer structs in place.
+- [ ] Add a drain-capable write contract, likely `PATCH`, that accepts explicit operations such as `drain`, `undrain`, `add`, `replace`, and `remove`.
+- [ ] Compile every partial mutation into a full next-generation snapshot by diffing against the current active generation, not by editing the active generation in place.
+- [ ] Preserve peer order for unchanged peers and append new peers deterministically so affinity churn stays bounded.
+- [ ] Delay hard removal of a drained peer until a subsequent generation excludes it, keeping the old generation alive until request refcounts naturally reach zero.
+- [ ] Surface patch-plan results in the API response: `changed`, `drained`, `added`, `removed`, and resulting `generation`.
+
+**Verification scope**
+
+- Add integration tests for `PATCH drain` excluding a peer from new selection while old in-flight requests still complete.
+- Add tests for `PATCH add` and `PATCH remove` proving the API compiles to a new generation and preserves last-good semantics on validation failure.
+- Add multi-worker tests proving all workers agree on the drained/active peer set after activation.
+- Add sticky-affinity regression coverage with `upstream-balancer` proving unchanged peers keep their relative ordering after partial mutation.

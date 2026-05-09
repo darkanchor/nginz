@@ -127,17 +127,9 @@ The consul source for dynamic-upstreams polls the Consul catalog directly from t
 
 These are capabilities nginx Plus provides that this stack does not yet match.
 
-### Partial Server Mutation (PATCH semantics)
+### State Persistence Across Cold Restart
 
-nginx Plus allows adding or removing individual servers from an upstream group via the upstream API without replacing the entire peer set. The current `dynamic-upstreams` model is always a full snapshot replacement: PUT or Consul-sourced activation always replaces all peers atomically. Partial mutations require iteration-aware in-place updates, which conflict with the snapshot immutability model. Addressable by introducing a diff+merge phase before snapshot activation, but not trivial.
-
-### State Persistence Across Restart
-
-nginx Plus upstream zone state persists across graceful reloads because the shared memory zone is inherited by the new worker generation. The current `dynamic-upstreams` implementation loses snapshot state on nginx restart/reload — the worker-0 timer re-polls Consul or waits for the next PUT, meaning there is a window where the upstream is serving only the static config peers. Addressable with a disk-based snapshot journal or shared memory persistence across reload.
-
-### Graceful Drain
-
-nginx Plus supports marking a server as `draining` — it receives no new requests but finishes in-flight requests before being removed. The current snapshot model has no drain state. A `draining` peer would need generation-aware routing exclusion (skip for new connections) while allowing the refcount on the old generation to reach zero naturally. The generation + refcount model is the right foundation for this, but the balancer `get` callback does not currently consult drain state.
+nginx Plus upstream zone state persists across graceful reloads because the shared memory zone is inherited by the new worker generation. The current `dynamic-upstreams` implementation already reuses the inherited shared-memory store on graceful reload, so reload is not the real gap anymore. The remaining gap is **cold restart/bootstrap**: after a full nginx stop/start with no inherited zone, the active snapshot is lost until worker-0 re-polls Consul or a new `PUT` arrives. Addressable with a disk-backed last-good snapshot journal plus restore-on-init.
 
 ### DNS-Based Upstream Resolution
 
@@ -147,9 +139,17 @@ nginx Plus can resolve upstream hostnames at runtime using system DNS, re-queryi
 
 The Consul source uses a simple HTTP/1.0 blocking socket on the worker-0 event loop with a 5-second timeout. This is correct for the current load but is a single-worker blocking operation — a slow Consul response can stall worker-0's event processing for the timeout duration. nginx Plus equivalent polling uses non-blocking async DNS + upstream connections. Addressable by moving to nginx's non-blocking upstream connection machinery, which is substantial but the right long-term fix.
 
-### Per-Request Slab Mutex in `du_get_active_peers`
+### Request-Path Slab Mutex in `du_get_active_peers`
 
-`du_get_active_peers` acquires the slab mutex on every proxied request to increment the generation refcount. At c=32 this produces no kernel-visible contention (0 migrations, 0 context switches), but under sustained high concurrency this is a single serialization point that will eventually become a bottleneck. nginx Plus manages peer set access through atomic operations and per-upstream zone locking, not a global slab mutex. Addressable by replacing the slab mutex with a CAS-based refcount (Zig's `@atomicRmw` on an atomic counter embedded in the snapshot header).
+`du_get_active_peers` still acquires the slab mutex on every proxied request to read `store->active` and pin the generation. The refcount itself is already atomic (`@atomicRmw` on `Snapshot.refcount`), so the remaining issue is not “add CAS refcounting”; it is removing the slab mutex from the common read path without introducing an ABA or premature-free race. At c=32 this produces no kernel-visible contention (0 migrations, 0 context switches), but under sustained high concurrency it remains a serialization point. Addressable by moving to atomic active-pointer reads plus lock-owned deferred reclamation.
+
+### Graceful Drain (Operator-Facing Peer State)
+
+nginx Plus supports marking a server as `draining` — it receives no new requests but finishes in-flight requests before being removed. This stack already has **snapshot-level** draining and refcounted deferred reclamation: when a new generation activates, the old snapshot becomes draining and is freed only after outstanding requests release it. What is still missing is **operator-facing per-peer drain state**: a way to mark one peer draining so new requests stop selecting it while existing requests on old generations complete naturally. Addressable by adding peer drain state to the control plane and making `upstream-balancer` consult it during selection.
+
+### Partial Server Mutation (PATCH semantics)
+
+nginx Plus allows adding or removing individual servers from an upstream group via the upstream API without replacing the entire peer set. The current `dynamic-upstreams` model is still whole-generation replacement: `PUT` or source-driven activation always builds a complete new snapshot and swaps it atomically. Partial mutation should therefore be implemented as **API semantics over the same immutable snapshot model**: diff against the current generation, merge the requested changes, then publish one complete next generation. This is addressable, but should follow explicit drain semantics so removal can be done safely.
 
 ### Sticky Learn
 
@@ -161,17 +161,17 @@ nginx Plus has `sticky learn` — the upstream remembers which backend a client 
 
 The gaps above are ranked by impact on production correctness and operational safety:
 
-1. **State persistence across restart** — a production deployment that loses its upstream peer set on reload is operationally unreliable. This is the most important gap for production readiness.
+1. **Cold-start persistence / restore** — graceful reload already inherits the shared zone; the real production gap is full restart bootstrap. A deployment should be able to come back with the last good peer set before the first external refresh or control-plane write.
 
 2. **Async Consul polling** — the blocking event-loop issue is a correctness risk under slow Consul responses, not just a performance issue. Moving to non-blocking upstream connections on the worker event loop removes a potential multi-second stall from worker-0.
 
-3. **Per-request slab mutex → CAS refcount** — this is benign today but becomes a scalability ceiling. An `@atomicRmw` refcount on the snapshot header replaces the slab mutex for the common read path. The slab mutex is still needed for snapshot activation (write path), which is rare.
+3. **Remove the slab mutex from the request pin path** — atomic refcounts are already in place, but the read path still serializes on `shpool->mutex`. The next step is atomic active-pointer pinning plus deferred reclamation under lock.
 
-4. **Partial server mutation (PATCH)** — relevant for deployments that perform incremental backend fleet changes rather than full replacements. Lower urgency than the three items above, but important for operational flexibility.
+4. **Graceful per-peer drain** — the snapshot model already supports draining old generations; the missing piece is operator-facing peer drain so zero-downtime removal becomes explicit and safe.
 
-5. **Graceful drain** — the generation + refcount model is already the right foundation. The work is adding drain state to peer structs and consulting it in the balancer `get` callback. Useful for zero-downtime backend rotation.
+5. **Partial server mutation (PATCH)** — still valuable for operational flexibility, but it should compile into the same whole-snapshot activation pipeline and should follow drain semantics rather than preceding them.
 
-6. **DNS-based resolution** and **sticky learn** are lower priority and have external workarounds (explicit IP registration via PUT, client-side sticky cookies).
+6. **DNS-based resolution** and **sticky learn** remain lower priority and still have external workarounds (explicit IP registration via PUT, client-side sticky cookies).
 
 ---
 
@@ -181,4 +181,36 @@ The dynamic-upstreams stack is performance-optimized to the point where the modu
 
 The implementation is solid: generation tracking, last-good preservation, cross-worker cache invalidation, tag-based purge, and a general worker-events bus are all working and integration-tested. These are capabilities with no direct equivalent in stock nginx or clean primitives in nginx Plus.
 
-The honest gaps are operational rather than architectural: state persistence, async source polling, per-request slab mutex contention, and drain semantics. All are addressable within the current model — none require redesigning the generation or snapshot machinery. The foundation is the right one.
+The honest gaps are operational rather than architectural: cold-start persistence, async source polling, request-path lock removal, and operator-facing drain semantics. Partial mutation remains a real gap too, but it should be layered on top of the existing immutable snapshot model rather than replacing it. All are addressable within the current design — the foundation is still the right one.
+
+---
+
+## Appendix: Recommended Implementation Order
+
+The priority list above is the production-value ranking. The recommended **implementation** order is slightly different: it follows the current architecture and tries to land low-risk prerequisites before request-path surgery or API expansion.
+
+1. **Worker-events event contract hardening**  
+   Standardize event shapes first so later restore, refresh-failure, activation, and drain work all emit stable observability signals.
+
+2. **Cold-start persistence / restore**  
+   Highest operational value among the remaining control-plane tasks, and it fits the existing full-snapshot model cleanly without touching request-time peer selection.
+
+3. **Async Consul polling**  
+   Removes the worker-0 blocking risk while still reusing the same “fetch -> validate -> activate full snapshot” pipeline.
+
+4. **Drain contract in `upstream-balancer` and `healthcheck`**  
+   Define request-time selection semantics before exposing new mutation APIs. This keeps “draining” precise instead of letting it emerge accidentally.
+
+5. **Per-peer drain API in `dynamic-upstreams`**  
+   Once drain semantics are defined, expose operator-facing drain/undrain over the existing immutable-generation model.
+
+6. **Lockless request-time snapshot pinning**  
+   Important, but harder than the control-plane work above. This is concurrency surgery on the common request path and should land only after the surrounding model is stable.
+
+7. **Affinity stability rules for partial mutation**  
+   Before adding PATCH, make the ordering and cookie-rotation behavior explicit so sticky churn stays bounded and testable.
+
+8. **PATCH semantics**  
+   Last on purpose. Partial mutation should compile into the existing whole-snapshot activation path, not introduce a second live-mutation model.
+
+In short: **stabilize observability first, fix restart/bootstrap, remove the blocking source adapter, define drain semantics, then add richer mutation APIs**. That is the cleanest fit for the current codebase.

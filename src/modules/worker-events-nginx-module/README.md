@@ -332,6 +332,48 @@ server {
 - cross-node delivery
 - advanced retention or replay models
 
+## Next-Term Roadmap
+
+### Module role for the next term
+
+The next-term parity work does not make `worker-events` the source of truth. Its job is to remain a bounded transport primitive while the control-plane modules add cold-start restore, async source refresh, and peer-drain transitions.
+
+### Phase 4 - Event contract hardening for restore and drain flows
+
+**Goal**
+
+Stabilize the event shapes emitted by native consumers so operators and future consumers can reason about restore, activation, and drain transitions without reverse-engineering payload strings.
+
+**TODO**
+
+- [ ] Standardize event payload fields for `snapshot_activated`, `snapshot_restored`, `peer_draining`, `peer_undrained`, and refresh-failure notifications.
+- [ ] Keep payloads small and flat: upstream name, generation, source, peer count, peer address, and error code are in scope; full peer lists are not.
+- [ ] Document which events are best-effort observability signals versus those consumers may actively react to.
+- [ ] Preserve existing overwrite-oldest semantics; do not add acknowledgement logic for these new event types.
+
+**Verification scope**
+
+- Add integration coverage from `dynamic-upstreams` proving the documented event types and fields are emitted exactly once per successful activation or restore.
+- Add overflow regression tests with the new event mix so dropped-event accounting remains accurate.
+- Add compatibility tests proving older consumers that only look at `type` continue to work when payload fields expand.
+
+### Phase 5 - Consumer-oriented inspection ergonomics
+
+**Goal**
+
+Keep the ring debuggable as more native modules publish richer events.
+
+**TODO**
+
+- [ ] Add optional inspect filters for `type=` in addition to the existing channel/since/limit filters.
+- [ ] Expose enough ring metadata to debug missed restore or drain transitions without dumping every payload.
+- [ ] Keep inspect costs bounded; filtering should happen over the retained ring only and should not allocate unbounded scratch memory.
+
+**Verification scope**
+
+- Add API tests for `type=` filtering alongside existing `channel`, `since`, and `limit` coverage.
+- Add multi-worker regression tests proving inspect results remain stable under concurrent publish from several native consumers.
+
 ### Documentation Audit Checklist
 
 - [x] Audit date: 2026-05-03

@@ -165,3 +165,45 @@ The probing/visibility parts of this phase are largely implemented. The routing/
 - **Readiness remains service-level**: upstream and peer probe failures do not automatically flip `/ready` unless the service-level probe itself fails.
 - **Best-effort timeout scope**: probe timeout currently covers connect/send/receive at the socket layer used by the module, not a richer nginx-native async probe engine.
 - **Reload/restart reset**: shared-memory probe state resets when zones are recreated.
+
+## Next-Term Roadmap
+
+### Module role for the next term
+
+The next-term roadmap does not move persistence or PATCH control into `healthcheck`. Its role is narrower: keep the peer-eligibility contract precise while `dynamic-upstreams` and `upstream-balancer` add operator-driven drain and restart-time restore behavior.
+
+### Phase 4 - Explicit interaction contract with drain state
+
+**Goal**
+
+Make health-driven exclusion and operator-driven drain complementary instead of ambiguous.
+
+**TODO**
+
+- [ ] Document the precedence rule: a peer is selectable only if it is both health-eligible and not operator-draining.
+- [ ] Keep slow-start behavior health-owned; a peer leaving `draining` should still wait for health-owned slow-start recovery before re-entering sticky rotation when probes say it is recovering.
+- [ ] If needed by the balancer contract, add a richer exported helper or bitmask-oriented API so callers can distinguish `unhealthy`, `slow_start`, and `healthy` without overloading one boolean.
+- [ ] Keep fail-open semantics for unprobed peers unless the upstream explicitly opts into stricter behavior later.
+
+**Verification scope**
+
+- Add integration coverage with `dynamic-upstreams` + `upstream-balancer` proving a peer marked draining is excluded even when probes are healthy.
+- Add recovery tests proving undraining a peer does not bypass slow-start when healthcheck says the peer is still in recovery.
+- Add regression tests proving unprobed peers still behave exactly as they do today.
+
+### Phase 5 - Readiness policy review after upstream drain exists
+
+**Goal**
+
+Revisit whether service readiness should remain purely service-probe-driven once upstream-level drain and restore flows are first-class.
+
+**TODO**
+
+- [ ] Decide whether `/ready` should stay service-probe-only or optionally consider “all upstream peers unavailable” as not-ready.
+- [ ] If readiness policy expands, make it explicit and opt-in; do not silently change existing `/ready` semantics.
+- [ ] Surface enough reason data in `/health` or metrics for operators to distinguish “probe unhealthy” from “all peers drained or excluded.”
+
+**Verification scope**
+
+- Add policy-specific tests for whichever readiness mode is chosen.
+- Add metrics/JSON assertions proving the reason data is operator-visible and not inferred indirectly from status codes.

@@ -411,6 +411,53 @@ http {
 - upstream-management control APIs, which remain the job of `dynamic-upstreams`
 - service discovery or reconciliation
 
+## Next-Term Roadmap
+
+### Module role for the next term
+
+- `dynamic-upstreams` remains the owner of persistence, source refresh, and control-plane mutation.
+- `upstream-balancer` owns the request-time contract those features depend on: peer identity stability, drain exclusion for new requests, and safe generation pin/release behavior.
+- The next-term work here is therefore not “add more APIs”; it is “make runtime mutation less disruptive to live routing.”
+
+### Phase 4 - Drain-aware peer selection
+
+**Goal**
+
+Teach the balancer to exclude operator-draining peers from new selections without breaking retries or old pinned generations.
+
+**TODO**
+
+- [ ] Extend the runtime peer-source contract so the balancer can distinguish `active` peers from `draining` peers on the currently pinned generation.
+- [ ] Keep `draining` peers out of new sticky hash selection and round-robin fallback selection when an equivalent non-draining peer is available.
+- [ ] Preserve current retry behavior: if a request already pinned a generation before the drain transition, the request may continue through nginx's normal retry path on that pinned generation.
+- [ ] Keep backup-peer semantics unchanged; drain only affects the peer-source generation exposed by `dynamic-upstreams`, not nginx's built-in backup-chain rules.
+- [ ] Make status output expose drain-related rejection counts so operators can tell whether a peer is skipped because it is unhealthy or because it is intentionally draining.
+
+**Verification scope**
+
+- Add integration tests proving a drained peer stops receiving new requests while sibling peers continue serving traffic.
+- Add retry-path regression tests where a request pinned before drain still completes or retries without crashing the worker.
+- Add multi-worker affinity tests proving all workers honor the same drain state for the same generation.
+
+### Phase 5 - Affinity stability across partial mutation
+
+**Goal**
+
+Reduce avoidable sticky remapping when `dynamic-upstreams` starts applying partial add/remove/update operations.
+
+**TODO**
+
+- [ ] Document and enforce the ordering contract expected from `dynamic-upstreams`: unchanged peers keep relative order, removed peers disappear, new peers append deterministically unless a future policy explicitly says otherwise.
+- [ ] Prefer peer address as the cross-generation identity key for handoff bookkeeping, even though request-time selection still walks the nginx peer list.
+- [ ] Keep cookie rotation behavior explicit when a direct-peer cookie points at a removed or draining peer: treat it as stale, then rotate onto the selected live peer when cookie issuance is enabled.
+- [ ] Update the peer-source handoff docs so “partial mutation” is clearly described as “new generation from merged state,” not live list surgery.
+
+**Verification scope**
+
+- Add sticky-cookie and sticky-header regression tests where `PATCH add` preserves routing for unchanged peers as far as the documented ordering contract allows.
+- Add a stale-cookie rotation test for a removed or draining peer.
+- Add a generation-change regression test proving the balancer never reads partially merged peer state.
+
 ### Documentation Audit Checklist
 
 - [x] Audit date: 2026-05-07
