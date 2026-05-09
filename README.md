@@ -191,6 +191,10 @@ None currently.
 | **hello** | Minimal module example |
 | **njs** | QuickJS scripting engine (built-in); integration demos for njs+Redis+PGrest orchestration |
 
+## License
+
+Apache-2.0
+
 [1]: https://github.com/openresty/echo-nginx-module "echo"
 [2]: https://github.com/agentzh "agentzh"
 [3]: https://github.com/nginxinc/docker-nginx/blob/master/stable/debian/Dockerfile "docker"
