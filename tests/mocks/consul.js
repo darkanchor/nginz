@@ -12,6 +12,7 @@ export class ConsulMock {
     this.health = new Map(); // service_name -> health status
     this.kvErrors = new Map(); // key -> { status, body, headers }
     this.requestLog = [];
+    this.healthBehavior = null;
   }
 
   start() {
@@ -32,6 +33,7 @@ export class ConsulMock {
     this.health.clear();
     this.kvErrors.clear();
     this.requestLog = [];
+    this.healthBehavior = null;
   }
 
   async handleRequest(req) {
@@ -143,6 +145,22 @@ export class ConsulMock {
             },
           ],
         }));
+
+      const behavior = this.healthBehavior;
+      if (behavior?.delayMs) {
+        await Bun.sleep(behavior.delayMs);
+      }
+      if (behavior?.rawBody !== undefined || behavior?.status !== undefined) {
+        return new Response(behavior.rawBody ?? JSON.stringify(results), {
+          status: behavior.status ?? 200,
+          headers:
+            behavior.headers ||
+            {
+              "Content-Type": "application/json",
+              "X-Consul-Index": "1",
+            },
+        });
+      }
 
       return this.jsonResponse(results);
     }
@@ -329,6 +347,14 @@ export class ConsulMock {
 
   clearLog() {
     this.requestLog = [];
+  }
+
+  setHealthBehavior(behavior) {
+    this.healthBehavior = behavior;
+  }
+
+  clearHealthBehavior() {
+    this.healthBehavior = null;
   }
 }
 

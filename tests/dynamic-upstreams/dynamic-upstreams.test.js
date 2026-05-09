@@ -12,6 +12,7 @@ import {
 
 const MODULE = "dynamic-upstreams";
 const REFRESH_SOURCE_FILE = "/tmp/nginz-dynamic-upstreams-source.json";
+const CONSUL_LIVENESS_SOURCE_FILE = "/tmp/nginz-dynamic-upstreams-consul-liveness.json";
 
 async function getWorkerEvents(channel = "upstreams", since = null) {
   const params = new URLSearchParams({ channel });
@@ -36,9 +37,13 @@ async function waitForWorkerEvents(predicate, channel = "upstreams", timeout = 4
 }
 
 async function waitForDynamicState(predicate, timeout = 4000) {
+  return waitForDynamicRouteState("/dynamic-upstreams", predicate, timeout);
+}
+
+async function waitForDynamicRouteState(route, predicate, timeout = 4000) {
   const started = Date.now();
   while (Date.now() - started < timeout) {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`);
+    const res = await fetch(`${TEST_URL}${route}`);
     expect(res.status).toBe(200);
     const body = await res.json();
     if (predicate(body)) {
@@ -466,6 +471,10 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
   let consulMock;
 
   beforeAll(async () => {
+    writeFileSync(
+      CONSUL_LIVENESS_SOURCE_FILE,
+      JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 1 }] }),
+    );
     consulMock = createConsulMock(MOCK_PORTS.CONSUL);
     consulMock.addService("api-backend", [
       { id: "api-1", address: "127.0.0.1", port: 19002, tags: ["primary"] },
@@ -481,6 +490,9 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
     await stopNginz();
     consulMock.stop();
     cleanupRuntime(MODULE);
+    if (existsSync(CONSUL_LIVENESS_SOURCE_FILE)) {
+      rmSync(CONSUL_LIVENESS_SOURCE_FILE);
+    }
   });
 
   test("consul source populates upstream from service catalog", async () => {
@@ -507,6 +519,20 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
     expect(lastRequest.headers["x-consul-token"]).toBe("test-token-123");
   });
 
+  test("only worker 0 owns the async polling loop while all workers observe the activated generation", async () => {
+    const stable = await waitForDynamicState((s) => s.generation > 0 && s.peer_count === 2, 3000);
+    consulMock.clearLog();
+    await Bun.sleep(450);
+
+    const requests = consulMock.getRequests();
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+    expect(requests.length).toBeLessThanOrEqual(5);
+
+    const observed = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(observed.generation).toBe(stable.generation);
+    expect(observed.peers).toEqual(stable.peers);
+  });
+
   test("consul source updates upstream when catalog changes", async () => {
     // Remove one service from consul
     consulMock.clearServices();
@@ -516,6 +542,59 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
 
     const body = await waitForDynamicState((s) => s.peer_count === 1, 3000);
     expect(body.peers).toEqual([{ address: "127.0.0.1:19002", weight: 1 }]);
+  });
+
+  test("unchanged consul membership is a no-op refresh", async () => {
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const beforeEvents = await getWorkerEvents();
+
+    await Bun.sleep(450);
+
+    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const events = await getWorkerEvents("upstreams", beforeEvents.newest_generation);
+
+    expect(after.generation).toBe(before.generation);
+    expect(
+      events.events.filter((event) => {
+        if (event.type !== "snapshot_activated") return false;
+        const payload = JSON.parse(event.payload);
+        return payload.target === "api_backend" && payload.source === "consul";
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("slow consul does not block another worker-0 timer", async () => {
+    const beforeStatic = await (await fetch(`${TEST_URL}/dynamic-upstreams-static`)).json();
+    consulMock.setHealthBehavior({ delayMs: 6000 });
+
+    writeFileSync(
+      CONSUL_LIVENESS_SOURCE_FILE,
+      JSON.stringify({ peers: [{ address: "127.0.0.1:19003", weight: 1 }] }),
+    );
+
+    const staticBody = await waitForDynamicRouteState(
+      "/dynamic-upstreams-static",
+      (s) => s.generation > beforeStatic.generation && s.peers[0]?.address === "127.0.0.1:19003",
+      3000,
+    );
+    expect(staticBody.peers).toEqual([{ address: "127.0.0.1:19003", weight: 1 }]);
+
+    consulMock.clearHealthBehavior();
+    await waitForDynamicState((s) => s.peer_count === 1 && s.last_error_code === 0, 7000);
+  });
+
+  test("consul source keeps the last good snapshot on timeout", async () => {
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    consulMock.setHealthBehavior({ delayMs: 6000 });
+
+    const after = await waitForDynamicState(
+      (s) => s.generation === before.generation && s.last_error_code > 0,
+      9000,
+    );
+    expect(after.peers).toEqual(before.peers);
+
+    consulMock.clearHealthBehavior();
+    await waitForDynamicState((s) => s.last_error_code === 0, 7000);
   });
 
   test("consul source records error and keeps last good state on consul failure", async () => {
@@ -532,10 +611,30 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
     expect(body.generation).toBe(prev_gen);
     expect(body.last_error_code).toBeGreaterThan(0);
     expect(body.peers).toEqual(prev_peers);
+
+    consulMock = createConsulMock(MOCK_PORTS.CONSUL);
+    consulMock.addService("api-backend", [
+      { id: "api-1", address: "127.0.0.1", port: 19002, tags: ["primary"] },
+    ]);
+    await waitForDynamicState((s) => s.peer_count === 1 && s.last_error_code === 0, 4000);
+  });
+
+  test("consul source keeps the last good snapshot on malformed JSON", async () => {
+    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    consulMock.setHealthBehavior({ rawBody: "{bad-json", headers: { "Content-Type": "application/json" } });
+
+    const after = await waitForDynamicState(
+      (s) => s.generation === before.generation && s.last_error_code === 4001,
+      4000,
+    );
+    expect(after.peers).toEqual(before.peers);
+
+    consulMock.clearHealthBehavior();
+    await waitForDynamicState((s) => s.last_error_code === 0, 4000);
   });
 
   test("consul source reconciles an empty healthy result to an empty upstream snapshot", async () => {
-    consulMock = createConsulMock(MOCK_PORTS.CONSUL);
+    consulMock.clearServices();
     const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
 
     const body = await waitForDynamicState(

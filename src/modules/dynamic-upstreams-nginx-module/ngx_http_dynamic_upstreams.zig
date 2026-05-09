@@ -74,20 +74,23 @@ const DU_ERROR_REFRESH_NOT_CONFIGURED: u32 = 4004;
 const DU_ERROR_ALL_PEERS_UNHEALTHY: u32 = 5031;
 const MAX_REFRESH_ENTRIES: usize = 32;
 
-// ── C socket API for consul polling ──────────────────────────────────────────
+// ── C socket API for async consul polling ────────────────────────────────────
 
 const AF_INET: c_int = 2;
 const SOCK_STREAM: c_int = 1;
 const IPPROTO_TCP: c_int = 6;
 const SOL_SOCKET: c_int = 1;
-const SO_RCVTIMEO: c_int = 20;
-const SO_SNDTIMEO: c_int = 21;
+const SO_ERROR: c_int = 4;
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+const O_NONBLOCK: c_int = 0o4000;
+const MSG_NOSIGNAL: c_int = 0x4000;
 const CONSUL_RECV_BUF_SIZE: usize = 256 * 1024;
-
-const linux_timeval = extern struct {
-    tv_sec: c_long,
-    tv_usec: c_long,
-};
+const CONSUL_TIMEOUT_MS: ngx_msec_t = 1000;
+const EINTR: c_int = 4;
+const EAGAIN: c_int = 11;
+const EWOULDBLOCK: c_int = 11;
+const EINPROGRESS: c_int = 115;
 
 const sockaddr_in = extern struct {
     sin_family: u16,
@@ -101,9 +104,12 @@ extern fn connect(sockfd: c_int, addr: ?*const anyopaque, addrlen: c_uint) c_int
 extern fn send(sockfd: c_int, buf: [*c]const u8, len: usize, flags: c_int) isize;
 extern fn recv(sockfd: c_int, buf: [*c]u8, len: usize, flags: c_int) isize;
 extern fn close(fd: c_int) c_int;
-extern fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: ?*const anyopaque, optlen: c_uint) c_int;
+extern fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+extern fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: ?*anyopaque, optlen: [*c]c_uint) c_int;
 extern fn htons(hostshort: u16) u16;
 extern fn inet_pton(af: c_int, src: [*c]const u8, dst: ?*anyopaque) c_int;
+extern fn __errno_location() [*c]c_int;
+extern fn ngx_close_connection(c: [*c]core.ngx_connection_t) void;
 
 // ── Per-location config ─────────────────────────────────────────────────────
 
@@ -130,6 +136,27 @@ const dynamic_upstreams_loc_conf = extern struct {
 const RefreshEntry = struct {
     lccf: [*c]dynamic_upstreams_loc_conf,
     timer: core.ngx_event_t,
+    in_flight: bool,
+    ctx: ?*ConsulRefreshCtx,
+};
+
+const ConsulRefreshState = enum {
+    connecting,
+    writing,
+    reading,
+};
+
+const ConsulRefreshCtx = struct {
+    entry: *RefreshEntry,
+    lccf: [*c]dynamic_upstreams_loc_conf,
+    ducf: [*c]DynamicUpstreamsSrvConf,
+    pool: [*c]core.ngx_pool_t,
+    connection: [*c]core.ngx_connection_t,
+    request: ngx_str_t,
+    response_buf: [*c]u8,
+    response_len: usize,
+    send_pos: usize,
+    state: ConsulRefreshState,
 };
 
 const JournalEntry = struct {
@@ -256,6 +283,14 @@ fn currentTimeMsec() i64 {
     return 0;
 }
 
+fn errno_value() c_int {
+    return __errno_location().*;
+}
+
+fn is_retryable_socket_errno(err: c_int) bool {
+    return err == EAGAIN or err == EWOULDBLOCK or err == EINTR;
+}
+
 fn is_json_content_type(r: [*c]ngx_http_request_t) bool {
     if (r.*.headers_in.content_type == null) return false;
     const value = r.*.headers_in.content_type.*.value;
@@ -325,6 +360,30 @@ fn publish_refresh_failed_event(channel: ngx_str_t, target: ngx_str_t, source: n
     ) catch return;
     const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
     _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
+}
+
+fn record_refresh_failure(ducf: [*c]DynamicUpstreamsSrvConf, lccf: [*c]dynamic_upstreams_loc_conf, code: u32) void {
+    record_store_error(ducf, code);
+    if (lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
+        publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, code);
+    }
+}
+
+fn activate_refresh_snapshot_json(
+    pool: [*c]core.ngx_pool_t,
+    ducf: [*c]DynamicUpstreamsSrvConf,
+    lccf: [*c]dynamic_upstreams_loc_conf,
+    body_str: ngx_str_t,
+    allow_empty_peers: bool,
+) void {
+    var cj = CJSON.init(pool);
+    const json = cj.decode(body_str) catch {
+        record_refresh_failure(ducf, lccf, DU_ERROR_INVALID_JSON);
+        return;
+    };
+    defer cj.free(json);
+
+    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, allow_empty_peers, false);
 }
 
 // ── Journal persistence ───────────────────────────────────────────────────────
@@ -604,6 +663,8 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
             refresh_entries[refresh_entry_count] = .{
                 .lccf = c,
                 .timer = std.mem.zeroes(core.ngx_event_t),
+                .in_flight = false,
+                .ctx = null,
             };
             refresh_entry_count += 1;
             c.*.refresh_registered = 1;
@@ -1824,103 +1885,213 @@ fn consul_build_path(
     return ngx_str_t{ .data = data, .len = pos };
 }
 
-// Blocking HTTP/1.0 GET — only safe from timer context (worker 0 background).
-// Returns the response body as a pool-allocated slice on HTTP 200.
-fn consul_http_get(
+fn consul_build_request(
     pool: [*c]core.ngx_pool_t,
-    host: ngx_str_t,   // null-terminated IP
-    port: u16,
+    host: ngx_str_t,
     path: ngx_str_t,
     token: ngx_str_t,
-    lg: [*c]ngx.log.ngx_log_t,
-) !ngx_str_t {
-    var addr: sockaddr_in = std.mem.zeroes(sockaddr_in);
-    addr.sin_family = @intCast(AF_INET);
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host.data, &addr.sin_addr) != 1) {
-        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0,
-            "consul: invalid address %.*s\x00", .{ @as(c_int, @intCast(host.len)), host.data });
-        return error.InvalidAddress;
-    }
-
-    const fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fd < 0) {
-        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0, "consul: socket() failed\x00", .{});
-        return error.SocketFailed;
-    }
-    defer _ = close(fd);
-
-    const tv = linux_timeval{ .tv_sec = 5, .tv_usec = 0 };
-    _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, @sizeOf(linux_timeval));
-    _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, @sizeOf(linux_timeval));
-
-    if (connect(fd, &addr, @sizeOf(sockaddr_in)) != 0) {
-        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0,
-            "consul: connect to %.*s:%d failed\x00",
-            .{ @as(c_int, @intCast(host.len)), host.data, @as(c_int, port) });
-        return error.ConnectFailed;
-    }
-
+) ?ngx_str_t {
     var req_buf: [1024]u8 = undefined;
     var req_len: usize = 0;
 
-    // Use HTTP/1.0 to avoid chunked transfer encoding
     const req_line = std.fmt.bufPrint(
         req_buf[req_len..],
-        "GET {s} HTTP/1.0\r\nHost: {s}\r\n",
+        "GET {s} HTTP/1.0\r\nHost: {s}\r\nConnection: close\r\n",
         .{ core.slicify(u8, path.data, path.len), core.slicify(u8, host.data, host.len) },
-    ) catch return error.RequestTooLarge;
+    ) catch return null;
     req_len += req_line.len;
 
     if (token.len > 0 and token.data != null) {
-        const tok_line = std.fmt.bufPrint(req_buf[req_len..], "X-Consul-Token: {s}\r\n",
-            .{core.slicify(u8, token.data, token.len)}) catch return error.RequestTooLarge;
+        const tok_line = std.fmt.bufPrint(
+            req_buf[req_len..],
+            "X-Consul-Token: {s}\r\n",
+            .{core.slicify(u8, token.data, token.len)},
+        ) catch return null;
         req_len += tok_line.len;
     }
-    req_buf[req_len] = '\r'; req_len += 1;
-    req_buf[req_len] = '\n'; req_len += 1;
 
-    var sent: usize = 0;
-    while (sent < req_len) {
-        const n = send(fd, req_buf[sent..].ptr, req_len - sent, 0);
-        if (n <= 0) {
-            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0, "consul: send failed\x00", .{});
-            return error.SendFailed;
-        }
-        sent += @intCast(n);
+    req_buf[req_len] = '\r';
+    req_len += 1;
+    req_buf[req_len] = '\n';
+    req_len += 1;
+
+    const mem = core.castPtr(u8, core.ngx_pnalloc(pool, req_len)) orelse return null;
+    @memcpy(mem[0..req_len], req_buf[0..req_len]);
+    return ngx_str_t{ .data = mem, .len = req_len };
+}
+
+fn consul_refresh_close_connection(ctx: *ConsulRefreshCtx) void {
+    if (ctx.connection == core.nullptr(core.ngx_connection_t)) return;
+    if (ctx.connection.*.read != core.nullptr(core.ngx_event_t) and ctx.connection.*.read.*.flags.timer_set) {
+        event.ngx_event_del_timer(ctx.connection.*.read);
+    }
+    if (ctx.connection.*.write != core.nullptr(core.ngx_event_t) and ctx.connection.*.write.*.flags.timer_set) {
+        event.ngx_event_del_timer(ctx.connection.*.write);
+    }
+    ngx_close_connection(ctx.connection);
+    ctx.connection = core.nullptr(core.ngx_connection_t);
+}
+
+fn consul_refresh_finalize(ctx: *ConsulRefreshCtx) void {
+    const pool = ctx.pool;
+    consul_refresh_close_connection(ctx);
+    ctx.entry.ctx = null;
+    ctx.entry.in_flight = false;
+    if (pool != core.nullptr(core.ngx_pool_t)) {
+        core.ngx_destroy_pool(pool);
+    }
+}
+
+fn consul_refresh_fail(ctx: *ConsulRefreshCtx, code: u32) void {
+    record_refresh_failure(ctx.ducf, ctx.lccf, code);
+    consul_refresh_finalize(ctx);
+}
+
+fn consul_refresh_arm(ctx: *ConsulRefreshCtx, want_read: bool, want_write: bool) bool {
+    const c = ctx.connection;
+    if (c == core.nullptr(core.ngx_connection_t)) return false;
+
+    if (c.*.read != core.nullptr(core.ngx_event_t) and c.*.read.*.flags.timer_set) {
+        event.ngx_event_del_timer(c.*.read);
+    }
+    if (c.*.write != core.nullptr(core.ngx_event_t) and c.*.write.*.flags.timer_set) {
+        event.ngx_event_del_timer(c.*.write);
     }
 
-    const rbuf = core.castPtr(u8, core.ngx_pnalloc(pool, CONSUL_RECV_BUF_SIZE)) orelse
-        return error.OutOfMemory;
-    var total: usize = 0;
-    while (total < CONSUL_RECV_BUF_SIZE - 1) {
-        const n = recv(fd, rbuf + total, CONSUL_RECV_BUF_SIZE - 1 - total, 0);
-        if (n < 0) {
-            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0, "consul: recv failed\x00", .{});
-            return error.RecvFailed;
-        }
-        if (n == 0) break;
-        total += @intCast(n);
-    }
+    if (want_read and http.ngx_handle_read_event(c.*.read, 0) != core.NGX_OK) return false;
+    if (want_write and http.ngx_handle_write_event(c.*.write, 0) != core.NGX_OK) return false;
 
-    const response = core.slicify(u8, rbuf, total);
+    if (want_read) event.ngx_event_add_timer(c.*.read, CONSUL_TIMEOUT_MS);
+    if (want_write) event.ngx_event_add_timer(c.*.write, CONSUL_TIMEOUT_MS);
+    return true;
+}
+
+fn consul_refresh_check_connect(ctx: *ConsulRefreshCtx) bool {
+    var so_error: c_int = 0;
+    var so_len: c_uint = @sizeOf(c_int);
+    if (getsockopt(ctx.connection.*.fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) != 0 or so_error != 0) {
+        consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+        return false;
+    }
+    ctx.state = .writing;
+    return true;
+}
+
+const ConsulResponseBodyResult = union(enum) {
+    ok: ngx_str_t,
+    bad_status,
+    invalid_response,
+};
+
+fn consul_refresh_extract_body(ctx: *ConsulRefreshCtx) ConsulResponseBodyResult {
+    const response = core.slicify(u8, ctx.response_buf, ctx.response_len);
     const sep = "\r\n\r\n";
-    const hdr_end = std.mem.indexOf(u8, response, sep) orelse return error.InvalidResponse;
+    const hdr_end = std.mem.indexOf(u8, response, sep) orelse return .invalid_response;
 
-    const sp1 = std.mem.indexOfScalar(u8, response[0..@min(20, response.len)], ' ') orelse
-        return error.InvalidResponse;
-    if (sp1 + 4 > response.len) return error.InvalidResponse;
-    const status = std.fmt.parseInt(u16, response[sp1 + 1 .. sp1 + 4], 10) catch
-        return error.InvalidResponse;
-
-    if (status != 200) {
-        ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, lg, 0,
-            "consul: HTTP %d from %.*s\x00", .{ @as(c_int, status), @as(c_int, @intCast(host.len)), host.data });
-        return error.BadStatus;
-    }
+    const sp1 = std.mem.indexOfScalar(u8, response[0..@min(20, response.len)], ' ') orelse return .invalid_response;
+    if (sp1 + 4 > response.len) return .invalid_response;
+    const status = std.fmt.parseInt(u16, response[sp1 + 1 .. sp1 + 4], 10) catch return .invalid_response;
+    if (status != 200) return .bad_status;
 
     const body_off = hdr_end + sep.len;
-    return ngx_str_t{ .data = rbuf + body_off, .len = total - body_off };
+    return .{ .ok = ngx_str_t{ .data = ctx.response_buf + body_off, .len = ctx.response_len - body_off } };
+}
+
+fn consul_refresh_complete(ctx: *ConsulRefreshCtx) void {
+    const consul_body = switch (consul_refresh_extract_body(ctx)) {
+        .ok => |body| body,
+        .bad_status => {
+            consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+            return;
+        },
+        .invalid_response => {
+            consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+            return;
+        },
+    };
+
+    const peers_str = consul_peers_json(ctx.pool, consul_body, ctx.connection.*.log) orelse {
+        consul_refresh_fail(ctx, DU_ERROR_INVALID_JSON);
+        return;
+    };
+
+    activate_refresh_snapshot_json(ctx.pool, ctx.ducf, ctx.lccf, peers_str, true);
+    consul_refresh_finalize(ctx);
+}
+
+fn consul_refresh_drive_write(ctx: *ConsulRefreshCtx) void {
+    while (ctx.send_pos < ctx.request.len) {
+        const chunk_ptr = ctx.request.data + ctx.send_pos;
+        const chunk_len = ctx.request.len - ctx.send_pos;
+        const n = send(ctx.connection.*.fd, chunk_ptr, chunk_len, MSG_NOSIGNAL);
+        if (n > 0) {
+            ctx.send_pos += @intCast(n);
+            continue;
+        }
+        if (n < 0 and is_retryable_socket_errno(errno_value())) {
+            if (!consul_refresh_arm(ctx, false, true)) consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+            return;
+        }
+        consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    }
+
+    ctx.state = .reading;
+    if (!consul_refresh_arm(ctx, true, false)) consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+}
+
+fn consul_refresh_drive_read(ctx: *ConsulRefreshCtx) void {
+    while (ctx.response_len < CONSUL_RECV_BUF_SIZE) {
+        const dst = ctx.response_buf + ctx.response_len;
+        const avail = CONSUL_RECV_BUF_SIZE - ctx.response_len;
+        const n = recv(ctx.connection.*.fd, dst, avail, 0);
+        if (n > 0) {
+            ctx.response_len += @intCast(n);
+            continue;
+        }
+        if (n == 0) {
+            consul_refresh_complete(ctx);
+            return;
+        }
+        if (is_retryable_socket_errno(errno_value())) {
+            if (!consul_refresh_arm(ctx, true, false)) consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+            return;
+        }
+        consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    }
+
+    consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+}
+
+fn consul_refresh_write_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
+    const c = core.castPtr(core.ngx_connection_t, ev.*.data) orelse return;
+    const ctx_cptr = core.castPtr(ConsulRefreshCtx, c.*.data) orelse return;
+    const ctx: *ConsulRefreshCtx = @alignCast(@ptrCast(ctx_cptr));
+
+    if (ev.*.flags.timedout) {
+        ev.*.flags.timedout = false;
+        consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    }
+
+    if (ctx.state == .connecting and !consul_refresh_check_connect(ctx)) return;
+    if (ctx.state == .writing) consul_refresh_drive_write(ctx);
+}
+
+fn consul_refresh_read_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
+    const c = core.castPtr(core.ngx_connection_t, ev.*.data) orelse return;
+    const ctx_cptr = core.castPtr(ConsulRefreshCtx, c.*.data) orelse return;
+    const ctx: *ConsulRefreshCtx = @alignCast(@ptrCast(ctx_cptr));
+
+    if (ev.*.flags.timedout) {
+        ev.*.flags.timedout = false;
+        consul_refresh_fail(ctx, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    }
+
+    if (ctx.state == .connecting and !consul_refresh_check_connect(ctx)) return;
+    if (ctx.state == .reading) consul_refresh_drive_read(ctx);
 }
 
 // Parse Consul health endpoint JSON and build a {"peers":[...]} JSON string.
@@ -2029,43 +2200,109 @@ fn run_consul_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) voi
         return;
     }
 
+    if (entry.in_flight) return;
+
     const pool = core.ngx_create_pool(512 * 1024, lg);
     if (pool == core.nullptr(core.ngx_pool_t)) {
         record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
         return;
     }
-    defer core.ngx_destroy_pool(pool);
 
     const path = consul_build_path(pool, lccf.*.consul_service, lccf.*.consul_tag, lccf.*.consul_dc) orelse {
+        core.ngx_destroy_pool(pool);
         record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
         return;
     };
 
-    const body = consul_http_get(
-        pool, lccf.*.consul_host, @intCast(lccf.*.consul_port), path, lccf.*.consul_token, lg,
-    ) catch {
+    const request = consul_build_request(pool, lccf.*.consul_host, path, lccf.*.consul_token) orelse {
+        core.ngx_destroy_pool(pool);
+        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+        return;
+    };
+    const response_buf = core.castPtr(u8, core.ngx_pnalloc(pool, CONSUL_RECV_BUF_SIZE)) orelse {
+        core.ngx_destroy_pool(pool);
+        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
+        return;
+    };
+
+    var addr: sockaddr_in = std.mem.zeroes(sockaddr_in);
+    addr.sin_family = @intCast(AF_INET);
+    addr.sin_port = htons(@intCast(lccf.*.consul_port));
+    if (inet_pton(AF_INET, lccf.*.consul_host.data, &addr.sin_addr) != 1) {
+        core.ngx_destroy_pool(pool);
+        record_store_error(ducf, DU_ERROR_REFRESH_NOT_CONFIGURED);
+        return;
+    }
+
+    const fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        core.ngx_destroy_pool(pool);
         record_store_error(ducf, DU_ERROR_SOURCE_READ_FAILED);
-        if (lccf.*.worker_events_channel.len > 0)
-            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    }
+
+    const flags = fcntl(fd, F_GETFL, @as(c_int, 0));
+    if (flags < 0 or fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        _ = close(fd);
+        core.ngx_destroy_pool(pool);
+        record_store_error(ducf, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    }
+
+    const ngx_conn = http.ngx_get_connection(fd, lg);
+    if (ngx_conn == core.nullptr(core.ngx_connection_t)) {
+        _ = close(fd);
+        core.ngx_destroy_pool(pool);
+        record_store_error(ducf, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    }
+
+    const ctx_mem_cptr = core.ngz_pcalloc_c(ConsulRefreshCtx, pool) orelse {
+        ngx_close_connection(ngx_conn);
+        core.ngx_destroy_pool(pool);
+        record_store_error(ducf, DU_ERROR_ALLOCATION_FAILED);
         return;
     };
+    const ctx_mem: *ConsulRefreshCtx = @alignCast(@ptrCast(ctx_mem_cptr));
 
-    const peers_str = consul_peers_json(pool, body, lg) orelse {
-        record_store_error(ducf, DU_ERROR_INVALID_JSON);
-        if (lccf.*.worker_events_channel.len > 0)
-            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_INVALID_JSON);
-        return;
+    ctx_mem.* = .{
+        .entry = entry,
+        .lccf = lccf,
+        .ducf = ducf,
+        .pool = pool,
+        .connection = ngx_conn,
+        .request = request,
+        .response_buf = response_buf,
+        .response_len = 0,
+        .send_pos = 0,
+        .state = .connecting,
     };
 
-    var cj = CJSON.init(pool);
-    const json = cj.decode(peers_str) catch {
-        record_store_error(ducf, DU_ERROR_INVALID_JSON);
-        if (lccf.*.worker_events_channel.len > 0)
-            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_INVALID_JSON);
-        return;
-    };
+    ngx_conn.*.log = lg;
+    ngx_conn.*.data = ctx_mem;
+    ngx_conn.*.read.*.log = lg;
+    ngx_conn.*.read.*.handler = consul_refresh_read_handler;
+    ngx_conn.*.write.*.log = lg;
+    ngx_conn.*.write.*.handler = consul_refresh_write_handler;
 
-    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, true, false);
+    entry.ctx = ctx_mem;
+    entry.in_flight = true;
+
+    const rc = connect(fd, &addr, @sizeOf(sockaddr_in));
+    if (rc == 0) {
+        ctx_mem.state = .writing;
+        consul_refresh_drive_write(ctx_mem);
+        return;
+    }
+
+    if (errno_value() != EINPROGRESS) {
+        consul_refresh_fail(ctx_mem, DU_ERROR_SOURCE_READ_FAILED);
+        return;
+    }
+
+    if (!consul_refresh_arm(ctx_mem, false, true)) {
+        consul_refresh_fail(ctx_mem, DU_ERROR_SOURCE_READ_FAILED);
+    }
 }
 
 fn run_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
@@ -2094,16 +2331,7 @@ fn run_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
         return;
     };
 
-    var cj = CJSON.init(pool);
-    const json = cj.decode(body_str) catch {
-        record_store_error(ducf, DU_ERROR_INVALID_JSON);
-        if (lccf.*.worker_events_channel.len > 0)
-            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_INVALID_JSON);
-        return;
-    };
-    defer cj.free(json);
-
-    _ = build_and_activate_snapshot(pool, ducf, lccf.*.target_uscf, lccf, json, true, false, false);
+    activate_refresh_snapshot_json(pool, ducf, lccf, body_str, false);
 }
 
 fn dynamic_upstreams_refresh_timer_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
@@ -2145,6 +2373,8 @@ fn dynamic_upstreams_init_process(cycle: [*c]core.ngx_cycle_t) callconv(.c) ngx_
         if (entry.lccf.*.refresh_ms == 0) continue;
 
         entry.timer = std.mem.zeroes(core.ngx_event_t);
+        entry.in_flight = false;
+        entry.ctx = null;
         entry.timer.handler = dynamic_upstreams_refresh_timer_handler;
         entry.timer.log = cycle.*.log;
         entry.timer.data = entry;
@@ -2162,7 +2392,12 @@ fn dynamic_upstreams_exit_process(_: [*c]core.ngx_cycle_t) callconv(.c) void {
         if (entry.timer.flags.timer_set) {
             event.ngx_event_del_timer(&entry.timer);
         }
+        if (entry.ctx) |ctx| {
+            consul_refresh_finalize(ctx);
+        }
         entry.timer = std.mem.zeroes(core.ngx_event_t);
+        entry.in_flight = false;
+        entry.ctx = null;
     }
 }
 
