@@ -201,9 +201,7 @@ fn find_tag_idx(store: [*c]cache_tags_store, tag: []const u8) ?usize {
 
 fn remove_tag_at(store: [*c]cache_tags_store, idx: usize) usize {
     if (idx >= MAX_TAGS or store[0].tag_used[idx] != @as(u8, 1)) return 0;
-    const entry = &store[0].tags[idx];
-    const count = entry.uri_count;
-    entry.* = std.mem.zeroes(TagEntry);
+    const count = store[0].tags[idx].uri_count;
     store[0].tag_used[idx] = @as(u8, 0);
     store.*.tag_count -= 1;
     return count;

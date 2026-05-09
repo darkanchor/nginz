@@ -210,9 +210,9 @@ fn findOrCreateTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
         if (store.*.tag_count >= MAX_TAGS) return null;
         for (&store[0].tags, 0..) |*entry, i| {
             if (store[0].tag_used[i] != @as(u8, 0)) continue;
-            entry.* = std.mem.zeroes(TagEntry);
             const len = @min(tag.len, MAX_TAG_LEN);
             entry.tag_len = len;
+            entry.uri_count = 0;
             @memcpy(entry.tag[0..len], tag[0..len]);
             store[0].tag_used[i] = @as(u8, 1);
             store.*.tag_count += 1;
@@ -236,9 +236,9 @@ fn findOrCreateTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
 
     for (&store[0].tags, 0..) |*entry, i| {
         if (store[0].tag_used[i] != @as(u8, 0)) continue;
-        entry.* = std.mem.zeroes(TagEntry);
         const len = @min(tag.len, MAX_TAG_LEN);
         entry.tag_len = len;
+        entry.uri_count = 0;
         @memcpy(entry.tag[0..len], tag[0..len]);
         store[0].tag_used[i] = @as(u8, 1);
         store.*.tag_count += 1;
@@ -313,7 +313,6 @@ fn purgeByTag(store: [*c]cache_tags_store, tag: []const u8) usize {
         const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
         if (entry.tag_len == tag.len and std.mem.eql(u8, entry_tag, tag)) {
             const count = entry.uri_count;
-            entry.* = std.mem.zeroes(TagEntry);
             store[0].tag_used[i] = @as(u8, 0);
             store.*.tag_count -= 1;
             return count;

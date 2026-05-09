@@ -252,14 +252,25 @@ Add optional advanced matching, authorization depth, and fanout integration.
 
 ### Performance Notes
 
-- The first tuning priority is the exact-match operator path, because that is the common control-plane action in the combo perf harness.
-- `cache_purge_match exact` is the cheapest mode. It uses direct lookup/removal against the shared metadata store.
+- `cache_purge_match exact` is the cheapest mode. It uses a direct lookup/removal against the shared metadata store without scanning.
 - `cache_purge_match prefix` is intentionally more expensive because it must scan the bounded metadata set for matches.
 - The single-target exact fast path is deliberately narrow:
   - accepted fast-shape: `{"targets":["tag-a"]}`
   - no escapes inside the target string
   - any other valid request body still works, but uses the normal parser path
 - This is an implementation optimization, not a separate API contract. Users do not need to opt in.
+
+#### Worker-events mode tuning
+
+`cache_purge_worker_events_mode` is an explicit performance opt-in. Every successful purge that publishes an event acquires the worker-events shared-memory mutex in addition to the cache-tags metadata mutex. Choosing the right mode avoids unnecessary mutex work on the purge hot path:
+
+| mode | when to use |
+|---|---|
+| `per_target` (default) | Multi-worker deployments where other workers subscribe to purge events and react per tag — e.g. dropping a local in-process cache entry on invalidation. Keep this when consumers care about which specific tag was purged. |
+| `summary` | Multi-worker deployments doing high-fanout batch purges (many targets per POST). Emits one `purge_batch` event instead of one event per target, reducing event volume for consumers that only need to know *a batch happened*, not which tags. |
+| `off` | Single-worker nginx, or multi-worker setups where no consumer subscribes to purge events. Skips the worker-events mutex entirely. Use this in benchmarks and deployments where cross-worker cache invalidation notification is not needed. |
+
+If `cache_purge_worker_events_channel` is not set, no events are published regardless of mode, so the mode setting has no effect.
 
 ### Observability
 

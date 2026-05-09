@@ -48,7 +48,12 @@
       "Bash(nm -n zig-out/bin/nginz)",
       "Bash(addr2line -e zig-out/bin/nginz -f 0x16347a9)",
       "Bash(objdump -d zig-out/bin/nginz)",
-      "Bash(nginx -t -c /tmp/bad-nginx.conf)"
+      "Bash(nginx -t -c /tmp/bad-nginx.conf)",
+      "Bash(ZIG_OPTIMIZE=ReleaseSmall zig build)",
+      "Bash(ZIG_OPTIMIZE=ReleaseSmall bun test *)",
+      "Bash(bun perf/dynamic-upstreams/benchmark/run.js --help)",
+      "Bash(ZIG_OPTIMIZE=ReleaseSmall bun *)",
+      "Bash(wait)"
     ]
   }
 }

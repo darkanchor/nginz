@@ -20,7 +20,7 @@ let activeArtifacts = null;
 let activeRuntime = null;
 let backendServers = [];
 
-function buildNginzConfig() {
+function buildNginzConfig(workerEventsMode = "per_target") {
   const configPath = join(activeArtifacts.runtimeDir, "nginx.conf");
   const [backendA, backendB] = activeRuntime.backends;
   const config = [
@@ -86,6 +86,7 @@ function buildNginzConfig() {
     "            cache_purge_authorize off;",
     "            cache_purge_max_keys 16;",
     `            cache_purge_worker_events_channel ${EVENTS_CHANNEL};`,
+    `            cache_purge_worker_events_mode ${workerEventsMode};`,
     "        }",
     "",
     "        location /health {",
@@ -368,7 +369,7 @@ async function main() {
   let nginzStarted = false;
   try {
     resetRuntimeDir(activeArtifacts.runtimeDir);
-    const configPath = buildNginzConfig();
+    const configPath = buildNginzConfig(options.workerEventsMode);
     await startNginz(configPath, activeArtifacts.runtimeDir, nginzPort, { resetRuntime: false });
     nginzStarted = true;
 

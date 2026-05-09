@@ -1,3 +1,5 @@
+const VALID_WORKER_EVENTS_MODES = ["off", "per_target", "summary"];
+
 export function parseBenchmarkArgs(argv) {
   const options = {
     scenario: null,
@@ -8,6 +10,7 @@ export function parseBenchmarkArgs(argv) {
     profile: "snapshot",
     artifactTag: "",
     keepRuntime: false,
+    workerEventsMode: "per_target",
     help: false,
   };
 
@@ -31,11 +34,17 @@ export function parseBenchmarkArgs(argv) {
     if (key === "--concurrency") {
       options.concurrency = value.split(",").map((part) => Number(part.trim())).filter((part) => part > 0);
     }
+    if (key === "--worker-events-mode") {
+      if (!VALID_WORKER_EVENTS_MODES.includes(value)) {
+        throw new Error(`--worker-events-mode must be one of: ${VALID_WORKER_EVENTS_MODES.join(", ")}`);
+      }
+      options.workerEventsMode = value;
+    }
   }
 
   return options;
 }
 
 export function printBenchmarkHelp(scriptPath) {
-  console.log(`Usage: bun ${scriptPath} [options]\n\nOptions:\n  --help                 Show this help\n  --scenario=<name>      Run a single scenario\n  --requests=<n>         Timed requests per scenario/concurrency/service (default: 200)\n  --warmup=<n>           Warmup requests per scenario/service (default: 20)\n  --concurrency=a,b,c    Concurrency list (default: 1,8,32)\n  --service=<both|pgrest|postgrest>  Service selection (default: both)\n  --profile=<none|snapshot|perf-stat>  Profiling mode (default: snapshot)\n  --artifact-tag=<slug>  Optional tag appended to the run directory name\n  --keep-runtime         Keep benchmark runtime artifacts`);
+  console.log(`Usage: bun ${scriptPath} [options]\n\nOptions:\n  --help                 Show this help\n  --scenario=<name>      Run a single scenario\n  --requests=<n>         Timed requests per scenario/concurrency/service (default: 200)\n  --warmup=<n>           Warmup requests per scenario/service (default: 20)\n  --concurrency=a,b,c    Concurrency list (default: 1,8,32)\n  --service=<both|pgrest|postgrest>  Service selection (default: both)\n  --profile=<none|snapshot|perf-stat>  Profiling mode (default: snapshot)\n  --artifact-tag=<slug>  Optional tag appended to the run directory name\n  --keep-runtime         Keep benchmark runtime artifacts\n  --worker-events-mode=<off|per_target|summary>  cache_purge worker-events mode (default: per_target)`);
 }

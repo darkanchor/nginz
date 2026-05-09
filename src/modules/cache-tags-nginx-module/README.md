@@ -89,13 +89,23 @@ These variables expose the most recent purge outcome for the current purge reque
 - `$cache_tags_last_error` is currently set to `method_not_allowed` when the purge endpoint is called with an unsupported method such as `POST`.
 - Plain cache-tag capture requests and tag-listing purge requests leave these variables unset.
 
+### Performance Notes
+
+The tag store is a fixed-size flat array in an nginx shared-memory zone. The header filter holds the zone's slab mutex briefly on every response that carries a `Cache-Tag` header. To keep the capture path fast:
+
+- Enable `cache_tags` only on locations where upstream responses actually carry `Cache-Tag` headers. Enabling it broadly causes every response to attempt a header lookup and a potential store update under the mutex.
+- Keep tag names and URI paths reasonably short. The store caps each tag name at 64 bytes and each URI at 256 bytes; longer values are silently truncated rather than rejected.
+- Tag names beyond `MAX_TAGS` (256) and URIs beyond `MAX_URIS_PER_TAG` (64) per tag are silently dropped when the store is full. For workloads with very high tag cardinality or many URIs per tag, consider purging tags regularly to keep the store below capacity.
+
+The `cache-purge` module is the preferred operator-facing purge surface. The `cache_tags_purge` directive (GET/DELETE endpoint on this module) is a simpler alternative but does not support the richer matching, authorization, or worker-events fanout provided by `cache-purge`.
+
 ### Limitations
 
 Current implementation has these limitations:
 
 - **Memory Only**: Tags are stored in nginx shared memory and are still lost on restart/reload
 - **No Wildcards Yet**: Pattern matching limited to exact tags
-- **Fixed Capacity**: The current shared-memory store uses fixed tag and URI limits
+- **Fixed Capacity**: The current shared-memory store uses fixed tag and URI limits (`MAX_TAGS=256`, `MAX_URIS_PER_TAG=64`, `MAX_URI_LEN=256`); entries beyond these limits are silently dropped
 
 ### Future Enhancements
 
