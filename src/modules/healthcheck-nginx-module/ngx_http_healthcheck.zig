@@ -987,6 +987,22 @@ fn findPeerProbeEntry(addr: []const u8) ?*const PeerProbeEntry {
 
 // ── Cross-module API ─────────────────────────────────────────────────────────
 
+const HEALTHCHECK_PEER_STATE_ELIGIBLE: c_int = 0;
+const HEALTHCHECK_PEER_STATE_UNHEALTHY: c_int = 1;
+const HEALTHCHECK_PEER_STATE_SLOW_START: c_int = 2;
+
+export fn ngz_healthcheck_peer_state(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int {
+    if (peer_probe_count == 0) return HEALTHCHECK_PEER_STATE_ELIGIBLE;
+    const addr = core.slicify(u8, addr_data, addr_len);
+    const entry = findPeerProbeEntry(addr) orelse return HEALTHCHECK_PEER_STATE_ELIGIBLE;
+    const zone = entry.zone;
+    if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null) return HEALTHCHECK_PEER_STATE_ELIGIBLE;
+    const store = core.castPtr(healthcheck_store, zone.*.data) orelse return HEALTHCHECK_PEER_STATE_ELIGIBLE;
+    if (store.*.probe_healthy == 0) return HEALTHCHECK_PEER_STATE_UNHEALTHY;
+    if (store.*.probe_recovered_at_ms > 0) return HEALTHCHECK_PEER_STATE_SLOW_START;
+    return HEALTHCHECK_PEER_STATE_ELIGIBLE;
+}
+
 // Returns 1 if the peer at addr_data/addr_len is eligible for selection,
 // 0 if it is known-unhealthy according to a configured peer probe.
 // Peers with no probe configured are considered eligible (fail-open).
@@ -994,18 +1010,7 @@ fn findPeerProbeEntry(addr: []const u8) ?*const PeerProbeEntry {
 // reading a single ngx_flag_t word is atomic on x86-64 and acceptable
 // for selection-time decisions where a stale read degrades gracefully.
 export fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int {
-    if (peer_probe_count == 0) return 1;
-    const addr = core.slicify(u8, addr_data, addr_len);
-    const entry = findPeerProbeEntry(addr) orelse return 1;
-    const zone = entry.zone;
-    if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null) return 1;
-    const store = core.castPtr(healthcheck_store, zone.*.data) orelse return 1;
-    // Conservative slow-start contract for selection:
-    // a recovered peer stays out of sticky rotation until its slow-start
-    // ramp completes and probe_recovered_at_ms is cleared.
-    if (store.*.probe_healthy == 0) return 0;
-    if (store.*.probe_recovered_at_ms > 0) return 0;
-    return 1; // no probe configured for this peer — eligible
+    return if (ngz_healthcheck_peer_state(addr_data, addr_len) == HEALTHCHECK_PEER_STATE_ELIGIBLE) 1 else 0;
 }
 
 // ── Snapshot readers ─────────────────────────────────────────────────────────

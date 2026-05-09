@@ -726,6 +726,24 @@ describe("dynamic-upstreams Phase 4 — cold-start journal persistence", () => {
     void journaledGen;
   });
 
+  test("cold restart emits snapshot_restored event", async () => {
+    await stopNginz();
+    await startNginz(`tests/${MODULE}/nginx-journal.conf`, MODULE);
+
+    const events = await waitForWorkerEvents(
+      (snapshot) => snapshot.events.some((event) => event.type === "snapshot_restored"),
+      "upstreams",
+      4000,
+    );
+    const restored = events.events.find((event) => event.type === "snapshot_restored");
+    const payload = JSON.parse(restored.payload);
+    expect(payload.target).toBe("api_backend");
+    expect(payload.source).toBe("static");
+    expect(typeof payload.generation).toBe("number");
+    expect(typeof payload.peer_count).toBe("number");
+    expect(payload.peer_count).toBeGreaterThan(0);
+  });
+
   test("corrupt journal is non-fatal: nginx starts with restore_error_code set", async () => {
     const { writeFileSync } = await import("fs");
     writeFileSync(JOURNAL_PATH, "{bad-json");
@@ -781,6 +799,28 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
     expect(state.drain_count).toBe(1);
   });
 
+  test("PATCH drain emits peer_draining event", async () => {
+    const beforeEvents = await getWorkerEvents("upstreams");
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(200);
+
+    const events = await waitForWorkerEvents(
+      (snapshot) => snapshot.events.some((event) => event.type === "peer_draining"),
+      "upstreams",
+      4000,
+      beforeEvents.newest_generation,
+    );
+    const ev = events.events.find((event) => event.type === "peer_draining");
+    const payload = JSON.parse(ev.payload);
+    expect(payload.target).toBe("api_backend");
+    expect(payload.address).toBe("127.0.0.1:19002");
+    expect(payload.drain_count).toBeGreaterThanOrEqual(1);
+  });
+
   test("PATCH drain is idempotent for already-draining address", async () => {
     const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
@@ -793,6 +833,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH undrain removes address and updates drain_count", async () => {
+    const beforeEvents = await getWorkerEvents("upstreams");
     const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -806,6 +847,18 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
 
     const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(state.drain_count).toBe(0);
+
+    const events = await waitForWorkerEvents(
+      (snapshot) => snapshot.events.some((event) => event.type === "peer_undrained"),
+      "upstreams",
+      4000,
+      beforeEvents.newest_generation,
+    );
+    const ev = events.events.find((event) => event.type === "peer_undrained");
+    const payload = JSON.parse(ev.payload);
+    expect(payload.target).toBe("api_backend");
+    expect(payload.address).toBe("127.0.0.1:19002");
+    expect(payload.drain_count).toBe(0);
   });
 
   test("PATCH undrain is idempotent for non-draining address", async () => {
@@ -828,6 +881,18 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
     expect(res.status).toBe(400);
   });
 
+  test("PATCH rejects requests that specify both drain and undrain", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        drain: "127.0.0.1:19002",
+        undrain: "127.0.0.1:19002",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
   test("PATCH rejects address longer than 64 bytes", async () => {
     const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
@@ -846,11 +911,57 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
     expect(res.status).toBe(400);
   });
 
+  test("PATCH drain rejects an address that is not part of the current upstream", async () => {
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "127.0.0.1:19999" }),
+    });
+    expect(res.status).toBe(404);
+  });
+
   test("PATCH rejects missing Content-Type", async () => {
     const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       body: JSON.stringify({ drain: "127.0.0.1:19002" }),
     });
     expect(res.status).toBe(415);
+  });
+});
+
+describe("dynamic-upstreams Phase 5 — drain state is scoped per upstream", () => {
+  let backend;
+
+  beforeAll(async () => {
+    backend = createHTTPMock(MOCK_PORTS.HTTP_UPSTREAM_1);
+    backend.setDefault({ status: 200, body: { server: "shared-backend" } });
+    await startNginz(`tests/${MODULE}/nginx-drain-scope.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    backend.stop();
+    cleanupRuntime(MODULE);
+  });
+
+  test("draining one managed upstream does not exclude the same address in another upstream", async () => {
+    const routeHeaders = { "x-route": "scope-test" };
+
+    const beforeBlue = await fetch(`${TEST_URL}/blue`, { headers: routeHeaders });
+    const beforeGreen = await fetch(`${TEST_URL}/green`, { headers: routeHeaders });
+    expect(beforeBlue.status).toBe(200);
+    expect(beforeGreen.status).toBe(200);
+
+    const patchRes = await fetch(`${TEST_URL}/dynamic-upstreams-blue`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "127.0.0.1:19002" }),
+    });
+    expect(patchRes.status).toBe(200);
+
+    const afterBlue = await fetch(`${TEST_URL}/blue`, { headers: routeHeaders });
+    const afterGreen = await fetch(`${TEST_URL}/green`, { headers: routeHeaders });
+    expect(afterBlue.status).toBe(502);
+    expect(afterGreen.status).toBe(200);
   });
 });

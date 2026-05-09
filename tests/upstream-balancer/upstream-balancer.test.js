@@ -558,4 +558,59 @@ describe("upstream-balancer healthcheck integration", () => {
     }
     expect(servers.size).toBe(2);
   });
+
+  test("undrain does not bypass unhealthy or slow-start gating", async () => {
+    const peer2Key = stickyKeyForPeer(1, 2, "hc-drain-peer2");
+
+    let res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${peer2Key}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend2");
+
+    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "127.0.0.1:19003" }),
+    });
+    expect(res.status).toBe(200);
+
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${peer2Key}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend1");
+
+    backend2.get("/probe", { status: 500, body: { status: "fail" } });
+    await Bun.sleep(400);
+
+    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ undrain: "127.0.0.1:19003" }),
+    });
+    expect(res.status).toBe(200);
+
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${peer2Key}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend1");
+
+    backend2.get("/probe", { status: 200, body: { status: "ok" } });
+    await Bun.sleep(150);
+
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${peer2Key}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend1");
+
+    await Bun.sleep(350);
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${peer2Key}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend2");
+  });
 });

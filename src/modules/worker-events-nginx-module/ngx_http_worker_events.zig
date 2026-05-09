@@ -459,6 +459,7 @@ fn handle_inspect(r: [*c]ngx_http_request_t) ngx_int_t {
 
     // Resolve filter parameters
     var channel_filter: ngx_str_t = lccf.*.default_channel;
+    var type_filter: ngx_str_t = ngx_null_str;
     var since_generation: u64 = 0;
     var limit_count: ngx_uint_t = 0;
 
@@ -488,6 +489,9 @@ fn handle_inspect(r: [*c]ngx_http_request_t) ngx_int_t {
                 // Set channel filter from query
                 channel_filter.len = @intCast(value.len);
                 channel_filter.data = @constCast(value.ptr);
+            } else if (std.mem.eql(u8, key, "type")) {
+                type_filter.len = @intCast(value.len);
+                type_filter.data = @constCast(value.ptr);
             } else if (std.mem.eql(u8, key, "since")) {
                 since_generation = std.fmt.parseInt(u64, value, 10) catch 0;
             } else if (std.mem.eql(u8, key, "limit")) {
@@ -554,6 +558,16 @@ fn handle_inspect(r: [*c]ngx_http_request_t) ngx_int_t {
                 }
                 const ch_str = ngx_str_t{ .data = @constCast(&entry.channel), .len = entry.channel_len };
                 if (!string.eql(ch_str, channel_filter)) {
+                    continue;
+                }
+            }
+
+            if (type_filter.len > 0) {
+                if (entry.type_len != type_filter.len) {
+                    continue;
+                }
+                const ty_str = ngx_str_t{ .data = @constCast(&entry.event_type), .len = entry.type_len };
+                if (!string.eql(ty_str, type_filter)) {
                     continue;
                 }
             }

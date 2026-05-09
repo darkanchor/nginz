@@ -30,10 +30,15 @@ extern var ngx_http_core_module: ngx_module_t;
 // Provided by the healthcheck module. Returns 1 if the peer is eligible
 // (healthy or not monitored), 0 if a configured probe marks it unhealthy.
 extern fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
+extern fn ngz_healthcheck_peer_state(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
 
 // Provided by the dynamic-upstreams module. Returns 1 if the peer has been
-// explicitly marked draining via PATCH /drain, 0 otherwise (fail-open).
-extern fn ngz_du_is_peer_draining(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
+// explicitly marked draining in this upstream, 0 otherwise (fail-open).
+extern fn ngz_du_is_peer_draining_in_upstream(
+    source_ctx: ?*anyopaque,
+    addr_data: [*c]u8,
+    addr_len: usize,
+) callconv(.c) c_int;
 
 extern fn ngx_http_upstream_init_round_robin(
     cf: [*c]ngx_conf_t,
@@ -51,6 +56,9 @@ const FALLBACK_OFF: c_int = 1;
 const DIRECT_COOKIE_PREFIX = "peer:";
 const DEFAULT_COOKIE_ATTRS = "; Path=/; HttpOnly; SameSite=Lax";
 const BALANCER_METRICS_ZONE_SIZE: usize = 32 * 1024;
+const HEALTHCHECK_PEER_STATE_ELIGIBLE: c_int = 0;
+const HEALTHCHECK_PEER_STATE_UNHEALTHY: c_int = 1;
+const HEALTHCHECK_PEER_STATE_SLOW_START: c_int = 2;
 
 const balancer_metrics_store = extern struct {
     initialized: core.ngx_flag_t,
@@ -68,8 +76,10 @@ const balancer_metrics_store = extern struct {
     cookies_rotated_total: u64,
     peer_rejections_tried_total: u64,
     peer_rejections_unhealthy_total: u64,
+    peer_rejections_slow_start_total: u64,
     peer_rejections_fail_window_total: u64,
     peer_rejections_max_conns_total: u64,
+    peer_rejections_draining_total: u64,
 };
 
 var ngx_http_upstream_balancer_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_shm_zone_t);
@@ -194,8 +204,10 @@ const BalancerMetric = enum {
     cookies_rotated_total,
     peer_rejections_tried_total,
     peer_rejections_unhealthy_total,
+    peer_rejections_slow_start_total,
     peer_rejections_fail_window_total,
     peer_rejections_max_conns_total,
+    peer_rejections_draining_total,
 };
 
 fn incrementMetric(metric: BalancerMetric) void {
@@ -215,8 +227,10 @@ fn incrementMetric(metric: BalancerMetric) void {
         .cookies_rotated_total => _ = @atomicRmw(u64, &store.*.cookies_rotated_total, .Add, 1, .monotonic),
         .peer_rejections_tried_total => _ = @atomicRmw(u64, &store.*.peer_rejections_tried_total, .Add, 1, .monotonic),
         .peer_rejections_unhealthy_total => _ = @atomicRmw(u64, &store.*.peer_rejections_unhealthy_total, .Add, 1, .monotonic),
+        .peer_rejections_slow_start_total => _ = @atomicRmw(u64, &store.*.peer_rejections_slow_start_total, .Add, 1, .monotonic),
         .peer_rejections_fail_window_total => _ = @atomicRmw(u64, &store.*.peer_rejections_fail_window_total, .Add, 1, .monotonic),
         .peer_rejections_max_conns_total => _ = @atomicRmw(u64, &store.*.peer_rejections_max_conns_total, .Add, 1, .monotonic),
+        .peer_rejections_draining_total => _ = @atomicRmw(u64, &store.*.peer_rejections_draining_total, .Add, 1, .monotonic),
     }
 }
 
@@ -238,8 +252,10 @@ fn snapshotMetrics() ?balancer_metrics_store {
         .cookies_rotated_total = atomicLoadMetric(&store.*.cookies_rotated_total),
         .peer_rejections_tried_total = atomicLoadMetric(&store.*.peer_rejections_tried_total),
         .peer_rejections_unhealthy_total = atomicLoadMetric(&store.*.peer_rejections_unhealthy_total),
+        .peer_rejections_slow_start_total = atomicLoadMetric(&store.*.peer_rejections_slow_start_total),
         .peer_rejections_fail_window_total = atomicLoadMetric(&store.*.peer_rejections_fail_window_total),
         .peer_rejections_max_conns_total = atomicLoadMetric(&store.*.peer_rejections_max_conns_total),
+        .peer_rejections_draining_total = atomicLoadMetric(&store.*.peer_rejections_draining_total),
     };
 }
 
@@ -529,7 +545,7 @@ export fn ngx_http_upstream_balancer_status_handler(r: [*c]ngx_http_request_t) c
         return send_json_response(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR, string.ngx_string("{\"module\":\"upstream_balancer\",\"status\":\"error\",\"error\":\"metrics unavailable\"}"));
     var body_buf: [1024]u8 = undefined;
     const body = std.fmt.bufPrint(&body_buf,
-        "{{\"module\":\"upstream_balancer\",\"status\":\"ok\",\"requests_total\":{d},\"sticky_cookie_requests_total\":{d},\"sticky_header_requests_total\":{d},\"runtime_peer_source_requests_total\":{d},\"direct_peer_hits\":{d},\"hash_hits\":{d},\"key_absent_misses\":{d},\"direct_peer_misses\":{d},\"fallback_next_total\":{d},\"fallback_off_total\":{d},\"cookies_issued_total\":{d},\"cookies_rotated_total\":{d},\"peer_rejections_tried_total\":{d},\"peer_rejections_unhealthy_total\":{d},\"peer_rejections_fail_window_total\":{d},\"peer_rejections_max_conns_total\":{d}}}",
+        "{{\"module\":\"upstream_balancer\",\"status\":\"ok\",\"requests_total\":{d},\"sticky_cookie_requests_total\":{d},\"sticky_header_requests_total\":{d},\"runtime_peer_source_requests_total\":{d},\"direct_peer_hits\":{d},\"hash_hits\":{d},\"key_absent_misses\":{d},\"direct_peer_misses\":{d},\"fallback_next_total\":{d},\"fallback_off_total\":{d},\"cookies_issued_total\":{d},\"cookies_rotated_total\":{d},\"peer_rejections_tried_total\":{d},\"peer_rejections_unhealthy_total\":{d},\"peer_rejections_slow_start_total\":{d},\"peer_rejections_fail_window_total\":{d},\"peer_rejections_max_conns_total\":{d},\"peer_rejections_draining_total\":{d}}}",
         .{
             snapshot.requests_total,
             snapshot.sticky_cookie_requests_total,
@@ -545,8 +561,10 @@ export fn ngx_http_upstream_balancer_status_handler(r: [*c]ngx_http_request_t) c
             snapshot.cookies_rotated_total,
             snapshot.peer_rejections_tried_total,
             snapshot.peer_rejections_unhealthy_total,
+            snapshot.peer_rejections_slow_start_total,
             snapshot.peer_rejections_fail_window_total,
             snapshot.peer_rejections_max_conns_total,
+            snapshot.peer_rejections_draining_total,
         },
     ) catch return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
     const body_str = dupPoolString(r.*.pool, body) orelse return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -634,10 +652,15 @@ export fn upstream_balancer_init_peer(
 // A peer is eligible if nginx hasn't marked it down, the healthcheck module
 // (when loaded) considers it healthy, and it is not explicitly draining.
 // All checks fail-open: unknown peer → eligible.
-fn is_eligible(p: [*c]ngx_http_upstream_rr_peer_t) bool {
+fn is_eligible(source_ctx: ?*anyopaque, p: [*c]ngx_http_upstream_rr_peer_t) bool {
     if (p.*.down != 0) return false;
-    if (ngz_healthcheck_is_peer_eligible(p.*.name.data, p.*.name.len) == 0) return false;
-    if (ngz_du_is_peer_draining(p.*.name.data, p.*.name.len) != 0) return false;
+    switch (ngz_healthcheck_peer_state(p.*.name.data, p.*.name.len)) {
+        HEALTHCHECK_PEER_STATE_ELIGIBLE => {},
+        HEALTHCHECK_PEER_STATE_UNHEALTHY => return false,
+        HEALTHCHECK_PEER_STATE_SLOW_START => return false,
+        else => if (ngz_healthcheck_is_peer_eligible(p.*.name.data, p.*.name.len) == 0) return false,
+    }
+    if (ngz_du_is_peer_draining_in_upstream(source_ctx, p.*.name.data, p.*.name.len) != 0) return false;
     return true;
 }
 
@@ -678,6 +701,7 @@ fn mark_peer_tried(rrp: [*c]ngx_http_upstream_rr_peer_data_t, index: ngx_uint_t)
 }
 
 fn peer_available_for_sticky(
+    source_ctx: ?*anyopaque,
     rrp: [*c]ngx_http_upstream_rr_peer_data_t,
     peer: [*c]ngx_http_upstream_rr_peer_t,
     index: ngx_uint_t,
@@ -687,8 +711,20 @@ fn peer_available_for_sticky(
         incrementMetric(.peer_rejections_tried_total);
         return false;
     }
-    if (!is_eligible(peer)) {
-        incrementMetric(.peer_rejections_unhealthy_total);
+    if (peer.*.down != 0) return false;
+    switch (ngz_healthcheck_peer_state(peer.*.name.data, peer.*.name.len)) {
+        HEALTHCHECK_PEER_STATE_UNHEALTHY => {
+            incrementMetric(.peer_rejections_unhealthy_total);
+            return false;
+        },
+        HEALTHCHECK_PEER_STATE_SLOW_START => {
+            incrementMetric(.peer_rejections_slow_start_total);
+            return false;
+        },
+        else => {},
+    }
+    if (ngz_du_is_peer_draining_in_upstream(source_ctx, peer.*.name.data, peer.*.name.len) != 0) {
+        incrementMetric(.peer_rejections_draining_total);
         return false;
     }
     if (peer.*.max_fails != 0 and peer.*.fails >= peer.*.max_fails and now - peer.*.checked <= peer.*.fail_timeout) {
@@ -707,7 +743,7 @@ const StickySelection = struct {
     index: ngx_uint_t,
 };
 
-fn select_direct_peer(rrp: [*c]ngx_http_upstream_rr_peer_data_t, target_name: []const u8) ?StickySelection {
+fn select_direct_peer(source_ctx: ?*anyopaque, rrp: [*c]ngx_http_upstream_rr_peer_data_t, target_name: []const u8) ?StickySelection {
     const now = core.ngx_time();
     var index: ngx_uint_t = 0;
     var peer = rrp.*.peers.*.peer;
@@ -715,7 +751,7 @@ fn select_direct_peer(rrp: [*c]ngx_http_upstream_rr_peer_data_t, target_name: []
         peer = peer.*.next;
         index += 1;
     }) {
-        if (!peer_available_for_sticky(rrp, peer, index, now)) continue;
+        if (!peer_available_for_sticky(source_ctx, rrp, peer, index, now)) continue;
         const name = core.slicify(u8, peer.*.name.data, peer.*.name.len);
         if (std.mem.eql(u8, name, target_name)) {
             if (now - peer.*.checked > peer.*.fail_timeout) peer.*.checked = now;
@@ -725,7 +761,7 @@ fn select_direct_peer(rrp: [*c]ngx_http_upstream_rr_peer_data_t, target_name: []
     return null;
 }
 
-fn select_sticky_peer(rrp: [*c]ngx_http_upstream_rr_peer_data_t, hash: u32) ?StickySelection {
+fn select_sticky_peer(source_ctx: ?*anyopaque, rrp: [*c]ngx_http_upstream_rr_peer_data_t, hash: u32) ?StickySelection {
     const peers = rrp.*.peers;
     const now = core.ngx_time();
 
@@ -736,7 +772,7 @@ fn select_sticky_peer(rrp: [*c]ngx_http_upstream_rr_peer_data_t, hash: u32) ?Sti
         peer = peer.*.next;
         index += 1;
     }) {
-        if (peer_available_for_sticky(rrp, peer, index, now)) {
+        if (peer_available_for_sticky(source_ctx, rrp, peer, index, now)) {
             total_weight += peer_weight(peer);
         }
     }
@@ -751,7 +787,7 @@ fn select_sticky_peer(rrp: [*c]ngx_http_upstream_rr_peer_data_t, hash: u32) ?Sti
         peer = peer.*.next;
         index += 1;
     }) {
-        if (!peer_available_for_sticky(rrp, peer, index, now)) continue;
+        if (!peer_available_for_sticky(source_ctx, rrp, peer, index, now)) continue;
         cumulative += peer_weight(peer);
         if (target < cumulative) {
             if (now - peer.*.checked > peer.*.fail_timeout) {
@@ -825,6 +861,7 @@ export fn upstream_balancer_get_peer(
     const vv = http.ngx_http_get_flushed_variable(r, @intCast(bcf.*.var_index));
     const key_absent = (vv == null) or vv.*.flags.not_found or (vv.*.flags.len == 0);
     const rrp = @as([*c]ngx_http_upstream_rr_peer_data_t, @ptrCast(@alignCast(ctx.original_data)));
+    const source_ctx = if (ctx.dynamic_source_ctx != null) ctx.dynamic_source_ctx else bcf.*.peer_source_ctx;
 
     if (key_absent) {
         incrementMetric(.key_absent_misses);
@@ -869,9 +906,9 @@ export fn upstream_balancer_get_peer(
     }
 
     const maybe_chosen = if (direct_target) |target_name|
-        select_direct_peer(rrp, target_name)
+        select_direct_peer(source_ctx, rrp, target_name)
     else
-        select_sticky_peer(rrp, hash);
+        select_sticky_peer(source_ctx, rrp, hash);
     const chosen = maybe_chosen orelse {
         if (direct_target != null) incrementMetric(.direct_peer_misses);
         if (bcf.*.fallback_mode == FALLBACK_OFF) {
