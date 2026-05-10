@@ -56,7 +56,12 @@
       "Bash(wait)",
       "Bash(jobs *)",
       "Read(//home/kaiwu/.claude/skills/**)",
-      "Read(//home/kaiwu/**)"
+      "Read(//home/kaiwu/**)",
+      "Bash(gcc -I submodules/nginx/objs -I submodules/nginx/src/core -I submodules/nginx/src/os/unix /tmp/sig_probe.c -o /tmp/sig_probe)",
+      "Bash(/tmp/sig_probe)",
+      "Bash(gcc -I submodules/nginx/objs -I submodules/nginx/src/core -I submodules/nginx/src/os/unix -I submodules/nginx/src/event -I submodules/nginx/src/event/quic -I submodules/nginx/src/http -I submodules/nginx/src/http/v2 -I submodules/nginx/src/http/v3 /tmp/sig_full.c -o /tmp/sig_full)",
+      "Bash(/tmp/sig_full)",
+      "Bash(/usr/local/bin/zig version *)"
     ]
   }
 }

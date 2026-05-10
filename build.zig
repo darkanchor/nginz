@@ -13,6 +13,7 @@ const stream = @import("project/build_stream.zig");
 const http_modules = @import("project/build_modules.zig");
 const package = @import("project/build_package.zig");
 const check_layout = @import("project/build_check_layout.zig");
+const dynmod = @import("project/build_dynmod.zig");
 
 const NGINX = "src/ngx/nginx.zig";
 const required_zig_version = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
@@ -167,6 +168,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    // Inject the nginz signature so ngx_module.zig can read it at compile time.
+    // dynmod builds override this with a signature extracted from the target nginx.
+    const sig_opts = b.addOptions();
+    sig_opts.addOption([]const u8, "nginx_signature", "8,4,8,0011111111010111011111111111111111");
+    nginx.addImport("ngx_opts", sig_opts.createModule());
 
     const ngx_libinjection = b.createModule(.{
         .root_source_file = b.path("src/ngx/ngx_libinjection.zig"),
@@ -352,6 +359,7 @@ pub fn build(b: *std.Build) void {
         }
         t.root_module.addIncludePath(b.path("src/ngx/"));
         t.root_module.addImport("ngx", nginx);
+        t.root_module.addImport("ngx_opts", sig_opts.createModule());
         t.root_module.addImport("ngx_libinjection", ngx_libinjection);
 
         const core_unit_tests = b.addRunArtifact(t);
@@ -360,6 +368,10 @@ pub fn build(b: *std.Build) void {
 
     // Package step - creates nginx module packages with config files
     _ = package.createPackageSteps(b, target, optimize, nginx, cjsonlib, libinjectionlib) catch unreachable;
+
+    // Dynmod step - builds .so files loadable by stock nginx via load_module
+    const nginx_src = b.option([]const u8, "nginx-src", "Path to a configured nginx source tree; used to extract NGX_MODULE_SIGNATURE for dynmod compatibility");
+    _ = dynmod.createDynmodSteps(b, target, optimize, nginx, cjsonlib, libinjectionlib, nginx_src) catch unreachable;
 
     // Check layout step - compare C struct sizes against Zig bindings
     const check_layout_step = b.step("check-layout", "Check C vs Zig struct layout compatibility");

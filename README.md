@@ -104,7 +104,49 @@ so far is a simplified version of `echo` and it misses some of the directives.
 
 By all means, deploy the module objects with your own binary building toolchains.
 
-## Integrating Modules with Stock Nginx
+## Integrating Modules with Stock Nginx at runtime
+
+nginz also supports building each module as a standalone `.so` file that nginx can load at runtime via `load_module`. Dynamic modules avoid recompiling nginx — they are linked into a running instance by adding a `load_module` directive to `nginx.conf`.
+
+### Building Dynamic Modules
+
+```bash
+# Build .so files signed for nginz (default signature)
+zig build dynmod
+
+# Build .so files signed for a separately-built stock nginx
+zig build dynmod -Dnginx-src=/path/to/nginx-source
+```
+
+Output is written to `zig-out/dynmod/`:
+
+```
+zig-out/dynmod/
+  echoz/
+    ngx_http_echoz_module.so
+  jwt/
+    ngx_http_jwt_module.so
+  ...
+```
+
+### Using with Nginx
+
+```nginx
+# nginx.conf
+load_module /path/to/nginz/zig-out/dynmod/echoz/ngx_http_echoz_module.so;
+load_module /path/to/nginz/zig-out/dynmod/jwt/ngx_http_jwt_module.so;
+```
+
+### Signature Compatibility
+
+nginx enforces a strict `NGX_MODULE_SIGNATURE` check when loading dynamic modules. The signature encodes the nginx version, compile-time feature flags, and struct layout. A `.so` built with the wrong signature will be rejected at startup.
+
+- **Default** (`zig build dynmod`): uses nginz's own signature — works with the bundled `nginz` binary.
+- **`-Dnginx-src`** (`zig build dynmod -Dnginx-src=/path/to/nginx`): compiles a small C probe against the target nginx's `objs/` directory to extract the correct signature automatically. The target nginx must have been previously configured with `./auto/configure`.
+
+The target nginx must also have been built with `--with-compat` to ensure struct layout compatibility.
+
+## Integrating Modules with Stock Nginx at compile time
 
 nginz provides a `package` build step that creates nginx-compatible module packages. Each package
 contains the compiled object file and a `config` script for nginx's `./configure --add-module`.
