@@ -342,6 +342,7 @@ pub fn build(b: *std.Build) void {
         t.root_module.linkSystemLibrary("pthread", .{});
         t.root_module.linkLibrary(corelib);
         t.root_module.linkLibrary(httplib);
+        t.root_module.linkLibrary(streamlib);
         t.root_module.linkLibrary(cjsonlib);
         t.root_module.linkLibrary(libinjectionlib);
         t.root_module.linkLibrary(test_moduleslib);

@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Nginz is a framework for writing nginx modules in Zig. It wraps nginx 1.30.0 and requires Zig 0.16. The project produces a `nginz` binary (nginx wrapper) and individual module object files.
 
 ## Skills
+- Read from $HOME/.claude/skills
 - This project requires zig 0.16, equip yourself with `skills/zig-0.16/SKILL.md`
 - Nginx is a subtle piece of software, it might take substantial effort to learn a hard fact when debug its core and native modules, as you learnt, append to an existing skill or create one
 
