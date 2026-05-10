@@ -137,6 +137,34 @@ load_module /path/to/nginz/zig-out/dynmod/echoz/ngx_http_echoz_module.so;
 load_module /path/to/nginz/zig-out/dynmod/jwt/ngx_http_jwt_module.so;
 ```
 
+### Module Load Order
+
+`load_module` directives are processed top-to-bottom before nginx initialises any module. Several nginz modules depend on other nginz modules being present, so the dependent module must appear **after** the one it relies on.
+
+Required ordering constraints:
+
+| Module | Must be loaded after |
+|--------|----------------------|
+| `healthcheck` | `worker-events` |
+| `cache-purge` | `cache-tags`, `worker-events` |
+| `upstream-balancer` | `healthcheck` |
+| `dynamic-upstreams` | `worker-events`, `healthcheck`, `upstream-balancer`, `consul` |
+
+Filter modules (`echoz`, `wechatpay`, `oidc`, `requestid`, `cache-tags`, `transform`) are ordered relative to nginx's built-in header/body filters by the sequence of `load_module` lines. Place them after all non-filter modules.
+
+A safe full ordering for `nginx.conf`:
+
+```nginx
+load_module .../worker_events/ngx_http_worker_events_module.so;
+load_module .../healthcheck/ngx_http_healthcheck_module.so;
+load_module .../cache_tags/ngx_http_cache_tags_module.so;      # filter
+load_module .../cache_purge/ngx_http_cache_purge_module.so;
+load_module .../consul/ngx_http_consul_module.so;
+load_module .../upstream_balancer/ngx_http_upstream_balancer_module.so;
+load_module .../dynamic_upstreams/ngx_http_dynamic_upstreams_module.so;
+# ... remaining standalone modules in any order
+```
+
 ### Signature Compatibility
 
 nginx enforces a strict `NGX_MODULE_SIGNATURE` check when loading dynamic modules. The signature encodes the nginx version, compile-time feature flags, and struct layout. A `.so` built with the wrong signature will be rejected at startup.
