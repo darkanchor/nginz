@@ -4,6 +4,7 @@ const OOM = std.mem.Allocator.Error.OutOfMemory;
 const ArrayList = std.array_list.Managed;
 
 pub var BUILD_BUFFER: [4096 * 10]u8 = undefined;
+pub var STREAM_BUILD_BUFFER: [4096 * 4]u8 = undefined;
 pub const C_FLAGS = [_][]const u8{
     "-std=gnu11",
     "-Wall",
@@ -24,6 +25,7 @@ pub const NGX_INCLUDE_PATH = [_][]const u8{
     "submodules/nginx/src/event/quic",
     "submodules/nginx/src/http/modules",
     "submodules/nginx/src/event/modules",
+    "submodules/nginx/src/stream",
 };
 
 const EXCLUDES = [_][]const u8{
@@ -38,6 +40,7 @@ const EXCLUDES = [_][]const u8{
     "njs_addr2line.c",
     "njs_lexer_keyword.c",
     "ngx_http_geoip_module.c",
+    "ngx_stream_geoip_module.c",
     "ngx_http_stub_status_module.c",
     "ngx_http_degradation_module.c",
 };

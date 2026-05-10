@@ -130,6 +130,27 @@ extern var ngx_http_transform_filter_module: ngx_module_t;
 extern var ngx_http_cache_purge_module: ngx_module_t;
 extern var ngx_http_prometheus_module: ngx_module_t;
 
+// Stream Modules
+extern var ngx_stream_module: ngx_module_t;
+extern var ngx_stream_core_module: ngx_module_t;
+extern var ngx_stream_ssl_module: ngx_module_t;
+extern var ngx_stream_realip_module: ngx_module_t;
+extern var ngx_stream_limit_conn_module: ngx_module_t;
+extern var ngx_stream_access_module: ngx_module_t;
+extern var ngx_stream_geo_module: ngx_module_t;
+extern var ngx_stream_map_module: ngx_module_t;
+extern var ngx_stream_split_clients_module: ngx_module_t;
+extern var ngx_stream_return_module: ngx_module_t;
+extern var ngx_stream_pass_module: ngx_module_t;
+extern var ngx_stream_set_module: ngx_module_t;
+extern var ngx_stream_upstream_hash_module: ngx_module_t;
+extern var ngx_stream_upstream_least_conn_module: ngx_module_t;
+extern var ngx_stream_upstream_random_module: ngx_module_t;
+extern var ngx_stream_upstream_zone_module: ngx_module_t;
+extern var ngx_stream_ssl_preread_module: ngx_module_t;
+extern var ngx_stream_write_filter_module: ngx_module_t;
+extern var ngx_stream_log_module: ngx_module_t;
+
 // Ordered list of modules (following nginx's module loading order)
 export const ngx_modules = [_][*c]ngx_module_t{
     // Core modules
@@ -266,6 +287,27 @@ export const ngx_modules = [_][*c]ngx_module_t{
     &ngx_http_range_body_filter_module,
     &ngx_http_not_modified_filter_module,
 
+    // Stream modules
+    &ngx_stream_module,
+    &ngx_stream_core_module,
+    &ngx_stream_ssl_module,
+    &ngx_stream_realip_module,
+    &ngx_stream_limit_conn_module,
+    &ngx_stream_access_module,
+    &ngx_stream_geo_module,
+    &ngx_stream_map_module,
+    &ngx_stream_split_clients_module,
+    &ngx_stream_return_module,
+    &ngx_stream_pass_module,
+    &ngx_stream_set_module,
+    &ngx_stream_upstream_hash_module,
+    &ngx_stream_upstream_least_conn_module,
+    &ngx_stream_upstream_random_module,
+    &ngx_stream_upstream_zone_module,
+    &ngx_stream_ssl_preread_module,
+    &ngx_stream_write_filter_module,
+    &ngx_stream_log_module,
+
     // Null terminator
     ngx.core.nullptr(ngx_module_t),
 };
@@ -368,6 +410,27 @@ export const ngx_module_names = [_][*c]const u8{
     "ngx_http_copy_filter_module",
     "ngx_http_range_body_filter_module",
     "ngx_http_not_modified_filter_module",
+
+    // Stream modules
+    "ngx_stream_module",
+    "ngx_stream_core_module",
+    "ngx_stream_ssl_module",
+    "ngx_stream_realip_module",
+    "ngx_stream_limit_conn_module",
+    "ngx_stream_access_module",
+    "ngx_stream_geo_module",
+    "ngx_stream_map_module",
+    "ngx_stream_split_clients_module",
+    "ngx_stream_return_module",
+    "ngx_stream_pass_module",
+    "ngx_stream_set_module",
+    "ngx_stream_upstream_hash_module",
+    "ngx_stream_upstream_least_conn_module",
+    "ngx_stream_upstream_random_module",
+    "ngx_stream_upstream_zone_module",
+    "ngx_stream_ssl_preread_module",
+    "ngx_stream_write_filter_module",
+    "ngx_stream_log_module",
 
     // Null terminator
     ngx.core.nullptr(u8),

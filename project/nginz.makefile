@@ -11,6 +11,10 @@ all: ./submodules/nginx/objs/nginz.c
 		--with-http_xslt_module \
 		--with-http_v2_module \
 		--with-http_v3_module \
+		--with-stream \
+		--with-stream_realip_module \
+		--with-stream_ssl_module \
+		--with-stream_ssl_preread_module \
 		--with-debug
 	cd submodules/njs && ./configure
 

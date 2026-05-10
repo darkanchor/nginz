@@ -9,6 +9,7 @@ const cjson = @import("project/build_cjson.zig");
 const libinjection = @import("project/build_libinjection.zig");
 const patch = @import("project/build_patch.zig");
 const quickjs = @import("project//build_quickjs.zig");
+const stream = @import("project/build_stream.zig");
 const http_modules = @import("project/build_modules.zig");
 const package = @import("project/build_package.zig");
 const check_layout = @import("project/build_check_layout.zig");
@@ -222,6 +223,10 @@ pub fn build(b: *std.Build) void {
     httplib.step.dependOn(&corelib.step);
     httplib.root_module.linkLibrary(corelib);
 
+    const streamlib = stream.build_stream(b, target, optimize) catch unreachable;
+    streamlib.step.dependOn(&corelib.step);
+    streamlib.root_module.linkLibrary(corelib);
+
     const moduleslib = http_modules.build_modules(b, target, optimize) catch unreachable;
     moduleslib.step.dependOn(&httplib.step);
     moduleslib.root_module.linkLibrary(corelib);
@@ -240,6 +245,7 @@ pub fn build(b: *std.Build) void {
     nginz.root_module.linkSystemLibrary("pthread", .{});
     nginz.root_module.linkLibrary(corelib);
     nginz.root_module.linkLibrary(httplib);
+    nginz.root_module.linkLibrary(streamlib);
     nginz.root_module.linkLibrary(moduleslib);
     nginz.root_module.linkLibrary(cjsonlib);
     nginz.root_module.linkLibrary(libinjectionlib);
