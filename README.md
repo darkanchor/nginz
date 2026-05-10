@@ -70,22 +70,26 @@ sudo docker run -d --name redis-nginz-test -p 6379:6379 redis:8.6.2-trixie
 > The SSL zig bindings are generated with `OpenSSL 3`.
 
 > [!CAUTION]
-> Many nginx structs have variable sizes, as they depend on the opt-in features at compile time.
-> Options such as `--with-compat`, `--with-http_ssl_module` could drastically affect many structs.
-> To ensure binary compatibility, one needs to adjust the zig bindings accordingly. The project
-> defaults to the configure options showed below in `main` branch. The `docker` branch configures
-> as many features as the official nginx [docker][3] debian release. Note the structs differences
-> in the test asserts.
->
-> After upgrading the nginx submodule, run `zig build check-layout` (or `zig build check-layout
-> -Ddocker=true` for the docker config) to verify C and Zig struct layouts match. Mismatches
-> are typically caused by `spare` array sizes in `ngx.zig` not being adjusted when nginx adds
-> new conditional fields that consume `NGX_COMPAT_BEGIN` slots.
+> Many nginx structs have variable sizes depending on compile-time features. The Zig bindings in
+> `ngx.zig` must match the exact configure flags used above. After upgrading the nginx submodule,
+> run `zig build check-layout` to verify C and Zig struct layouts match. Mismatches are typically
+> caused by `spare` array sizes in `ngx.zig` not being adjusted when nginx adds new conditional
+> fields that consume `NGX_COMPAT_BEGIN` slots.
 
 To ease the development. A `nginz` binary is built as an artifact along with the module objects.
-It is a nginx wrapper, and by default built with
+It is a nginx wrapper, built with
 
-`./auto/configure --with-http_ssl_module --with-http_xslt_module --with-debug`
+```
+./auto/configure \
+    --with-compat \
+    --with-file-aio \
+    --with-threads \
+    --with-http_ssl_module \
+    --with-http_xslt_module \
+    --with-http_v2_module \
+    --with-http_v3_module \
+    --with-debug
+```
 
 nginz also has built-in `ngx_http_js_module` with quickjs engine.
 
@@ -197,4 +201,3 @@ Apache-2.0
 
 [1]: https://github.com/openresty/echo-nginx-module "echo"
 [2]: https://github.com/agentzh "agentzh"
-[3]: https://github.com/nginxinc/docker-nginx/blob/master/stable/debian/Dockerfile "docker"
