@@ -40,7 +40,7 @@ fn patchOp(step: *Step, _: Build.Step.MakeOptions) anyerror!void {
 pub fn patchStep(b: *Build, docker: bool) *Step {
     const patch = b.step("patch", "patch nginz");
     if (docker) {
-        MAKEFILE = "project/nginz.makefile";
+        MAKEFILE = "project/nginz.docker.makefile";
     }
     patch.makeFn = patchOp;
 
