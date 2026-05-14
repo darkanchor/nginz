@@ -169,10 +169,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Inject the nginz signature so ngx_module.zig can read it at compile time.
-    // dynmod builds override this with a signature extracted from the target nginx.
+    // Inject the nginz metadata so ngx_module.zig can read it at compile time.
+    // dynmod builds override both values with metadata extracted from the target nginx.
     const sig_opts = b.addOptions();
     sig_opts.addOption([]const u8, "nginx_signature", "8,4,8,0011111111010111011111111111111111");
+    sig_opts.addOption(u32, "nginx_version", 1030000);
     nginx.addImport("ngx_opts", sig_opts.createModule());
 
     const ngx_libinjection = b.createModule(.{

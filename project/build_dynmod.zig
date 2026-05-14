@@ -2,16 +2,22 @@ const std = @import("std");
 const package = @import("build_package.zig");
 
 const DEFAULT_SIGNATURE = "8,4,8,0011111111010111011111111111111111";
+const DEFAULT_VERSION: u32 = 1030000;
+
+const NginxMetadata = struct {
+    signature: []const u8,
+    version: u32,
+};
 
 /// Compile and run a tiny C probe against a configured nginx source tree to
-/// extract NGX_MODULE_SIGNATURE.  The probe is written to /tmp, compiled with
-/// cc, and executed; stdout is the signature string.
-fn computeSignature(allocator: std.mem.Allocator, io: std.Io, nginx_src: []const u8) ![]const u8 {
+/// extract both NGX_MODULE_SIGNATURE and nginx_version. The probe is written to
+/// /tmp, compiled with cc, and executed; stdout is parsed into both values.
+fn computeMetadata(allocator: std.mem.Allocator, io: std.Io, nginx_src: []const u8) !NginxMetadata {
     const probe_src =
         \\#include <ngx_config.h>
         \\#include <ngx_core.h>
         \\#include <stdio.h>
-        \\int main(void) { printf("%s\n", NGX_MODULE_SIGNATURE); return 0; }
+        \\int main(void) { printf("%u\n%s\n", (unsigned) nginx_version, NGX_MODULE_SIGNATURE); return 0; }
     ;
 
     const probe_c = "/tmp/nginz_sig_probe.c";
@@ -44,22 +50,28 @@ fn computeSignature(allocator: std.mem.Allocator, io: std.Io, nginx_src: []const
     defer allocator.free(compile_res.stderr);
     switch (compile_res.term) {
         .exited => |code| if (code != 0) {
-            std.debug.print("dynmod sig_probe compile failed:\n{s}\n", .{compile_res.stderr});
-            return error.SigProbeCompileFailed;
+            std.debug.print("dynmod metadata probe compile failed:\n{s}\n", .{compile_res.stderr});
+            return error.MetadataProbeCompileFailed;
         },
-        else => return error.SigProbeCompileFailed,
+        else => return error.MetadataProbeCompileFailed,
     }
 
     const run_res = try std.process.run(allocator, io, .{ .argv = &.{probe_exe} });
     defer allocator.free(run_res.stderr);
     errdefer allocator.free(run_res.stdout);
     switch (run_res.term) {
-        .exited => |code| if (code != 0) return error.SigProbeRunFailed,
-        else => return error.SigProbeRunFailed,
+        .exited => |code| if (code != 0) return error.MetadataProbeRunFailed,
+        else => return error.MetadataProbeRunFailed,
     }
 
-    const sig = std.mem.trim(u8, run_res.stdout, " \n\r\t");
-    return try allocator.dupe(u8, sig);
+    var lines = std.mem.tokenizeAny(u8, run_res.stdout, "\n\r");
+    const version_line = lines.next() orelse return error.MetadataProbeParseFailed;
+    const signature_line = lines.next() orelse return error.MetadataProbeParseFailed;
+    const version = try std.fmt.parseInt(u32, std.mem.trim(u8, version_line, " \t"), 10);
+    return .{
+        .version = version,
+        .signature = try allocator.dupe(u8, std.mem.trim(u8, signature_line, " \t")),
+    };
 }
 
 /// Register the "dynmod" build step.  Each module in module_infos gets its own
@@ -83,16 +95,17 @@ pub fn createDynmodSteps(
 
     const dynmod_step = b.step("dynmod", "Build nginx dynamic module .so files (load_module compatible)");
 
-    const signature: []const u8 = if (nginx_src) |src|
-        computeSignature(b.allocator, b.graph.io, src) catch |err| blk: {
-            std.debug.print("dynmod: signature probe failed ({s}), falling back to default\n", .{@errorName(err)});
-            break :blk DEFAULT_SIGNATURE;
+    const metadata: NginxMetadata = if (nginx_src) |src|
+        computeMetadata(b.allocator, b.graph.io, src) catch |err| blk: {
+            std.debug.print("dynmod: metadata probe failed ({s}), falling back to defaults\n", .{@errorName(err)});
+            break :blk .{ .signature = DEFAULT_SIGNATURE, .version = DEFAULT_VERSION };
         }
     else
-        DEFAULT_SIGNATURE;
+        .{ .signature = DEFAULT_SIGNATURE, .version = DEFAULT_VERSION };
 
     const dynmod_opts = b.addOptions();
-    dynmod_opts.addOption([]const u8, "nginx_signature", signature);
+    dynmod_opts.addOption([]const u8, "nginx_signature", metadata.signature);
+    dynmod_opts.addOption(u32, "nginx_version", metadata.version);
 
     // A dedicated ngx module that carries the dynmod signature.
     const dynmod_nginx = b.addModule("ngx_dynmod", .{

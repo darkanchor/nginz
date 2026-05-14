@@ -1,9 +1,10 @@
 const std = @import("std");
 const ngx = @import("ngx.zig");
+const ngx_opts = @import("ngx_opts");
 const ArrayList = std.array_list.Managed;
 const expectEqual = std.testing.expectEqual;
 
-pub const ngx_version = 1029006;
+pub const ngx_version = ngx_opts.nginx_version;
 pub const ngx_stdin = std.posix.STDIN_FILENO;
 pub const ngx_stdout = std.posix.STDOUT_FILENO;
 pub const ngx_stderr = std.posix.STDERR_FILENO;
