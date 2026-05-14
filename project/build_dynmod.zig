@@ -1,8 +1,9 @@
 const std = @import("std");
+const common = @import("build_common.zig");
 const package = @import("build_package.zig");
 
 const DEFAULT_SIGNATURE = "8,4,8,0011111111010111011111111111111111";
-const DEFAULT_VERSION: u32 = 1030000;
+const DEFAULT_VERSION: u32 = common.bundled_nginx_version();
 
 const NginxMetadata = struct {
     signature: []const u8,

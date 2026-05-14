@@ -56,6 +56,33 @@ pub fn cap_optimize(opt: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
 // Kept as an alias so existing callers don't need to be touched.
 pub const c_optimize = cap_optimize;
 
+const bundled_nginx_header = @embedFile("../submodules/nginx/src/core/nginx.h");
+
+pub fn bundled_nginx_version() u32 {
+    const marker = "#define nginx_version";
+    var lines = std.mem.tokenizeAny(u8, bundled_nginx_header, "\r\n");
+
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, marker)) continue;
+
+        const tail = line[marker.len..];
+        var begin: usize = 0;
+        while (begin < tail.len and (tail[begin] == ' ' or tail[begin] == '\t')) : (begin += 1) {}
+
+        var end = begin;
+        while (end < tail.len and std.ascii.isDigit(tail[end])) : (end += 1) {}
+
+        if (end == begin) {
+            @panic("failed to parse nginx_version from submodules/nginx/src/core/nginx.h");
+        }
+
+        return std.fmt.parseInt(u32, tail[begin..end], 10) catch
+            @panic("invalid nginx_version in submodules/nginx/src/core/nginx.h");
+    }
+
+    @panic("failed to locate nginx_version in submodules/nginx/src/core/nginx.h");
+}
+
 pub fn append(files: *ArrayList([]const u8), src: []const []const u8) !void {
     for (src) |f| {
         try files.append(f);
