@@ -139,7 +139,11 @@ load_module /path/to/nginz/zig-out/dynmod/jwt/ngx_http_jwt_module.so;
 
 ### Module Load Order
 
-`load_module` directives are processed top-to-bottom before nginx initialises any module. Several nginz modules depend on other nginz modules being present, so the dependent module must appear **after** the one it relies on.
+`load_module` directives are processed top-to-bottom before nginx initialises any module. Several nginz modules depend on other nginz modules being present at nginx init/config time, so the dependent module must appear **after** the one it relies on.
+
+For a local `zig build dynmod`, the files live under `zig-out/dynmod/<module>/...`. Product images such as `darkanchor/nginx:*` flatten the same `.so` files into `/usr/lib/nginx/modules/nginz/`.
+
+The `upstream-balancer` / `dynamic-upstreams` pair remains two separate `.so` files. Their old circular load-time dependency was removed by moving drain checks behind the runtime `PeerSourceVTable` handoff registered through `upstream_balancer_register_peer_source()`. In other words, the remaining ordering rules below are nginx module initialisation rules, not ELF link-order workarounds, and no merged `.so` is required.
 
 Required ordering constraints:
 
@@ -155,15 +159,17 @@ Filter modules (`echoz`, `wechatpay`, `oidc`, `requestid`, `cache-tags`, `transf
 A safe full ordering for `nginx.conf`:
 
 ```nginx
-load_module .../worker_events/ngx_http_worker_events_module.so;
-load_module .../healthcheck/ngx_http_healthcheck_module.so;
-load_module .../cache_tags/ngx_http_cache_tags_module.so;      # filter
-load_module .../cache_purge/ngx_http_cache_purge_module.so;
-load_module .../consul/ngx_http_consul_module.so;
-load_module .../upstream_balancer/ngx_http_upstream_balancer_module.so;
-load_module .../dynamic_upstreams/ngx_http_dynamic_upstreams_module.so;
+load_module /usr/lib/nginx/modules/nginz/ngx_http_worker_events_module.so;
+load_module /usr/lib/nginx/modules/nginz/ngx_http_healthcheck_module.so;
+load_module /usr/lib/nginx/modules/nginz/ngx_http_cache_tags_module.so;      # filter
+load_module /usr/lib/nginx/modules/nginz/ngx_http_cache_purge_module.so;
+load_module /usr/lib/nginx/modules/nginz/ngx_http_consul_module.so;
+load_module /usr/lib/nginx/modules/nginz/ngx_http_upstream_balancer_module.so;
+load_module /usr/lib/nginx/modules/nginz/ngx_http_dynamic_upstreams_module.so;
 # ... remaining standalone modules in any order
 ```
+
+If you are loading directly from `zig-out/dynmod/`, keep the same relative order and substitute the local file paths.
 
 ### Signature Compatibility
 
