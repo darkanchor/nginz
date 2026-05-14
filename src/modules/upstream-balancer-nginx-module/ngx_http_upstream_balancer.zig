@@ -32,14 +32,6 @@ extern var ngx_http_core_module: ngx_module_t;
 extern fn ngz_healthcheck_is_peer_eligible(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
 extern fn ngz_healthcheck_peer_state(addr_data: [*c]u8, addr_len: usize) callconv(.c) c_int;
 
-// Provided by the dynamic-upstreams module. Returns 1 if the peer has been
-// explicitly marked draining in this upstream, 0 otherwise (fail-open).
-extern fn ngz_du_is_peer_draining_in_upstream(
-    source_ctx: ?*anyopaque,
-    addr_data: [*c]u8,
-    addr_len: usize,
-) callconv(.c) c_int;
-
 extern fn ngx_http_upstream_init_round_robin(
     cf: [*c]ngx_conf_t,
     us: [*c]ngx_http_upstream_srv_conf_t,
@@ -121,9 +113,14 @@ const BalancerRequestCtx = extern struct {
     dynamic_active: core.ngx_flag_t,
 };
 
+const PeerSourceGetActivePeersFn = *const fn (?*anyopaque, [*c]ngx_http_request_t, *u64) callconv(.c) [*c]ngx_http_upstream_rr_peers_t;
+const PeerSourceReleaseGenerationFn = *const fn (?*anyopaque, [*c]ngx_http_upstream_rr_peers_t, u64) callconv(.c) void;
+const PeerSourceIsPeerDrainingFn = *const fn (?*anyopaque, [*c]u8, usize) callconv(.c) c_int;
+
 const PeerSourceVTable = extern struct {
     get_active_peers: ?*anyopaque,
     release_generation: ?*anyopaque,
+    is_peer_draining: ?*anyopaque,
 };
 
 fn configError(cf: [*c]ngx_conf_t, comptime msg: []const u8) [*c]u8 {
@@ -371,7 +368,7 @@ fn applyDynamicPeerGraph(
 fn releaseDynamicPeerGraph(ctx: *BalancerRequestCtx) void {
     if (ctx.dynamic_active == 0) return;
     if (ctx.dynamic_release_generation) |raw_release| {
-        const release_fn: *const fn (?*anyopaque, [*c]ngx_http_upstream_rr_peers_t, u64) callconv(.c) void =
+        const release_fn: PeerSourceReleaseGenerationFn =
             @ptrCast(@alignCast(raw_release));
         release_fn(ctx.dynamic_source_ctx, ctx.dynamic_peers, ctx.dynamic_generation);
     }
@@ -389,7 +386,7 @@ fn bindDynamicPeerSource(
 ) ngx_int_t {
     const vtable = bcf.peer_source_vtable orelse return core.NGX_OK;
     const raw_get = vtable.get_active_peers orelse return core.NGX_OK;
-    const get_fn: *const fn (?*anyopaque, [*c]ngx_http_request_t, *u64) callconv(.c) [*c]ngx_http_upstream_rr_peers_t =
+    const get_fn: PeerSourceGetActivePeersFn =
         @ptrCast(@alignCast(raw_get));
 
     var generation: u64 = 0;
@@ -660,8 +657,20 @@ fn is_eligible(source_ctx: ?*anyopaque, p: [*c]ngx_http_upstream_rr_peer_t) bool
         HEALTHCHECK_PEER_STATE_SLOW_START => return false,
         else => if (ngz_healthcheck_is_peer_eligible(p.*.name.data, p.*.name.len) == 0) return false,
     }
-    if (ngz_du_is_peer_draining_in_upstream(source_ctx, p.*.name.data, p.*.name.len) != 0) return false;
+    if (peerSourceIsDraining(source_ctx, null, p.*.name.data, p.*.name.len)) return false;
     return true;
+}
+
+fn peerSourceIsDraining(
+    source_ctx: ?*anyopaque,
+    vtable: ?*const PeerSourceVTable,
+    addr_data: [*c]u8,
+    addr_len: usize,
+) bool {
+    const peer_source_vtable = vtable orelse return false;
+    const raw_check = peer_source_vtable.is_peer_draining orelse return false;
+    const check_fn: PeerSourceIsPeerDrainingFn = @ptrCast(@alignCast(raw_check));
+    return check_fn(source_ctx, addr_data, addr_len) != 0;
 }
 
 fn peers_wlock(peers: [*c]ngx_http_upstream_rr_peers_t) void {
@@ -702,6 +711,7 @@ fn mark_peer_tried(rrp: [*c]ngx_http_upstream_rr_peer_data_t, index: ngx_uint_t)
 
 fn peer_available_for_sticky(
     source_ctx: ?*anyopaque,
+    peer_source_vtable: ?*const PeerSourceVTable,
     rrp: [*c]ngx_http_upstream_rr_peer_data_t,
     peer: [*c]ngx_http_upstream_rr_peer_t,
     index: ngx_uint_t,
@@ -723,7 +733,7 @@ fn peer_available_for_sticky(
         },
         else => {},
     }
-    if (ngz_du_is_peer_draining_in_upstream(source_ctx, peer.*.name.data, peer.*.name.len) != 0) {
+    if (peerSourceIsDraining(source_ctx, peer_source_vtable, peer.*.name.data, peer.*.name.len)) {
         incrementMetric(.peer_rejections_draining_total);
         return false;
     }
@@ -743,7 +753,12 @@ const StickySelection = struct {
     index: ngx_uint_t,
 };
 
-fn select_direct_peer(source_ctx: ?*anyopaque, rrp: [*c]ngx_http_upstream_rr_peer_data_t, target_name: []const u8) ?StickySelection {
+fn select_direct_peer(
+    source_ctx: ?*anyopaque,
+    peer_source_vtable: ?*const PeerSourceVTable,
+    rrp: [*c]ngx_http_upstream_rr_peer_data_t,
+    target_name: []const u8,
+) ?StickySelection {
     const now = core.ngx_time();
     var index: ngx_uint_t = 0;
     var peer = rrp.*.peers.*.peer;
@@ -751,7 +766,7 @@ fn select_direct_peer(source_ctx: ?*anyopaque, rrp: [*c]ngx_http_upstream_rr_pee
         peer = peer.*.next;
         index += 1;
     }) {
-        if (!peer_available_for_sticky(source_ctx, rrp, peer, index, now)) continue;
+        if (!peer_available_for_sticky(source_ctx, peer_source_vtable, rrp, peer, index, now)) continue;
         const name = core.slicify(u8, peer.*.name.data, peer.*.name.len);
         if (std.mem.eql(u8, name, target_name)) {
             if (now - peer.*.checked > peer.*.fail_timeout) peer.*.checked = now;
@@ -761,7 +776,12 @@ fn select_direct_peer(source_ctx: ?*anyopaque, rrp: [*c]ngx_http_upstream_rr_pee
     return null;
 }
 
-fn select_sticky_peer(source_ctx: ?*anyopaque, rrp: [*c]ngx_http_upstream_rr_peer_data_t, hash: u32) ?StickySelection {
+fn select_sticky_peer(
+    source_ctx: ?*anyopaque,
+    peer_source_vtable: ?*const PeerSourceVTable,
+    rrp: [*c]ngx_http_upstream_rr_peer_data_t,
+    hash: u32,
+) ?StickySelection {
     const peers = rrp.*.peers;
     const now = core.ngx_time();
 
@@ -772,7 +792,7 @@ fn select_sticky_peer(source_ctx: ?*anyopaque, rrp: [*c]ngx_http_upstream_rr_pee
         peer = peer.*.next;
         index += 1;
     }) {
-        if (peer_available_for_sticky(source_ctx, rrp, peer, index, now)) {
+        if (peer_available_for_sticky(source_ctx, peer_source_vtable, rrp, peer, index, now)) {
             total_weight += peer_weight(peer);
         }
     }
@@ -787,7 +807,7 @@ fn select_sticky_peer(source_ctx: ?*anyopaque, rrp: [*c]ngx_http_upstream_rr_pee
         peer = peer.*.next;
         index += 1;
     }) {
-        if (!peer_available_for_sticky(source_ctx, rrp, peer, index, now)) continue;
+        if (!peer_available_for_sticky(source_ctx, peer_source_vtable, rrp, peer, index, now)) continue;
         cumulative += peer_weight(peer);
         if (target < cumulative) {
             if (now - peer.*.checked > peer.*.fail_timeout) {
@@ -862,6 +882,7 @@ export fn upstream_balancer_get_peer(
     const key_absent = (vv == null) or vv.*.flags.not_found or (vv.*.flags.len == 0);
     const rrp = @as([*c]ngx_http_upstream_rr_peer_data_t, @ptrCast(@alignCast(ctx.original_data)));
     const source_ctx = if (ctx.dynamic_source_ctx != null) ctx.dynamic_source_ctx else bcf.*.peer_source_ctx;
+    const peer_source_vtable = bcf.*.peer_source_vtable;
 
     if (key_absent) {
         incrementMetric(.key_absent_misses);
@@ -910,10 +931,10 @@ export fn upstream_balancer_get_peer(
 
     var direct_target_missed = false;
     const maybe_chosen = if (direct_target) |target_name| blk: {
-        if (select_direct_peer(source_ctx, rrp, target_name)) |selection| break :blk selection;
+        if (select_direct_peer(source_ctx, peer_source_vtable, rrp, target_name)) |selection| break :blk selection;
         direct_target_missed = true;
-        break :blk select_sticky_peer(source_ctx, rrp, hash);
-    } else select_sticky_peer(source_ctx, rrp, hash);
+        break :blk select_sticky_peer(source_ctx, peer_source_vtable, rrp, hash);
+    } else select_sticky_peer(source_ctx, peer_source_vtable, rrp, hash);
     const chosen = maybe_chosen orelse {
         if (direct_target != null) incrementMetric(.direct_peer_misses);
         if (bcf.*.fallback_mode == FALLBACK_OFF) {
@@ -1152,6 +1173,10 @@ test "totalPeerCount includes backup peer chains" {
 
 var test_release_generation_calls: usize = 0;
 var test_release_generation_value: u64 = 0;
+var test_is_peer_draining_calls: usize = 0;
+var test_is_peer_draining_source_ctx: ?*anyopaque = null;
+var test_is_peer_draining_addr_len: usize = 0;
+var test_is_peer_draining_addr: [64]u8 = [_]u8{0} ** 64;
 
 fn testReleaseGeneration(
     source_ctx: ?*anyopaque,
@@ -1162,6 +1187,19 @@ fn testReleaseGeneration(
     _ = peers;
     test_release_generation_calls += 1;
     test_release_generation_value = generation;
+}
+
+fn testIsPeerDraining(
+    source_ctx: ?*anyopaque,
+    addr_data: [*c]u8,
+    addr_len: usize,
+) callconv(.c) c_int {
+    test_is_peer_draining_calls += 1;
+    test_is_peer_draining_source_ctx = source_ctx;
+    test_is_peer_draining_addr_len = addr_len;
+    @memset(&test_is_peer_draining_addr, 0);
+    @memcpy(test_is_peer_draining_addr[0..addr_len], core.slicify(u8, addr_data, addr_len));
+    return 1;
 }
 
 test "dynamic peer graph can be pinned and released once per request ctx" {
@@ -1195,4 +1233,37 @@ test "dynamic peer graph can be pinned and released once per request ctx" {
 
     releaseDynamicPeerGraph(&ctx);
     try std.testing.expectEqual(@as(usize, 1), test_release_generation_calls);
+}
+
+test "peer source draining helper fail-opens without callback" {
+    var addr = [_]u8{ '1', '2', '7', '.', '0', '.', '0', '.', '1', ':', '8', '0', '8', '0' };
+    try std.testing.expect(!peerSourceIsDraining(null, null, &addr, addr.len));
+
+    const vtable = PeerSourceVTable{
+        .get_active_peers = null,
+        .release_generation = null,
+        .is_peer_draining = null,
+    };
+    try std.testing.expect(!peerSourceIsDraining(null, &vtable, &addr, addr.len));
+}
+
+test "peer source draining helper delegates to callback" {
+    test_is_peer_draining_calls = 0;
+    test_is_peer_draining_source_ctx = null;
+    test_is_peer_draining_addr_len = 0;
+    @memset(&test_is_peer_draining_addr, 0);
+
+    var source_value: u8 = 7;
+    var addr = [_]u8{ '1', '0', '.', '0', '.', '0', '.', '1', ':', '9', '0', '0', '0' };
+    const vtable = PeerSourceVTable{
+        .get_active_peers = null,
+        .release_generation = null,
+        .is_peer_draining = @constCast(@ptrCast(&testIsPeerDraining)),
+    };
+
+    try std.testing.expect(peerSourceIsDraining(&source_value, &vtable, &addr, addr.len));
+    try std.testing.expectEqual(@as(usize, 1), test_is_peer_draining_calls);
+    try std.testing.expectEqual(@intFromPtr(&source_value), @intFromPtr(test_is_peer_draining_source_ctx.?));
+    try std.testing.expectEqual(addr.len, test_is_peer_draining_addr_len);
+    try std.testing.expectEqualSlices(u8, addr[0..], test_is_peer_draining_addr[0..addr.len]);
 }

@@ -44,6 +44,7 @@ extern fn upstream_balancer_ensure_hook(
 const PeerSourceVTable = extern struct {
     get_active_peers: ?*anyopaque,
     release_generation: ?*anyopaque,
+    is_peer_draining: ?*anyopaque,
 };
 
 extern fn upstream_balancer_register_peer_source(
@@ -220,6 +221,7 @@ const Snapshot = extern struct {
 const du_vtable = PeerSourceVTable{
     .get_active_peers = @constCast(@ptrCast(&du_get_active_peers)),
     .release_generation = @constCast(@ptrCast(&du_release_generation)),
+    .is_peer_draining = @constCast(@ptrCast(&ngz_du_is_peer_draining_in_upstream)),
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
