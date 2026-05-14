@@ -2,7 +2,10 @@ const std = @import("std");
 const common = @import("build_common.zig");
 
 pub const CJSON_C_FLAGS = [_][]const u8{
-    "-std=c89",
+    // cJSON needs at least C99 so modern libc math macros (notably musl, but
+    // also other strict toolchains) do not trip pedantic extension errors on
+    // perfectly valid system-header expansions.
+    "-std=c99",
     "-pedantic",
     "-Wall",
     "-Wextra",
