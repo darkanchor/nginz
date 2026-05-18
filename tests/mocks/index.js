@@ -16,6 +16,14 @@ export { ConsulMock, createConsulMock } from "./consul.js";
 export { OIDCMock, createOIDCMock } from "./oidc.js";
 export { ACMEMock, createACMEMock } from "./acme.js";
 export {
+  signWechatpayMessage,
+  buildWechatpayHeaders,
+  signedUpstreamResponse,
+  encryptWechatpayResource,
+  parseAuthorizationHeader,
+  verifyProxyAuthorization,
+} from "./wechatpay.js";
+export {
   HTTPMock,
   StaticMock,
   ProxyMock,
