@@ -31,6 +31,7 @@ const modules_files = .{
 const http_module_files = .{
     "submodules/njs/nginx/ngx_js.c",
     "submodules/njs/nginx/ngx_js_http.c",
+    "submodules/njs/nginx/ngx_js_form.c",
     "submodules/njs/nginx/ngx_js_fetch.c",
     "submodules/njs/nginx/ngx_js_regex.c",
     "submodules/njs/nginx/ngx_qjs_fetch.c",
