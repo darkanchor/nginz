@@ -237,6 +237,11 @@ describe("pgrest module", () => {
       rows: [["1", "A-", '[{"number":"917-929-5745"}]', "en"]],
     }));
 
+    pgMock.setQueryHandler(/^SELECT \* FROM jsonb_examples$/, () => ({
+      columns: ["id", { name: "tags", typeOid: 3802 }],
+      rows: [["1", '["openai","anthropic"]']],
+    }));
+
     pgMock.setQueryHandler(/SELECT id,name FROM users WHERE status = 'active' ORDER BY id DESC LIMIT 1 OFFSET 1/, () => ({
       columns: ["id", "name"],
       rows: [["1", "John Doe"]],
@@ -806,6 +811,20 @@ describe("pgrest module", () => {
       primary_language: "en",
     });
     expect(lastSql()).toBe("SELECT id,to_jsonb(json_data)->>'blood_type' AS blood_type,to_jsonb(json_data)->'phones' AS phones,to_jsonb(languages)->0 AS primary_language FROM people");
+  });
+
+  test("GET /api/jsonb_examples emits jsonb columns as native JSON values", async () => {
+    pgMock.clearTracking();
+
+    const res = await fetch(`${TEST_URL}/api/jsonb_examples`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([
+      {
+        id: "1",
+        tags: ["openai", "anthropic"],
+      },
+    ]);
+    expect(lastSql()).toBe("SELECT * FROM jsonb_examples");
   });
 
   // ============================================================================

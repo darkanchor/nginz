@@ -48,6 +48,7 @@ const PQconninfoParse = pq.PQconninfoParse;
 // Re-export raw libpq types and functions for module use
 pub const PGconn = pq.PGconn;
 pub const PGresult = pq.PGresult;
+pub const Oid = pq.Oid;
 pub const ConnStatusType = pq.ConnStatusType;
 pub const ExecStatusType = pq.ExecStatusType;
 pub const CONNECTION_OK = pq.CONNECTION_OK;
@@ -64,6 +65,7 @@ pub const pgResultStatus = pq.PQresultStatus;
 pub const pgNtuples = pq.PQntuples;
 pub const pgNfields = pq.PQnfields;
 pub const pgFname = pq.PQfname;
+pub const pgFtype = pq.PQftype;
 pub const pgGetvalue = pq.PQgetvalue;
 pub const pgGetisnull = pq.PQgetisnull;
 pub const pgGetlength = pq.PQgetlength;

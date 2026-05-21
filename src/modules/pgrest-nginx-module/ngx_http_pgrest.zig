@@ -23,6 +23,7 @@ const pgResultStatus = pq.pgResultStatus;
 const pgNtuples = pq.pgNtuples;
 const pgNfields = pq.pgNfields;
 const pgFname = pq.pgFname;
+const pgFtype = pq.pgFtype;
 const pgGetvalue = pq.pgGetvalue;
 const pgGetisnull = pq.pgGetisnull;
 const pgGetlength = pq.pgGetlength;
@@ -2023,6 +2024,14 @@ const JsonColumnMeta = struct {
 };
 
 const MIN_RESPONSE_BUFFER_SIZE: usize = 512;
+const PG_JSON_OID: pq.Oid = 114;
+const PG_JSONB_OID: pq.Oid = 3802;
+
+fn column_has_native_json_type(result: ?*PGresult, col: i32) bool {
+    if (result == null) return false;
+    const oid = pgFtype(result, col);
+    return oid == PG_JSON_OID or oid == PG_JSONB_OID;
+}
 
 fn build_json_column_meta(
     result: ?*PGresult,
@@ -2041,7 +2050,8 @@ fn build_json_column_meta(
         const name = if (fname != null) std.mem.span(fname) else "";
         metas[idx] = .{
             .name = name,
-            .emit_raw_json = column_is_raw_json(raw_json_fields, raw_json_field_lens, raw_json_field_count, name),
+            .emit_raw_json = column_has_native_json_type(result, col) or
+                column_is_raw_json(raw_json_fields, raw_json_field_lens, raw_json_field_count, name),
         };
     }
 
@@ -8441,44 +8451,59 @@ fn ngx_pgrest_conn_read_handler(ev: [*c]core.ngx_event_t) callconv(.c) void {
         trace_pool_event(ctx, pool_conn, "read-connect");
         poll_pg_connection(ctx, pool_conn);
     } else if (pool_conn.*.state == .busy and ctx.*.query_state == .waiting) {
-        // Read query result
-        if (pool_conn.*.conn != null) {
-            const conn = pool_conn.*.conn.?;
-            var drain_iters: usize = 0;
-            while (true) {
-                trace_pool_event(ctx, pool_conn, "read-consume");
-                if (pgConsumeInput(conn) == 0) {
+        process_waiting_query_read(ctx, pool_conn, ev);
+    }
+}
+
+fn process_waiting_query_read(ctx: *PgRequestCtx, pool_conn: *PgPoolConn, ev: [*c]core.ngx_event_t) void {
+    if (pool_conn.*.conn != null) {
+        const conn = pool_conn.*.conn.?;
+        var drain_iters: usize = 0;
+        while (true) {
+            trace_pool_event(ctx, pool_conn, "read-consume");
+            if (pgConsumeInput(conn) == 0) {
+                ctx.*.query_state = .failed;
+                finalize_pooled_failure(ctx);
+                return;
+            }
+
+            if (pgIsBusy(conn) == 0) {
+                ctx.*.result = pgGetResult(conn);
+                ctx.*.query_state = .done;
+                _ = set_pooled_timer_mode(ctx, pool_conn, false, false);
+                trace_pool_event(ctx, pool_conn, "result-ready");
+
+                while (pgGetResult(conn) != null) {}
+
+                finalize_pg_response(ctx);
+                return;
+            }
+
+            drain_iters += 1;
+            if (!ev.*.flags.ready or drain_iters >= PGREST_READ_DRAIN_LIMIT) {
+                if (!set_pooled_timer_mode(ctx, pool_conn, true, false)) {
                     ctx.*.query_state = .failed;
                     finalize_pooled_failure(ctx);
                     return;
                 }
-
-                if (pgIsBusy(conn) == 0) {
-                    ctx.*.result = pgGetResult(conn);
-                    ctx.*.query_state = .done;
-                    _ = set_pooled_timer_mode(ctx, pool_conn, false, false);
-                    trace_pool_event(ctx, pool_conn, "result-ready");
-
-                    while (pgGetResult(conn) != null) {}
-
-                    finalize_pg_response(ctx);
-                    return;
-                }
-
-                drain_iters += 1;
-                if (!ev.*.flags.ready or drain_iters >= PGREST_READ_DRAIN_LIMIT) {
-                    if (!set_pooled_timer_mode(ctx, pool_conn, true, false)) {
-                        ctx.*.query_state = .failed;
-                        finalize_pooled_failure(ctx);
-                        return;
-                    }
-                    log_pooled_event_watch_state(ctx, pool_conn, "read-busy");
-                    trace_pool_event(ctx, pool_conn, "read-busy");
-                    return;
-                }
+                log_pooled_event_watch_state(ctx, pool_conn, "read-busy");
+                trace_pool_event(ctx, pool_conn, "read-busy");
+                return;
             }
         }
     }
+}
+
+fn maybe_process_ready_wait_read(ctx: *PgRequestCtx, pool_conn: *PgPoolConn) void {
+    if (ctx.*.query_state != .waiting or pool_conn.*.state != .busy) return;
+    const ngx_conn = pool_conn.ngx_conn orelse return;
+    if (ngx_conn.*.read == core.nullptr(core.ngx_event_t)) return;
+
+    const rev = ngx_conn.*.read;
+    if (!rev.*.flags.ready) return;
+
+    trace_pool_event(ctx, pool_conn, "wait-read-ready");
+    process_waiting_query_read(ctx, pool_conn, rev);
 }
 
 /// Poll libpq connection during async connect
@@ -8589,7 +8614,9 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         if (ctx.*.pool_conn) |pool_conn| {
             if (!start_pooled_query(ctx, pool_conn)) {
                 finalize_pooled_failure(ctx);
+                return;
             }
+            maybe_process_ready_wait_read(ctx, pool_conn);
             return;
         }
     }
@@ -8616,7 +8643,9 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         if (ctx.*.pool_conn) |pool_conn| {
             if (!start_pooled_query(ctx, pool_conn)) {
                 finalize_pooled_failure(ctx);
+                return;
             }
+            maybe_process_ready_wait_read(ctx, pool_conn);
             return;
         }
     }
@@ -8773,7 +8802,9 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         if (ctx.*.pool_conn) |pool_conn| {
             if (!start_pooled_query(ctx, pool_conn)) {
                 finalize_pooled_failure(ctx);
+                return;
             }
+            maybe_process_ready_wait_read(ctx, pool_conn);
             return;
         }
     }
@@ -8969,7 +9000,9 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         if (ctx.*.pool_conn) |pool_conn| {
             if (!start_pooled_query(ctx, pool_conn)) {
                 finalize_pooled_failure(ctx);
+                return;
             }
+            maybe_process_ready_wait_read(ctx, pool_conn);
             return;
         }
     }

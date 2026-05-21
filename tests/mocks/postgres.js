@@ -431,8 +431,12 @@ export class PostgresMock {
   }
 
   sendQueryResult(socket, columns, rows) {
+    const normalizedColumns = columns.map((col) =>
+      typeof col === "string" ? { name: col, typeOid: 25 } : { name: col.name, typeOid: col.typeOid ?? 25 },
+    );
+
     // Send RowDescription
-    this.sendRowDescription(socket, columns);
+    this.sendRowDescription(socket, normalizedColumns);
 
     // Send DataRows
     for (const row of rows) {
@@ -447,7 +451,7 @@ export class PostgresMock {
     // Calculate total length
     let len = 4 + 2; // length + field count
     for (const col of columns) {
-      len += col.length + 1 + 18; // name + null + field info
+      len += col.name.length + 1 + 18; // name + null + field info
     }
 
     const buf = Buffer.alloc(1 + len);
@@ -460,15 +464,15 @@ export class PostgresMock {
     offset += 2;
 
     for (const col of columns) {
-      buf.write(col, offset);
-      offset += col.length;
+      buf.write(col.name, offset);
+      offset += col.name.length;
       buf[offset++] = 0; // null terminator
 
       buf.writeInt32BE(0, offset); // table OID
       offset += 4;
       buf.writeInt16BE(0, offset); // column number
       offset += 2;
-      buf.writeInt32BE(25, offset); // type OID (text)
+      buf.writeInt32BE(col.typeOid ?? 25, offset); // type OID
       offset += 4;
       buf.writeInt16BE(-1, offset); // type size
       offset += 2;
