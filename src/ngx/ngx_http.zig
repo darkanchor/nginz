@@ -290,6 +290,7 @@ test "http" {
     try expectEqual(@sizeOf(ngx_http_request_t), 1408);
     try expectEqual(@offsetOf(ngx_http_request_t, "connection"), 8);
     try expectEqual(@offsetOf(ngx_http_request_t, "cleanup"), 1192);
+    try expectEqual(@offsetOf(ngx_http_request_t, "port"), 1200);
     try expectEqual(@offsetOf(ngx_http_request_t, "flags0"), 1208);
     try expectEqual(@offsetOf(ngx_http_request_t, "flags1"), 1216);
     try expectEqual(@offsetOf(ngx_http_request_t, "state"), 1224);

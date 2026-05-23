@@ -297,10 +297,37 @@ const PgRequestCtx = extern struct {
     trace_release_calls: usize,
     trace_last_event_len: usize,
     trace_last_event: [32]u8,
-    count_held: bool, // tracks whether r->main->count was incremented in start_pooled_request
+    count_held: usize, // number of r->main->count holds added in start_pooled_request
 };
 
 var g_pgrest_trace_seq: usize = 0;
+
+// The Zig binding for ngx_http_request_t has flags0 at the wrong byte offset
+// (1208) because translate-c packed all bit fields into a single u64 with
+// 8-byte alignment.  The real nginx layout puts the `count:16` bit field at
+// offset 1202 (right after `port` at 1200).  These helpers read/write the
+// real count via raw pointer arithmetic so pgrest's hold mechanism actually
+// affects r->main->count instead of corrupting random flag bits.
+const NGX_REQUEST_COUNT_OFFSET: usize = 1202;
+
+inline fn main_count_ptr(r_main: [*c]ngx_http_request_t) *u16 {
+    const base: [*]u8 = @ptrCast(@as([*c]u8, @ptrCast(r_main)));
+    return @ptrCast(@alignCast(base + NGX_REQUEST_COUNT_OFFSET));
+}
+
+inline fn main_count_inc(r_main: [*c]ngx_http_request_t) void {
+    const p = main_count_ptr(r_main);
+    p.* +%= 1;
+}
+
+inline fn main_count_dec(r_main: [*c]ngx_http_request_t) void {
+    const p = main_count_ptr(r_main);
+    p.* -%= 1;
+}
+
+inline fn main_count_get(r_main: [*c]ngx_http_request_t) u16 {
+    return main_count_ptr(r_main).*;
+}
 
 fn trace_set_last_event(ctx: *PgRequestCtx, event_name: []const u8) void {
     const copy_len = @min(event_name.len, ctx.*.trace_last_event.len);
@@ -1562,12 +1589,15 @@ fn release_pooled_ctx(ctx: *PgRequestCtx, failed: bool) void {
                 event.ngx_event_del_timer(ngx_conn.*.write);
             }
         }
-        // Release the extra reference count that was added in start_pooled_request.
-        // Each successful connection assignment increments r->main->count to prevent
-        // the main request from being freed while the pgrest connection is active.
-        if (ctx.*.count_held and ctx.*.request != null) {
-            ctx.*.request.?.*.main.*.flags0.count -= 1;
-            ctx.*.count_held = false;
+        // Release all count holds added in start_pooled_request.
+        // Only releases when request is still set: if ctx.request was nulled before
+        // this call, the hold is intentionally kept as a guard for nginx's subrequest
+        // cleanup (r->main->count-- after the post_subrequest callback returns).
+        if (ctx.*.count_held > 0 and ctx.*.request != null) {
+            while (ctx.*.count_held > 0) {
+                main_count_dec(ctx.*.request.?.*.main);
+                ctx.*.count_held -= 1;
+            }
         }
         pool_conn.request_ctx = null;
         if (failed) {
@@ -1950,8 +1980,8 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
             ctx.*.pool_conn = null;
             return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
-        ctx.*.request.?.*.main.*.flags0.count += 1;
-        ctx.*.count_held = true;
+        main_count_inc(ctx.*.request.?.*.main);
+        ctx.*.count_held += 1;
         return core.NGX_DONE;
     }
 
@@ -2014,8 +2044,8 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         }
     }
 
-    ctx.*.request.?.*.main.*.flags0.count += 1;
-    ctx.*.count_held = true;
+    main_count_inc(ctx.*.request.?.*.main);
+    ctx.*.count_held += 1;
     trace_pool_event(ctx, pool_conn, "connect-start");
     poll_pg_connection(ctx, pool_conn);
     return core.NGX_DONE;
@@ -9093,10 +9123,14 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         },
     };
 
-    // Release the PG connection before sending the HTTP response.
-    // We've already formatted the result into the nginx buffer and no
-    // longer need the connection.  Releasing early lets another request
-    // start using the connection while we send the response body.
+    // Null ctx.request before releasing the pool connection.  This preserves the
+    // main->count hold so that nginx's subrequest cleanup (r->main->count-- after
+    // the post_subrequest callback returns) is what drives the count to zero rather
+    // than the callback itself.  Without this ordering, a NJS/SSI post_subrequest
+    // callback that calls r.return() would decrement count to zero mid-stack, and
+    // nginx's subsequent decrement would access freed memory (SIGSEGV).
+    // All error paths already null ctx.request first; this aligns the success path.
+    ctx.*.request = null;
     release_pooled_ctx(ctx, false);
 
     const rc = finalize_response_send(
@@ -9111,7 +9145,6 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         ctx.*.write_status,
         ctx.*.write_send_body,
     );
-    ctx.*.request = null;
     http.ngx_http_finalize_request(r, rc);
 }
 
