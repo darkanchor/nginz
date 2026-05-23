@@ -297,6 +297,7 @@ const PgRequestCtx = extern struct {
     trace_release_calls: usize,
     trace_last_event_len: usize,
     trace_last_event: [32]u8,
+    count_held: bool, // tracks whether r->main->count was incremented in start_pooled_request
 };
 
 var g_pgrest_trace_seq: usize = 0;
@@ -1561,6 +1562,13 @@ fn release_pooled_ctx(ctx: *PgRequestCtx, failed: bool) void {
                 event.ngx_event_del_timer(ngx_conn.*.write);
             }
         }
+        // Release the extra reference count that was added in start_pooled_request.
+        // Each successful connection assignment increments r->main->count to prevent
+        // the main request from being freed while the pgrest connection is active.
+        if (ctx.*.count_held and ctx.*.request != null) {
+            ctx.*.request.?.*.main.*.flags0.count -= 1;
+            ctx.*.count_held = false;
+        }
         pool_conn.request_ctx = null;
         if (failed) {
             pool_conn.state = .conn_error;
@@ -1943,6 +1951,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
             return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
         ctx.*.request.?.*.main.*.flags0.count += 1;
+        ctx.*.count_held = true;
         return core.NGX_DONE;
     }
 
@@ -2006,6 +2015,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
     }
 
     ctx.*.request.?.*.main.*.flags0.count += 1;
+    ctx.*.count_held = true;
     trace_pool_event(ctx, pool_conn, "connect-start");
     poll_pg_connection(ctx, pool_conn);
     return core.NGX_DONE;
@@ -8503,7 +8513,13 @@ fn maybe_process_ready_wait_read(ctx: *PgRequestCtx, pool_conn: *PgPoolConn) voi
     if (!rev.*.flags.ready) return;
 
     trace_pool_event(ctx, pool_conn, "wait-read-ready");
-    process_waiting_query_read(ctx, pool_conn, rev);
+    // Post the event to be processed at the end of the current event-loop
+    // iteration rather than calling process_waiting_query_read synchronously.
+    // Direct synchronous processing creates a nested finalize_pg_response call
+    // stack that interacts badly with NJS's synchronous ngx_http_run_posted_requests
+    // call in the post-subrequest callback, leading to use-after-free in
+    // ngx_http_set_lingering_close when the main request is freed mid-stack.
+    event.ngz_post_event(rev);
 }
 
 /// Poll libpq connection during async connect

@@ -4,6 +4,7 @@ const core = @import("ngx_core.zig");
 const http = @import("ngx_http.zig");
 const module = @import("ngx_module.zig");
 const rbtree = @import("ngx_rbtree.zig");
+const ngx_queue = @import("ngx_queue.zig");
 const expectEqual = std.testing.expectEqual;
 
 const ngx_int_t = core.ngx_int_t;
@@ -12,6 +13,7 @@ const ngx_http_request_t = http.ngx_http_request_t;
 
 extern var ngx_event_timer_rbtree: rbtree.ngx_rbtree_t;
 extern var ngx_current_msec: ngx_msec_t;
+extern var ngx_posted_events: ngx_queue.ngx_queue_t;
 
 pub const ngx_event_t = core.ngx_event_t;
 pub const ngx_event_handler_pt = ngx.ngx_event_handler_pt;
@@ -36,6 +38,16 @@ pub inline fn ngx_event_add_timer(ev: [*c]ngx_event_t, timer: ngx_msec_t) void {
     ev.*.timer.key = key;
     ev.*.flags.timer_set = true;
     rbtree.ngx_rbtree_insert(&ngx_event_timer_rbtree, &ev.*.timer);
+}
+
+/// Post an event to be processed at the end of the current event loop iteration.
+/// Implements the ngx_post_event(ev, &ngx_posted_events) macro for deferring
+/// event handlers out of deeply nested call stacks.
+pub inline fn ngz_post_event(ev: [*c]ngx_event_t) void {
+    if (!ev.*.flags.posted) {
+        ev.*.flags.posted = true;
+        ngx_queue.ngx_queue_insert_tail(&ngx_posted_events, &ev.*.queue);
+    }
 }
 
 pub const NTimer = struct {

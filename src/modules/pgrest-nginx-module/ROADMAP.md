@@ -895,9 +895,6 @@ Progress note:
 - 📊 **pgrest vs PostgREST full comparison (medium-page)**: c=1: **2.06x** (374 vs 182 rps), c=8: **1.46x** (932 vs 640 rps), c=16: **1.14x** (905 vs 794 rps). pgrest wins at every concurrency but the ratio compresses as CPU saturates.
 - 📁 PostgREST c=16 artifact: `perf/pgrest/benchmark/output/2026-04-27T14-00-52.603Z-pgrest-releasesmall/`
 - ℹ️ Net effect is positive (+204 rps at c=16 vs -58 rps at c=8); kept because production deployments typically run with fewer connections than peak concurrency.
-- ✅ **perf-stat hardware-counter validation**: Linux `perf stat` confirms **zero context switches and zero CPU migrations** at both c=1 and c=8 — the non-blocking pooled path never deschedules the worker. IPC improves under load (1.11→1.48), branch miss rate stays excellent (1.6–2.4%), cache miss rate drops at load (12.6%→8.1%). At c=8 each request executes 3.15x more instructions (4.38M vs 1.39M), confirming pool contention overhead. CPU saturates at 77% for c=8 on single core — throughput is CPU-bound, not I/O-bound.
-- 📁 Notes: `perf/pgrest/notes/2026-04-27-p3-perf-stat-validation.md`
-- 📁 Docs: `perf/pgrest/README.md` now documents `--profile=perf-stat` mode with counter interpretation guide.
 
 ### Perf Batch P4: Structural large-response improvements
 
