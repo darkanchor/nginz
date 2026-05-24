@@ -567,4 +567,3 @@ fn parseBitfieldLine(line: []const u8) ?ParsedBitfield {
         .offset = offset,
     };
 }
-// dummy

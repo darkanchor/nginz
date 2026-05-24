@@ -312,33 +312,6 @@ const PgRequestCtx = extern struct {
 
 var g_pgrest_trace_seq: usize = 0;
 
-// The Zig binding for ngx_http_request_t has flags0 at the wrong byte offset
-// (1208) because translate-c packed all bit fields into a single u64 with
-// 8-byte alignment.  The real nginx layout puts the `count:16` bit field at
-// offset 1202 (right after `port` at 1200).  These helpers read/write the
-// real count via raw pointer arithmetic so pgrest's hold mechanism actually
-// affects r->main->count instead of corrupting random flag bits.
-const NGX_REQUEST_COUNT_OFFSET: usize = 1202;
-
-inline fn main_count_ptr(r_main: [*c]ngx_http_request_t) *u16 {
-    const base: [*]u8 = @ptrCast(@as([*c]u8, @ptrCast(r_main)));
-    return @ptrCast(@alignCast(base + NGX_REQUEST_COUNT_OFFSET));
-}
-
-inline fn main_count_inc(r_main: [*c]ngx_http_request_t) void {
-    const p = main_count_ptr(r_main);
-    p.* +%= 1;
-}
-
-inline fn main_count_dec(r_main: [*c]ngx_http_request_t) void {
-    const p = main_count_ptr(r_main);
-    p.* -%= 1;
-}
-
-inline fn main_count_get(r_main: [*c]ngx_http_request_t) u16 {
-    return main_count_ptr(r_main).*;
-}
-
 fn trace_set_last_event(ctx: *PgRequestCtx, event_name: []const u8) void {
     const copy_len = @min(event_name.len, ctx.*.trace_last_event.len);
     @memcpy(ctx.*.trace_last_event[0..copy_len], event_name[0..copy_len]);
@@ -1612,7 +1585,7 @@ fn release_pooled_ctx(ctx: *PgRequestCtx, failed: bool) void {
         if (ctx.*.count_held > 0 and ctx.*.hold_main != core.nullptr(ngx_http_request_t)) {
             const leak: usize = if (ctx.*.hold_is_subrequest) 1 else 0;
             while (ctx.*.count_held > leak) {
-                main_count_dec(ctx.*.hold_main);
+                ctx.*.hold_main.*.flags0.count -%= 1;
                 ctx.*.count_held -= 1;
             }
             if (!ctx.*.hold_is_subrequest) {
@@ -2003,7 +1976,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         const r = ctx.*.request.?;
         ctx.*.hold_main = r.*.main;
         ctx.*.hold_is_subrequest = (r != r.*.main);
-        main_count_inc(r.*.main);
+        r.*.main.*.flags0.count +%= 1;
         ctx.*.count_held += 1;
         return core.NGX_DONE;
     }
@@ -2071,7 +2044,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         const r = ctx.*.request.?;
         ctx.*.hold_main = r.*.main;
         ctx.*.hold_is_subrequest = (r != r.*.main);
-        main_count_inc(r.*.main);
+        r.*.main.*.flags0.count +%= 1;
         ctx.*.count_held += 1;
     }
     trace_pool_event(ctx, pool_conn, "connect-start");
