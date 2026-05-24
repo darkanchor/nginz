@@ -116,10 +116,12 @@ Access nginx APIs through the ngx namespace:
 - Each module requires its own `README.md` documenting status, features, directives, usage examples, limitations, and future enhancements (see `prometheus-nginx-module/README.md` for reference)
 - Perf notes under `perf/` must do more than record raw numbers. They should assist later perf studies by identifying the likely hot path, separating steady-state cost from control-plane or mutation-heavy cost, calling out the most credible bottlenecks, and using available counters such as instructions, IPC, branch misses, and cache misses when artifacts support those claims.
 - Avoid using `buf` as a local variable name in module code — `const buf = ngx.buf;` is a top-level module alias in most modules, and a local `var buf` will shadow it and cause a compilation error
+- The nginx main request count can be real tricky, especially in the subrequest situations. When in double, always add logs to assert, do experiments, never take things for granted or blunt guess
 
 ### Testing
 
 Integration tests use Bun and run against a live nginx instance:
+If used wrong, bun test could introduce false positives by itself, use curl to double confirm
 ```bash
 bun test tests/jsonschema/
 ```
