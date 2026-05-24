@@ -1468,7 +1468,17 @@ fn finalize_response_send(
 
     const b = response_buf orelse return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
     b.*.last = b.*.pos + response_len;
-    b.*.flags.last_buf = true;
+    // For subrequests (SSI include, mirror), do NOT set last_buf on the
+    // response body.  The body travels via ngx_http_postpone_filter →
+    // ngx_http_next_body_filter(r->main, in) → chunked filter.  If last_buf
+    // were true the chunked filter would emit a terminal 0\r\n\r\n here.
+    // But the SSI framework also queues a sync buf with last_buf=true in
+    // r->main->postponed which will fire a second terminal later — resulting
+    // in two 0\r\n\r\n on the wire and Malformed_HTTP_Response on keepalive
+    // reuse (the client reads the extra 0\r\n\r\n as the start of the next
+    // response).  Clearing last_buf for subrequests delegates the sole
+    // terminal to the SSI sync buf path.
+    b.*.flags.last_buf = (r == r.*.main);
     b.*.flags.last_in_chain = true;
 
     var out: ngx_chain_t = std.mem.zeroes(ngx_chain_t);
