@@ -291,8 +291,8 @@ test "http" {
     try expectEqual(@offsetOf(ngx_http_request_t, "connection"), 8);
     try expectEqual(@offsetOf(ngx_http_request_t, "cleanup"), 1192);
     try expectEqual(@offsetOf(ngx_http_request_t, "port"), 1200);
-    try expectEqual(@offsetOf(ngx_http_request_t, "flags0"), 1208);
-    try expectEqual(@offsetOf(ngx_http_request_t, "flags1"), 1216);
+    try expectEqual(@offsetOf(ngx_http_request_t, "flags0"), 1202);
+    try expectEqual(@offsetOf(ngx_http_request_t, "flags1"), 1210);
     try expectEqual(@offsetOf(ngx_http_request_t, "state"), 1224);
     try expectEqual(@offsetOf(ngx_http_request_t, "host_end"), 1392);
     try expectEqual(@offsetOf(ngx_http_request_t, "flags2"), 1400);

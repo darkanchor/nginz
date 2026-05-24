@@ -783,7 +783,6 @@ fn create_upstream(
             rctx.*.res = chain;
             rctx.*.res.*.next = core.nullptr(ngx_chain_t);
             r.*.upstream.*.input_filter_ctx = r;
-            r.*.main.*.flags0.count += 1;
             http.ngx_http_upstream_init(r);
             return core.NGX_DONE;
         }
@@ -826,6 +825,7 @@ export fn ngx_http_wechatpay_proxy_handler(
         if (rctx.*.lccf == core.nullptr(wechatpay_loc_conf)) {
             rctx.*.lccf = lccf;
         }
+        r.*.flags1.discard_body = false;
         const rc = http.ngx_http_read_client_request_body(r, ngx_http_wechatpay_proxy_body_handler);
         return if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) rc else core.NGX_DONE;
     }
@@ -969,6 +969,7 @@ export fn ngx_http_wechatpay_access_handler(
             rctx.*.lccf = lccf;
             rctx.*.done_access = 0;
         }
+        r.*.flags1.discard_body = false;
         const rc = http.ngx_http_read_client_request_body(r, ngx_http_wechatpay_access_body_handler);
         if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) {
             return rc;

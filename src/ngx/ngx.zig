@@ -437,7 +437,7 @@ pub const struct_ngx_ssl_connection_s = extern struct {
     saved_write_handler: ngx_event_handler_pt = @import("std").mem.zeroes(ngx_event_handler_pt),
     ocsp: ?*ngx_ssl_ocsp_t = @import("std").mem.zeroes(?*ngx_ssl_ocsp_t),
     early_buf: u_char = @import("std").mem.zeroes(u_char),
-    flags: struct_ngx_ssl_connection_flags_s = @import("std").mem.zeroes(struct_ngx_ssl_connection_flags_s),
+    flags: struct_ngx_ssl_connection_flags_s align(1) = @import("std").mem.zeroes(struct_ngx_ssl_connection_flags_s),
 };
 pub const ngx_ssl_connection_t = struct_ngx_ssl_connection_s;
 pub const struct_ngx_udp_connection_s = extern struct {
@@ -935,7 +935,7 @@ pub const ngx_slab_pool_t = extern struct {
     mutex: ngx_shmtx_t = @import("std").mem.zeroes(ngx_shmtx_t),
     log_ctx: [*c]u_char = @import("std").mem.zeroes([*c]u_char),
     zero: u_char = @import("std").mem.zeroes(u_char),
-    flags: ngx_slab_pool_flags_t = @import("std").mem.zeroes(ngx_slab_pool_flags_t),
+    flags: ngx_slab_pool_flags_t align(1) = @import("std").mem.zeroes(ngx_slab_pool_flags_t),
     data: ?*anyopaque = @import("std").mem.zeroes(?*anyopaque),
     addr: ?*anyopaque = @import("std").mem.zeroes(?*anyopaque),
 };
@@ -1785,6 +1785,9 @@ pub const struct_ngx_http_cleanup_s = extern struct {
 };
 pub const ngx_http_cleanup_t = struct_ngx_http_cleanup_s;
 
+// flags0: C uses two 32-bit unsigned storage units at offsets 1202 and 1206,
+// packed immediately after port (in_port_t, 2B).  Recipe B (align override)
+// keeps the original packed struct(u64) so all internal bit offsets match C.
 const struct_ngx_http_request_flag0_s = packed struct(u64) {
     count: u16,
     subrequests: u8,
@@ -1814,6 +1817,8 @@ const struct_ngx_http_request_flag0_s = packed struct(u64) {
     gzip_tested: bool,
     gzip_ok: bool,
 };
+// flags1: C uses two 32-bit unsigned storage units at offsets 1210 and 1214.
+// Recipe B (align override) keeps the original packed struct(u64).
 const struct_ngx_http_request_flag1_s = packed struct(u64) {
     gzip_vary: bool,
     realloc_captures: bool,
@@ -1861,6 +1866,7 @@ const struct_ngx_http_request_flag1_s = packed struct(u64) {
     health_check: bool,
     padding: u14,
 };
+// flags2: already u32-backed and correctly aligned after host_end pointer.
 const struct_ngx_http_request_flag2_s = packed struct(u32) {
     http_minor: u16,
     http_major: u16,
@@ -1919,8 +1925,8 @@ pub const struct_ngx_http_request_s = extern struct {
     log_handler: ngx_http_log_handler_pt = @import("std").mem.zeroes(ngx_http_log_handler_pt),
     cleanup: [*c]ngx_http_cleanup_t = @import("std").mem.zeroes([*c]ngx_http_cleanup_t),
     port: in_port_t = @import("std").mem.zeroes(in_port_t),
-    flags0: struct_ngx_http_request_flag0_s = @import("std").mem.zeroes(struct_ngx_http_request_flag0_s),
-    flags1: struct_ngx_http_request_flag1_s = @import("std").mem.zeroes(struct_ngx_http_request_flag1_s),
+    flags0: struct_ngx_http_request_flag0_s align(2) = @import("std").mem.zeroes(struct_ngx_http_request_flag0_s),
+    flags1: struct_ngx_http_request_flag1_s align(2) = @import("std").mem.zeroes(struct_ngx_http_request_flag1_s),
     state: ngx_uint_t = @import("std").mem.zeroes(ngx_uint_t),
     header_hash: ngx_uint_t = @import("std").mem.zeroes(ngx_uint_t),
     lowcase_index: ngx_uint_t = @import("std").mem.zeroes(ngx_uint_t),

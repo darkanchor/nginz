@@ -220,6 +220,8 @@ int main(void) {
     PRINT_OFFSETOF(ngx_http_request_t, headers_in);
     PRINT_OFFSETOF(ngx_http_request_t, headers_out);
     PRINT_OFFSETOF(ngx_http_request_t, cleanup);
+    PRINT_OFFSETOF(ngx_http_request_t, main);
+    PRINT_OFFSETOF(ngx_http_request_t, parent);
     PRINT_OFFSETOF(ngx_http_request_t, state);
 
     /* === Bitfield byte-offset probes === *
@@ -250,6 +252,14 @@ int main(void) {
     PRINT_BITFIELD_OFFSET(ngx_http_core_loc_conf_t, lmt_excpt);
     PRINT_BITFIELD_OFFSET(ngx_http_listen_opt_t, set);
     PRINT_BITFIELD_OFFSET(ngx_http_core_srv_conf_t, listen);
+    PRINT_BITFIELD_OFFSET(ngx_ssl_connection_t, handshaked);
+    PRINT_BITFIELD_OFFSET(ngx_slab_pool_t, log_nomem);
+    PRINT_BITFIELD_OFFSET(ngx_http_file_cache_node_t, count);
+
+    /* Deep probe: verify internal storage unit boundaries */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, aio);
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, allow_ranges);
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, http_major);
 
     /* === Key offsets: ngx_http_upstream_t === */
     PRINT_OFFSETOF(ngx_http_upstream_t, conf);

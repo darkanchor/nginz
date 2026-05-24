@@ -1878,7 +1878,6 @@ fn create_token_upstream(r: [*c]ngx_http_request_t, rctx: [*c]oidc_request_ctx) 
     rctx.*.token_response.*.next = core.nullptr(ngx_chain_t);
     r.*.upstream.*.input_filter_ctx = r;
 
-    r.*.main.*.flags0.count += 1;
     http.ngx_http_upstream_init(r);
 
     return NGX_DONE;

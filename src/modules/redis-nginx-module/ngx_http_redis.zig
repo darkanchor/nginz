@@ -1114,7 +1114,6 @@ fn create_upstream(
         if (core.ngz_pcalloc_c(ngx_chain_t, r.*.pool)) |chain| {
             rctx.*.res = chain;
             rctx.*.res.*.next = core.nullptr(ngx_chain_t);
-            r.*.main.*.flags0.count += 1;
             http.ngx_http_upstream_init(r);
             return core.NGX_DONE;
         }

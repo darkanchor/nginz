@@ -2977,7 +2977,6 @@ fn create_acme_upstream(r: [*c]ngx_http_request_t, rctx: *acme_request_context) 
     rctx.res.*.next = core.nullptr(ngx_chain_t);
     r.*.upstream.*.input_filter_ctx = r;
 
-    r.*.main.*.flags0.count += 1;
     http.ngx_http_upstream_init(r);
 
     return core.NGX_DONE;

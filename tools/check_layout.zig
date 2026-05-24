@@ -214,6 +214,8 @@ const offsetof_table = [_]OffsetEntry{
     .{ .name = "ngx_http_request_t", .field = "headers_in", .zig_offset = @offsetOf(http.ngx_http_request_t, "headers_in") },
     .{ .name = "ngx_http_request_t", .field = "headers_out", .zig_offset = @offsetOf(http.ngx_http_request_t, "headers_out") },
     .{ .name = "ngx_http_request_t", .field = "cleanup", .zig_offset = @offsetOf(http.ngx_http_request_t, "cleanup") },
+    .{ .name = "ngx_http_request_t", .field = "main", .zig_offset = @offsetOf(http.ngx_http_request_t, "main") },
+    .{ .name = "ngx_http_request_t", .field = "parent", .zig_offset = @offsetOf(http.ngx_http_request_t, "parent") },
     .{ .name = "ngx_http_request_t", .field = "state", .zig_offset = @offsetOf(http.ngx_http_request_t, "state") },
 
     // ngx_http_upstream_t
@@ -274,19 +276,38 @@ const bitfield_table = [_]BitfieldEntry{
         .name = "ngx_http_request_t",
         .field = "count",
         .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "count"),
-        .note = "flags0 run; pgrest's NGX_REQUEST_COUNT_OFFSET workaround targets this byte",
+        .note = "flags0 run",
     },
     .{
         .name = "ngx_http_request_t",
         .field = "gzip_vary",
         .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "gzip_vary"),
-        .note = "flags1 run; cascades from any flags0 misalignment",
+        .note = "flags1 run",
     },
     .{
         .name = "ngx_http_request_t",
         .field = "http_minor",
         .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags2", "http_minor"),
         .note = "flags2 run; preceded by host_end pointer",
+    },
+    // Deep probes: verify internal storage unit boundaries
+    .{
+        .name = "ngx_http_request_t",
+        .field = "aio",
+        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "aio"),
+        .note = "second storage unit inside flags0",
+    },
+    .{
+        .name = "ngx_http_request_t",
+        .field = "allow_ranges",
+        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "allow_ranges"),
+        .note = "second storage unit inside flags1",
+    },
+    .{
+        .name = "ngx_http_request_t",
+        .field = "http_major",
+        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags2", "http_major"),
+        .note = "second field inside flags2",
     },
 
     .{
@@ -366,6 +387,27 @@ const bitfield_table = [_]BitfieldEntry{
         .field = "listen",
         .zig_offset = flag_byte_offset(http.ngx_http_core_srv_conf_t, "flags", "listen"),
         .note = "preceded by underscores_in_headers: ngx_flag_t",
+    },
+
+    // Boundary-risk entries: packed struct(u32/u64) after sub-aligned preceding field.
+    // See BITFIELDS.md audit table entries #5, #13, #47.
+    .{
+        .name = "ngx_ssl_connection_t",
+        .field = "handshaked",
+        .zig_offset = flag_byte_offset(http.ngx_ssl_connection_t, "flags", "handshaked"),
+        .note = "packed struct(u32) after u_char early_buf; Zig inserts 3B padding",
+    },
+    .{
+        .name = "ngx_slab_pool_t",
+        .field = "log_nomem",
+        .zig_offset = flag_byte_offset(core.ngx_slab_pool_t, "flags", "log_nomem"),
+        .note = "packed struct(u32) after u_char zero; Zig inserts 3B padding",
+    },
+    .{
+        .name = "ngx_http_file_cache_node_t",
+        .field = "count",
+        .zig_offset = flag_byte_offset(http.ngx_http_file_cache_node_t, "flags", "count"),
+        .note = "packed struct(u64) after [8]u_char key; Zig inserts up to 7B padding",
     },
 };
 
@@ -525,3 +567,4 @@ fn parseBitfieldLine(line: []const u8) ?ParsedBitfield {
         .offset = offset,
     };
 }
+// dummy
