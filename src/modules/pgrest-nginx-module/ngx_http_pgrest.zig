@@ -8176,7 +8176,11 @@ fn handle_rpc_call_upstream(
 
 /// Non-blocking content handler that uses upstream mechanism with connection pooling
 fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
-    if (r.*.request_body == null) {
+    // Only read the client body for main requests. For subrequests (SSI
+    // include, mirror) nginx short-circuits ngx_http_read_client_request_body
+    // without populating r->request_body, so the gate below would loop
+    // forever on r->request_body == null.
+    if (r == r.*.main and r.*.request_body == null) {
         const rc = http.ngx_http_read_client_request_body(r, ngx_http_pgrest_upstream_client_body_handler);
         if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) {
             return rc;

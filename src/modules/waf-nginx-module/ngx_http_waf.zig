@@ -2436,7 +2436,9 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
         {
             rctx.*.waiting_body = 1;
             const rc = http.ngx_http_read_client_request_body(r, ngx_http_waf_body_handler);
-            return if (rc == NGX_AGAIN) NGX_DONE else rc;
+            if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) return rc;
+            http.ngx_http_finalize_request(r, NGX_DONE);
+            return NGX_DONE;
         }
     }
 
