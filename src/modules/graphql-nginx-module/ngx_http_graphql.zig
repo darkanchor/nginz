@@ -219,7 +219,7 @@ export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     if (r.*.request_body == null or r.*.request_body.*.bufs == null) {
         // No body - reject
         _ = sendGraphQLError(r, "Missing request body");
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
@@ -235,7 +235,7 @@ export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) 
 
     if (body_len == 0) {
         _ = sendGraphQLError(r, "Empty request body");
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
@@ -269,7 +269,7 @@ export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     var cj = CJSON.init(r.*.pool);
     const json_root = cj.decode(body) catch {
         _ = sendGraphQLError(r, "Invalid JSON body");
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     };
 
@@ -277,19 +277,19 @@ export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     const query_node = cjson.cJSON_GetObjectItem(json_root, "query");
     if (query_node == core.nullptr(cjson.cJSON)) {
         _ = sendGraphQLError(r, "Missing query field");
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
     const query_str = CJSON.stringValue(query_node) orelse {
         _ = sendGraphQLError(r, "Query field must be a string");
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     };
 
     if (query_str.len == 0) {
         _ = sendGraphQLError(r, "Query cannot be empty");
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
@@ -300,7 +300,7 @@ export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) 
 
     if (!parse_result.is_valid) {
         _ = sendGraphQLError(r, parse_result.error_message);
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
@@ -315,14 +315,14 @@ export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) 
         }) catch "Query depth exceeds limit";
 
         _ = sendGraphQLError(r, msg);
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
     // Check introspection
     if (parse_result.has_introspection and lccf.*.allow_introspection != 1) {
         _ = sendGraphQLError(r, "Introspection queries are disabled");
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
@@ -362,9 +362,10 @@ export fn ngx_http_graphql_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_i
     rctx.*.waiting_body = 1;
     rctx.*.lccf = lccf;
 
-    // Read request body
     const rc = http.ngx_http_read_client_request_body(r, ngx_http_graphql_body_handler);
-    return if (rc == NGX_AGAIN) NGX_DONE else rc;
+    if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) return rc;
+    http.ngx_http_finalize_request(r, NGX_DONE);
+    return NGX_DONE;
 }
 
 fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
