@@ -298,6 +298,16 @@ const PgRequestCtx = extern struct {
     trace_last_event_len: usize,
     trace_last_event: [32]u8,
     count_held: usize, // number of r->main->count holds added in start_pooled_request
+    // hold_main stays valid after ctx.request is nulled so release_pooled_ctx
+    // can still decrement r->main->count.  hold_is_subrequest records whether
+    // the hold was taken on a subrequest: if so, the final hold is "transferred"
+    // to nginx's subrequest cleanup (r->main->count-- after the post_subrequest
+    // callback returns) and must NOT be decremented here, otherwise an NJS/SSI
+    // callback that drives count to zero would let nginx's subsequent decrement
+    // touch freed memory.  For direct main requests there is no such follow-up
+    // decrement and the hold MUST be released here or the request hangs.
+    hold_main: [*c]ngx_http_request_t,
+    hold_is_subrequest: bool,
 };
 
 var g_pgrest_trace_seq: usize = 0;
@@ -1589,14 +1599,24 @@ fn release_pooled_ctx(ctx: *PgRequestCtx, failed: bool) void {
                 event.ngx_event_del_timer(ngx_conn.*.write);
             }
         }
-        // Release all count holds added in start_pooled_request.
-        // Only releases when request is still set: if ctx.request was nulled before
-        // this call, the hold is intentionally kept as a guard for nginx's subrequest
-        // cleanup (r->main->count-- after the post_subrequest callback returns).
-        if (ctx.*.count_held > 0 and ctx.*.request != null) {
-            while (ctx.*.count_held > 0) {
-                main_count_dec(ctx.*.request.?.*.main);
+        // Release the count holds taken in start_pooled_request.  We use the
+        // stashed hold_main (set when the hold was taken) instead of ctx.request,
+        // because callers null ctx.request before reaching here.
+        //
+        // For subrequest holds, keep one hold so nginx's subrequest cleanup
+        // (r->main->count-- after the post_subrequest callback) can balance it
+        // — this preserves the 96632c3 guard against an NJS r.return() driving
+        // count to zero mid-stack and freeing main before nginx's decrement.
+        // For direct main-request holds there is no follow-up nginx decrement,
+        // so all holds must be released here or the request hangs at count > 0.
+        if (ctx.*.count_held > 0 and ctx.*.hold_main != core.nullptr(ngx_http_request_t)) {
+            const leak: usize = if (ctx.*.hold_is_subrequest) 1 else 0;
+            while (ctx.*.count_held > leak) {
+                main_count_dec(ctx.*.hold_main);
                 ctx.*.count_held -= 1;
+            }
+            if (!ctx.*.hold_is_subrequest) {
+                ctx.*.hold_main = core.nullptr(ngx_http_request_t);
             }
         }
         pool_conn.request_ctx = null;
@@ -1980,7 +2000,10 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
             ctx.*.pool_conn = null;
             return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
-        main_count_inc(ctx.*.request.?.*.main);
+        const r = ctx.*.request.?;
+        ctx.*.hold_main = r.*.main;
+        ctx.*.hold_is_subrequest = (r != r.*.main);
+        main_count_inc(r.*.main);
         ctx.*.count_held += 1;
         return core.NGX_DONE;
     }
@@ -2044,8 +2067,13 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         }
     }
 
-    main_count_inc(ctx.*.request.?.*.main);
-    ctx.*.count_held += 1;
+    {
+        const r = ctx.*.request.?;
+        ctx.*.hold_main = r.*.main;
+        ctx.*.hold_is_subrequest = (r != r.*.main);
+        main_count_inc(r.*.main);
+        ctx.*.count_held += 1;
+    }
     trace_pool_event(ctx, pool_conn, "connect-start");
     poll_pg_connection(ctx, pool_conn);
     return core.NGX_DONE;

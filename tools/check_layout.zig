@@ -18,6 +18,32 @@ const vx = ngx.vx;
 
 const SizeEntry = struct { name: []const u8, zig_size: usize };
 const OffsetEntry = struct { name: []const u8, field: []const u8, zig_offset: usize };
+// BitfieldEntry: the C side cannot use offsetof() on a bitfield (UB), so it
+// measures the byte offset at runtime via memset+scan and prints lines of the
+// form `bitfield <struct> <field> <C_offset>`.  The Zig side derives the
+// expected offset from the binding itself via `flag_byte_offset(Parent,
+// "<packed_field>", "<sub_field>")`, so the check fails whenever translate-c
+// produces a `packed struct(uN)` whose alignment shifts the first bitfield
+// away from where C placed it.
+const BitfieldEntry = struct {
+    name: []const u8,
+    field: []const u8,
+    zig_offset: usize,
+    note: []const u8,
+};
+
+/// Compute the byte offset of `sub` (first bitfield in a packed struct) as
+/// seen by the Zig binding.  Resolves the packed-struct type through the
+/// parent's field so we never have to make the (translate-c, private) flag
+/// types public just to reference them here.
+inline fn flag_byte_offset(
+    comptime Parent: type,
+    comptime flag_field: []const u8,
+    comptime sub: []const u8,
+) usize {
+    const FlagType = @TypeOf(@field(@as(Parent, undefined), flag_field));
+    return @offsetOf(Parent, flag_field) + @bitOffsetOf(FlagType, sub) / 8;
+}
 
 const sizeof_table = [_]SizeEntry{
     // Core structs
@@ -236,6 +262,113 @@ const offsetof_table = [_]OffsetEntry{
     .{ .name = "ngx_stream_upstream_t", .field = "resolved", .zig_offset = @offsetOf(vx.ngx_stream_upstream_t, "resolved") },
 };
 
+// Bitfield byte-offset checks.  One entry per "first bitfield" in a
+// contiguous run of `unsigned x:N` fields.  The C side measures the real
+// byte offset at runtime; the Zig side derives it from the binding through
+// flag_byte_offset(), so a mismatch means translate-c produced a packed
+// struct whose alignment shifts the field away from the C position.
+// See BITFIELDS.md for the full audit and the fix recipes.
+const bitfield_table = [_]BitfieldEntry{
+    // ngx_http_request_t has three bitfield runs (flags0/flags1/flags2).
+    .{
+        .name = "ngx_http_request_t",
+        .field = "count",
+        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "count"),
+        .note = "flags0 run; pgrest's NGX_REQUEST_COUNT_OFFSET workaround targets this byte",
+    },
+    .{
+        .name = "ngx_http_request_t",
+        .field = "gzip_vary",
+        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "gzip_vary"),
+        .note = "flags1 run; cascades from any flags0 misalignment",
+    },
+    .{
+        .name = "ngx_http_request_t",
+        .field = "http_minor",
+        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags2", "http_minor"),
+        .note = "flags2 run; preceded by host_end pointer",
+    },
+
+    .{
+        .name = "ngx_http_addr_conf_t",
+        .field = "ssl",
+        .zig_offset = flag_byte_offset(http.ngx_http_addr_conf_t, "flags", "ssl"),
+        .note = "preceded by virtual_names pointer",
+    },
+    .{
+        .name = "ngx_connection_t",
+        .field = "buffered",
+        .zig_offset = flag_byte_offset(core.ngx_connection_t, "flags", "buffered"),
+        .note = "preceded by requests: ngx_uint_t",
+    },
+    .{
+        .name = "ngx_listening_t",
+        .field = "open",
+        .zig_offset = flag_byte_offset(core.ngx_listening_t, "flags", "open"),
+        .note = "preceded by worker: ngx_uint_t",
+    },
+    .{
+        .name = "ngx_buf_t",
+        .field = "temporary",
+        .zig_offset = flag_byte_offset(buf.ngx_buf_t, "flags", "temporary"),
+        .note = "preceded by shadow pointer",
+    },
+    .{
+        .name = "ngx_event_t",
+        .field = "write",
+        .zig_offset = flag_byte_offset(core.ngx_event_t, "flags", "write"),
+        .note = "preceded by data pointer",
+    },
+    .{
+        .name = "ngx_http_upstream_t",
+        .field = "store",
+        .zig_offset = flag_byte_offset(http.ngx_http_upstream_t, "flags", "store"),
+        .note = "preceded by cleanup pointer",
+    },
+    .{
+        .name = "ngx_resolver_ctx_t",
+        .field = "async",
+        .zig_offset = flag_byte_offset(core.ngx_resolver_ctx_t, "flags", "async"),
+        .note = "preceded by timeout: ngx_msec_t",
+    },
+    .{
+        .name = "ngx_http_upstream_conf_t",
+        .field = "store",
+        .zig_offset = flag_byte_offset(http.ngx_http_upstream_conf_t, "flags", "store"),
+        .note = "preceded by store_values pointer",
+    },
+    .{
+        .name = "ngx_http_upstream_headers_in_t",
+        .field = "connection_close",
+        .zig_offset = flag_byte_offset(http.ngx_http_upstream_headers_in_t, "flags", "connection_close"),
+        .note = "preceded by last_modified_time",
+    },
+    .{
+        .name = "ngx_http_request_body_t",
+        .field = "filter_need_buffering",
+        .zig_offset = flag_byte_offset(http.ngx_http_request_body_t, "flags", "filter_need_buffering"),
+        .note = "preceded by post_handler pointer",
+    },
+    .{
+        .name = "ngx_http_core_loc_conf_t",
+        .field = "lmt_excpt",
+        .zig_offset = flag_byte_offset(http.ngx_http_core_loc_conf_t, "flags", "lmt_excpt"),
+        .note = "preceded by regex pointer",
+    },
+    .{
+        .name = "ngx_http_listen_opt_t",
+        .field = "set",
+        .zig_offset = flag_byte_offset(http.ngx_http_listen_opt_t, "flags", "set"),
+        .note = "preceded by addr_text: ngx_str_t",
+    },
+    .{
+        .name = "ngx_http_core_srv_conf_t",
+        .field = "listen",
+        .zig_offset = flag_byte_offset(http.ngx_http_core_srv_conf_t, "flags", "listen"),
+        .note = "preceded by underscores_in_headers: ngx_flag_t",
+    },
+};
+
 fn lookupZigSize(name: []const u8) ?usize {
     for (sizeof_table) |entry| {
         if (std.mem.eql(u8, entry.name, name)) return entry.zig_size;
@@ -247,6 +380,15 @@ fn lookupZigOffset(struct_name: []const u8, field_name: []const u8) ?usize {
     for (offsetof_table) |entry| {
         if (std.mem.eql(u8, entry.name, struct_name) and std.mem.eql(u8, entry.field, field_name)) {
             return entry.zig_offset;
+        }
+    }
+    return null;
+}
+
+fn lookupBitfieldEntry(struct_name: []const u8, field_name: []const u8) ?BitfieldEntry {
+    for (bitfield_table) |entry| {
+        if (std.mem.eql(u8, entry.name, struct_name) and std.mem.eql(u8, entry.field, field_name)) {
+            return entry;
         }
     }
     return null;
@@ -319,6 +461,22 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             }
+        } else if (std.mem.startsWith(u8, line, "bitfield ")) {
+            // Format: "bitfield <struct_name> <field_name> <c_byte_offset>"
+            const rest = line["bitfield ".len..];
+            if (parseBitfieldLine(rest)) |parsed| {
+                if (lookupBitfieldEntry(parsed.struct_name, parsed.field_name)) |be| {
+                    checked += 1;
+                    const label = std.fmt.bufPrint(&label_buf, "{s}.{s}", .{ be.name, be.field }) catch "???";
+                    if (parsed.offset != be.zig_offset) {
+                        const diff: i64 = @as(i64, @intCast(parsed.offset)) - @as(i64, @intCast(be.zig_offset));
+                        print("  {s:<48} {d:>6}  {d:>6}  MISMATCH (diff={d}) [{s}]\n", .{ label, parsed.offset, be.zig_offset, diff, be.note });
+                        mismatches += 1;
+                    } else {
+                        print("  {s:<48} {d:>6}  {d:>6}  OK\n", .{ label, parsed.offset, be.zig_offset });
+                    }
+                }
+            }
         }
     }
 
@@ -341,6 +499,22 @@ fn parseSizeofLine(line: []const u8) ?ParsedSizeof {
 }
 
 fn parseOffsetofLine(line: []const u8) ?ParsedOffsetof {
+    const first_sep = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
+    const rest = line[first_sep + 1 ..];
+    const second_sep = std.mem.lastIndexOfScalar(u8, rest, ' ') orelse return null;
+    const offset = std.fmt.parseInt(usize, rest[second_sep + 1 ..], 10) catch return null;
+    return .{
+        .struct_name = line[0..first_sep],
+        .field_name = rest[0..second_sep],
+        .offset = offset,
+    };
+}
+
+// Parse "bitfield" lines emitted by check_layout.c (one per bitfield byte
+// offset probe).  Format: "<struct_name> <field_name> <byte_offset>".
+const ParsedBitfield = struct { struct_name: []const u8, field_name: []const u8, offset: usize };
+
+fn parseBitfieldLine(line: []const u8) ?ParsedBitfield {
     const first_sep = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
     const rest = line[first_sep + 1 ..];
     const second_sep = std.mem.lastIndexOfScalar(u8, rest, ' ') orelse return null;

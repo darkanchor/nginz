@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stddef.h>
+#include <string.h>
 
 #include <ngx_config.h>
 #include <ngx_core.h>
@@ -20,6 +21,35 @@
 
 #define PRINT_OFFSETOF(type, field) \
     printf("offsetof " #type " " #field " %zu\n", offsetof(type, field))
+
+/*
+ * Bitfield byte-offset probe.
+ *
+ * offsetof() on a bitfield is undefined behaviour, so we measure the byte
+ * offset at runtime by zeroing two instances, setting the field to 1 in
+ * one of them, then scanning for the first byte that differs.  Used to
+ * cross-check Zig packed-struct bindings whose alignment may not match
+ * the C layout (translate-c often picks a `packed struct(u64)` that ends
+ * up 6 bytes past the real bitfield position).
+ *
+ * The Zig side derives the expected offset via
+ *   @offsetOf(parent, "flags") + @bitOffsetOf(packed, "first") / 8
+ * and compares to the C-measured value emitted by this macro.
+ */
+#define PRINT_BITFIELD_OFFSET(type, field) do {                              \
+    type _bf_a, _bf_b;                                                        \
+    memset(&_bf_a, 0, sizeof _bf_a);                                          \
+    memset(&_bf_b, 0, sizeof _bf_b);                                          \
+    _bf_b.field = 1;                                                          \
+    size_t _bf_o = (size_t)-1;                                                \
+    for (size_t _i = 0; _i < sizeof _bf_a; _i++) {                            \
+        if (((unsigned char*)&_bf_a)[_i] != ((unsigned char*)&_bf_b)[_i]) {   \
+            _bf_o = _i;                                                       \
+            break;                                                            \
+        }                                                                     \
+    }                                                                         \
+    printf("bitfield " #type " " #field " %zu\n", _bf_o);                     \
+} while (0)
 
 int main(void) {
     /* === Core structs === */
@@ -191,6 +221,35 @@ int main(void) {
     PRINT_OFFSETOF(ngx_http_request_t, headers_out);
     PRINT_OFFSETOF(ngx_http_request_t, cleanup);
     PRINT_OFFSETOF(ngx_http_request_t, state);
+
+    /* === Bitfield byte-offset probes === *
+     *
+     * One probe per "first bitfield" in every contiguous run.  Each line
+     * cross-checks the corresponding Zig packed-struct binding (the Zig
+     * side computes `@offsetOf(parent, "flags") + @bitOffsetOf(Packed,
+     * "first")/8` and matches against the C number).  See BITFIELDS.md
+     * for the full audit and the fix recipes.
+     */
+
+    /* ngx_http_request_t: 3 separate bitfield runs (flags0/flags1/flags2). */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, count);       /* run 1, after port */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, gzip_vary);   /* run 2, after run 1 */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, http_minor);  /* run 3, after host_end */
+
+    /* Other heavily used structs. */
+    PRINT_BITFIELD_OFFSET(ngx_http_addr_conf_t, ssl);
+    PRINT_BITFIELD_OFFSET(ngx_connection_t, buffered);
+    PRINT_BITFIELD_OFFSET(ngx_listening_t, open);
+    PRINT_BITFIELD_OFFSET(ngx_buf_t, temporary);
+    PRINT_BITFIELD_OFFSET(ngx_event_t, write);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_t, store);
+    PRINT_BITFIELD_OFFSET(ngx_resolver_ctx_t, async);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_conf_t, store);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_headers_in_t, connection_close);
+    PRINT_BITFIELD_OFFSET(ngx_http_request_body_t, filter_need_buffering);
+    PRINT_BITFIELD_OFFSET(ngx_http_core_loc_conf_t, lmt_excpt);
+    PRINT_BITFIELD_OFFSET(ngx_http_listen_opt_t, set);
+    PRINT_BITFIELD_OFFSET(ngx_http_core_srv_conf_t, listen);
 
     /* === Key offsets: ngx_http_upstream_t === */
     PRINT_OFFSETOF(ngx_http_upstream_t, conf);
