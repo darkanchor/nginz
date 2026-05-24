@@ -361,6 +361,7 @@ export fn ngx_http_graphql_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_i
 
     rctx.*.waiting_body = 1;
     rctx.*.lccf = lccf;
+    r.*.flags1.discard_body = false;
 
     const rc = http.ngx_http_read_client_request_body(r, ngx_http_graphql_body_handler);
     if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) return rc;

@@ -312,7 +312,7 @@ export fn ngx_http_jsonschema_body_handler(r: [*c]ngx_http_request_t) callconv(.
     var cj = CJSON.init(r.*.pool);
     const json_value = cj.decode(body) catch {
         _ = sendErrorResponse(r, "invalid JSON");
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     };
 
@@ -320,7 +320,7 @@ export fn ngx_http_jsonschema_body_handler(r: [*c]ngx_http_request_t) callconv(.
     const result = validateValue(json_value, rctx.*.lccf.*.schema_json, "$", 0);
     if (!result.valid) {
         _ = sendErrorResponse(r, result.error_message);
-        http.ngx_http_finalize_request(r, http.NGX_HTTP_FORBIDDEN);
+        http.ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
@@ -371,9 +371,11 @@ export fn ngx_http_jsonschema_access_handler(r: [*c]ngx_http_request_t) callconv
     }
     rctx.*.waiting_body = 1;
     rctx.*.lccf = lccf;
-    // Read request body
+    r.*.flags1.discard_body = false;
     const rc = http.ngx_http_read_client_request_body(r, ngx_http_jsonschema_body_handler);
-    return if (rc == NGX_AGAIN) NGX_DONE else rc;
+    if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) return rc;
+    http.ngx_http_finalize_request(r, NGX_DONE);
+    return NGX_DONE;
 }
 
 fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
