@@ -84,13 +84,6 @@ describe("ssi keepalive raw", () => {
   test("3 SSI requests on one keepalive TCP connection", async () => {
     const port = 8888;
     const { results, leftover } = await runKeepAlive(port);
-    console.log(`Got ${results.length} complete responses`);
-    for (let i = 0; i < results.length; i++) {
-      console.log(`Response ${i+1}: body="${results[i].body.substring(0,50)}..."`);
-    }
-    if (leftover.length > 0) {
-      console.log(`Leftover bytes (${leftover.length}): ${leftover.substring(0, 100).replace(/\r/g,"\\r").replace(/\n/g,"\\n")}`);
-    }
     expect(results.length).toBe(3);
     results.forEach(r => expect(r.body).toContain("Alice"));
   });

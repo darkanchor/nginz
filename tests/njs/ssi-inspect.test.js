@@ -30,8 +30,8 @@ describe("ssi raw response inspect", () => {
       const res = await fetch(`${TEST_URL}/ssi/users`);
       const headers = Object.fromEntries(res.headers.entries());
       const body = await res.text();
-      console.log(`Request ${i}: status=${res.status} body=${JSON.stringify(body)} headers=${JSON.stringify(headers)}`);
       expect(res.status).toBe(200);
+      expect(body).toContain("Alice");
     });
   }
 });

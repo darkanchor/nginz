@@ -1468,16 +1468,6 @@ fn finalize_response_send(
 
     const b = response_buf orelse return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
     b.*.last = b.*.pos + response_len;
-    // For subrequests (SSI include, mirror), do NOT set last_buf on the
-    // response body.  The body travels via ngx_http_postpone_filter →
-    // ngx_http_next_body_filter(r->main, in) → chunked filter.  If last_buf
-    // were true the chunked filter would emit a terminal 0\r\n\r\n here.
-    // But the SSI framework also queues a sync buf with last_buf=true in
-    // r->main->postponed which will fire a second terminal later — resulting
-    // in two 0\r\n\r\n on the wire and Malformed_HTTP_Response on keepalive
-    // reuse (the client reads the extra 0\r\n\r\n as the start of the next
-    // response).  Clearing last_buf for subrequests delegates the sole
-    // terminal to the SSI sync buf path.
     b.*.flags.last_buf = (r == r.*.main);
     b.*.flags.last_in_chain = true;
 
@@ -8198,6 +8188,15 @@ fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_
         return core.NGX_DONE;
     }
 
+    // Mirror module sets header_only on background subrequests — skip all
+    // processing (no postgres connection, no body).  Also skip background
+    // subrequests generally: they are fire-and-forget; routing output
+    // through the postpone filter to r->main would inject garbage onto
+    // the client connection after the main response has terminated.
+    if (r.*.flags1.header_only or r.*.flags1.background) {
+        return core.NGX_OK;
+    }
+
     // Get location config to retrieve connection string
     const loc_conf = core.castPtr(
         ngx_pgrest_loc_conf_t,
@@ -9148,6 +9147,15 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
     ctx.*.request = null;
     release_pooled_ctx(ctx, false);
 
+    // Background subrequests (mirror module) are fire-and-forget.  Sending
+    // any output would route through the postpone filter to r->main and
+    // inject garbage (and an extra terminal chunk) onto the client
+    // connection after the main response has already terminated.
+    if (r.*.flags1.background) {
+        http.ngx_http_finalize_request(r, core.NGX_OK);
+        return;
+    }
+
     const rc = finalize_response_send(
         r,
         response_body_buf,
@@ -9160,7 +9168,14 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         ctx.*.write_status,
         ctx.*.write_send_body,
     );
+    // Save connection before finalize — r may be freed after finalize.
+    // pgrest is async: we reach here from a postgres event callback, not
+    // from ngx_http_request_handler.  ngx_http_run_posted_requests must
+    // be called explicitly so the parent request's writer runs and flushes
+    // the SSI output stuck in r->main->postponed.
+    const c = r.*.connection;
     http.ngx_http_finalize_request(r, rc);
+    http.ngx_http_run_posted_requests(c);
 }
 
 /// Clean up a pool connection entry
