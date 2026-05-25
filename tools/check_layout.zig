@@ -264,51 +264,35 @@ const offsetof_table = [_]OffsetEntry{
     .{ .name = "ngx_stream_upstream_t", .field = "resolved", .zig_offset = @offsetOf(vx.ngx_stream_upstream_t, "resolved") },
 };
 
-// Bitfield byte-offset checks.  One entry per "first bitfield" in a
-// contiguous run of `unsigned x:N` fields.  The C side measures the real
-// byte offset at runtime; the Zig side derives it from the binding through
-// flag_byte_offset(), so a mismatch means translate-c produced a packed
-// struct whose alignment shifts the field away from the C position.
-// See BITFIELDS.md for the full audit and the fix recipes.
+// Bitfield byte-offset checks.  One entry per field we want to verify.
+// The C side measures the real byte offset at runtime; the Zig side
+// derives it from the binding through flag_byte_offset().  A mismatch
+// means the packed struct layout doesn't match C.
 const bitfield_table = [_]BitfieldEntry{
-    // ngx_http_request_t has three bitfield runs (flags0/flags1/flags2).
-    .{
-        .name = "ngx_http_request_t",
-        .field = "count",
-        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "count"),
-        .note = "flags0 run",
-    },
-    .{
-        .name = "ngx_http_request_t",
-        .field = "gzip_vary",
-        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "gzip_vary"),
-        .note = "flags1 run",
-    },
-    .{
-        .name = "ngx_http_request_t",
-        .field = "http_minor",
-        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags2", "http_minor"),
-        .note = "flags2 run; preceded by host_end pointer",
-    },
-    // Deep probes: verify internal storage unit boundaries
-    .{
-        .name = "ngx_http_request_t",
-        .field = "aio",
-        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "aio"),
-        .note = "second storage unit inside flags0",
-    },
-    .{
-        .name = "ngx_http_request_t",
-        .field = "allow_ranges",
-        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "allow_ranges"),
-        .note = "second storage unit inside flags1",
-    },
-    .{
-        .name = "ngx_http_request_t",
-        .field = "http_major",
-        .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags2", "http_major"),
-        .note = "second field inside flags2",
-    },
+    // flags0: 2 storage units
+    .{ .name = "ngx_http_request_t", .field = "count", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "count"), .note = "flags0 unit1 start" },
+    .{ .name = "ngx_http_request_t", .field = "aio", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "aio"), .note = "flags0 unit2 start" },
+    .{ .name = "ngx_http_request_t", .field = "subrequest_in_memory", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "subrequest_in_memory"), .note = "flags0 unit2 near end" },
+    .{ .name = "ngx_http_request_t", .field = "cached", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags0", "cached"), .note = "flags0 unit2 last bit" },
+
+    // flags1: 2 storage units
+    .{ .name = "ngx_http_request_t", .field = "gzip_tested", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "gzip_tested"), .note = "flags1 unit1 start" },
+    .{ .name = "ngx_http_request_t", .field = "gzip_vary", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "gzip_vary"), .note = "flags1 unit1 early" },
+    .{ .name = "ngx_http_request_t", .field = "realloc_captures", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "realloc_captures"), .note = "flags1 unit1 interior" },
+    .{ .name = "ngx_http_request_t", .field = "limit_conn_status", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "limit_conn_status"), .note = "flags1 unit1 interior" },
+    .{ .name = "ngx_http_request_t", .field = "limit_req_status", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "limit_req_status"), .note = "flags1 unit1 interior" },
+    .{ .name = "ngx_http_request_t", .field = "chunked", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "chunked"), .note = "flags1 unit1 before header_only" },
+    .{ .name = "ngx_http_request_t", .field = "header_only", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "header_only"), .note = "flags1 unit1 middle" },
+    .{ .name = "ngx_http_request_t", .field = "internal", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "internal"), .note = "flags1 unit1 near end" },
+    .{ .name = "ngx_http_request_t", .field = "done", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "done"), .note = "flags1 unit1 last?" },
+    .{ .name = "ngx_http_request_t", .field = "logged", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "logged"), .note = "flags1 unit boundary" },
+    .{ .name = "ngx_http_request_t", .field = "buffered", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "buffered"), .note = "flags1 unit2 start" },
+    .{ .name = "ngx_http_request_t", .field = "allow_ranges", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "allow_ranges"), .note = "flags1 unit2 middle" },
+    .{ .name = "ngx_http_request_t", .field = "background", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags1", "background"), .note = "flags1 unit2 near end" },
+
+    // flags2: 1 storage unit
+    .{ .name = "ngx_http_request_t", .field = "http_minor", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags2", "http_minor"), .note = "flags2 unit start" },
+    .{ .name = "ngx_http_request_t", .field = "http_major", .zig_offset = flag_byte_offset(http.ngx_http_request_t, "flags2", "http_major"), .note = "flags2 unit end" },
 
     .{
         .name = "ngx_http_addr_conf_t",
@@ -347,6 +331,18 @@ const bitfield_table = [_]BitfieldEntry{
         .note = "preceded by cleanup pointer",
     },
     .{
+        .name = "ngx_http_upstream_t",
+        .field = "keepalive",
+        .zig_offset = flag_byte_offset(http.ngx_http_upstream_t, "flags", "keepalive"),
+        .note = "upstream flags interior (crosses byte boundary)",
+    },
+    .{
+        .name = "ngx_http_upstream_t",
+        .field = "response_received",
+        .zig_offset = flag_byte_offset(http.ngx_http_upstream_t, "flags", "response_received"),
+        .note = "upstream flags end",
+    },
+    .{
         .name = "ngx_resolver_ctx_t",
         .field = "async",
         .zig_offset = flag_byte_offset(core.ngx_resolver_ctx_t, "flags", "async"),
@@ -359,11 +355,64 @@ const bitfield_table = [_]BitfieldEntry{
         .note = "preceded by store_values pointer",
     },
     .{
+        .name = "ngx_http_upstream_conf_t",
+        .field = "preserve_output",
+        .zig_offset = flag_byte_offset(http.ngx_http_upstream_conf_t, "flags", "preserve_output"),
+        .note = "upstream conf flags end",
+    },
+    .{
         .name = "ngx_http_upstream_headers_in_t",
         .field = "connection_close",
         .zig_offset = flag_byte_offset(http.ngx_http_upstream_headers_in_t, "flags", "connection_close"),
         .note = "preceded by last_modified_time",
     },
+    .{
+        .name = "ngx_http_upstream_headers_in_t",
+        .field = "expired",
+        .zig_offset = flag_byte_offset(http.ngx_http_upstream_headers_in_t, "flags", "expired"),
+        .note = "upstream headers_in flags end",
+    },
+    .{
+        .name = "ngx_http_upstream_server_t",
+        .field = "backup",
+        .zig_offset = flag_byte_offset(http.ngx_http_upstream_server_t, "flags", "backup"),
+        .note = "upstream server flags",
+    },
+
+    // Every remaining packed struct: first-field probes
+    .{ .name = "ngx_file_t", .field = "valid_info", .zig_offset = flag_byte_offset(file.ngx_file_t, "flags", "valid_info"), .note = "file flags" },
+    .{ .name = "ngx_variable_value_t", .field = "len", .zig_offset = flag_byte_offset(http.ngx_http_variable_value_t, "flags", "len"), .note = "variable value flags" },
+    .{ .name = "ngx_dir_t", .field = "type", .zig_offset = flag_byte_offset(core.ngx_dir_t, "flags", "type"), .note = "dir flags" },
+    .{ .name = "ngx_process_t", .field = "respawn", .zig_offset = flag_byte_offset(core.ngx_process_t, "flags", "respawn"), .note = "process flags" },
+    .{ .name = "ngx_output_chain_ctx_t", .field = "sendfile", .zig_offset = flag_byte_offset(core.ngx_output_chain_ctx_t, "flags", "sendfile"), .note = "output chain ctx flags" },
+    .{ .name = "ngx_temp_file_t", .field = "log_level", .zig_offset = flag_byte_offset(file.ngx_temp_file_t, "flags", "log_level"), .note = "temp file flags" },
+    .{ .name = "ngx_ext_rename_file_t", .field = "create_path", .zig_offset = flag_byte_offset(core.ngx_ext_rename_file_t, "flags", "create_path"), .note = "ext rename file flags" },
+    .{ .name = "ngx_url_t", .field = "listen", .zig_offset = flag_byte_offset(core.ngx_url_t, "flags", "listen"), .note = "url flags" },
+    .{ .name = "ngx_resolver_t", .field = "ipv4", .zig_offset = flag_byte_offset(core.ngx_resolver_t, "flags", "ipv4"), .note = "resolver flags" },
+    .{ .name = "ngx_resolver_node_t", .field = "tcp", .zig_offset = flag_byte_offset(core.ngx_resolver_node_t, "flags", "tcp"), .note = "resolver node flags" },
+    .{ .name = "ngx_ssl_ticket_key_t", .field = "size", .zig_offset = flag_byte_offset(http.ngx_ssl_ticket_key_t, "flags", "size"), .note = "ssl ticket key flags" },
+    .{ .name = "ngx_open_file_info_t", .field = "disable_symlinks", .zig_offset = flag_byte_offset(core.ngx_open_file_info_t, "flags", "disable_symlinks"), .note = "open file info flags" },
+    .{ .name = "ngx_cached_open_file_t", .field = "disable_symlinks", .zig_offset = flag_byte_offset(core.ngx_cached_open_file_t, "flags", "disable_symlinks"), .note = "cached open file flags (u64)" },
+    .{ .name = "ngx_syslog_peer_t", .field = "busy", .zig_offset = flag_byte_offset(core.ngx_syslog_peer_t, "flags", "busy"), .note = "syslog peer flags" },
+    .{ .name = "ngx_http_cache_t", .field = "lock", .zig_offset = flag_byte_offset(http.ngx_http_cache_t, "flags", "lock"), .note = "http cache flags" },
+    .{ .name = "ngx_peer_connection_t", .field = "cached", .zig_offset = flag_byte_offset(core.ngx_peer_connection_t, "flags", "cached"), .note = "peer connection flags" },
+    .{ .name = "ngx_event_pipe_t", .field = "read", .zig_offset = flag_byte_offset(core.ngx_event_pipe_t, "flags", "read"), .note = "event pipe flags" },
+    .{ .name = "ngx_http_headers_in_t", .field = "connection_type", .zig_offset = flag_byte_offset(http.ngx_http_headers_in_t, "flags", "connection_type"), .note = "http headers in flags" },
+    .{ .name = "ngx_http_connection_t", .field = "ssl", .zig_offset = flag_byte_offset(http.ngx_http_connection_t, "flags", "ssl"), .note = "http connection flags" },
+    .{ .name = "ngx_http_script_engine_t", .field = "flushed", .zig_offset = flag_byte_offset(http.ngx_http_script_engine_t, "flags", "flushed"), .note = "script engine flags" },
+    .{ .name = "ngx_http_script_compile_t", .field = "compile_args", .zig_offset = flag_byte_offset(http.ngx_http_script_compile_t, "flags", "compile_args"), .note = "script compile flags" },
+    .{ .name = "ngx_http_compile_complex_value_t", .field = "zero", .zig_offset = flag_byte_offset(http.ngx_http_compile_complex_value_t, "flags", "zero"), .note = "compile complex value flags" },
+    .{ .name = "ngx_http_script_regex_code_t", .field = "test", .zig_offset = flag_byte_offset(http.ngx_http_script_regex_code_t, "flags", "test"), .note = "script regex code flags" },
+    .{ .name = "ngx_http_script_regex_end_code_t", .field = "uri", .zig_offset = flag_byte_offset(http.ngx_http_script_regex_end_code_t, "flags", "uri"), .note = "script regex end code flags" },
+    .{ .name = "ngx_http_upstream_rr_peer_t", .field = "route", .zig_offset = flag_byte_offset(http.ngx_http_upstream_rr_peer_t, "flags", "route"), .note = "upstream rr peer flags" },
+    .{ .name = "ngx_http_upstream_rr_peers_t", .field = "single", .zig_offset = flag_byte_offset(http.ngx_http_upstream_rr_peers_t, "flags", "single"), .note = "upstream rr peers flags" },
+    .{ .name = "ngx_http_conf_addr_t", .field = "protocols", .zig_offset = flag_byte_offset(http.ngx_http_conf_addr_t, "flags", "protocols"), .note = "http conf addr flags" },
+    .{ .name = "ngx_http_v2_state_t", .field = "incomplete", .zig_offset = flag_byte_offset(vx.ngx_http_v2_state_t, "flags", "incomplete"), .note = "http v2 state flags" },
+    .{ .name = "ngx_http_v2_connection_t", .field = "blocked", .zig_offset = flag_byte_offset(vx.ngx_http_v2_connection_t, "flags", "blocked"), .note = "http v2 connection flags" },
+    .{ .name = "ngx_http_v2_stream_t", .field = "initialized", .zig_offset = flag_byte_offset(vx.ngx_http_v2_stream_t, "flags", "initialized"), .note = "http v2 stream flags" },
+    .{ .name = "ngx_http_v2_out_frame_t", .field = "fin", .zig_offset = flag_byte_offset(vx.ngx_http_v2_out_frame_t, "flags", "fin"), .note = "http v2 out frame flags" },
+    .{ .name = "ngx_http_v3_session_t", .field = "goaway", .zig_offset = flag_byte_offset(vx.ngx_http_v3_session_t, "flags", "goaway"), .note = "http v3 session flags" },
+
     .{
         .name = "ngx_http_request_body_t",
         .field = "filter_need_buffering",

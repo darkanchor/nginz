@@ -224,21 +224,34 @@ int main(void) {
     PRINT_OFFSETOF(ngx_http_request_t, parent);
     PRINT_OFFSETOF(ngx_http_request_t, state);
 
-    /* === Bitfield byte-offset probes === *
-     *
-     * One probe per "first bitfield" in every contiguous run.  Each line
-     * cross-checks the corresponding Zig packed-struct binding (the Zig
-     * side computes `@offsetOf(parent, "flags") + @bitOffsetOf(Packed,
-     * "first")/8` and matches against the C number).  See BITFIELDS.md
-     * for the full audit and the fix recipes.
-     */
+    /* === Comprehensive bitfield byte-offset probes === *
+     * Probe the first AND last field of every internal storage unit
+     * within flags0/flags1/flags2 to catch intra-struct boundary shifts. */
 
-    /* ngx_http_request_t: 3 separate bitfield runs (flags0/flags1/flags2). */
-    PRINT_BITFIELD_OFFSET(ngx_http_request_t, count);       /* run 1, after port */
-    PRINT_BITFIELD_OFFSET(ngx_http_request_t, gzip_vary);   /* run 2, after run 1 */
-    PRINT_BITFIELD_OFFSET(ngx_http_request_t, http_minor);  /* run 3, after host_end */
+    /* flags0: 2 storage units (offsets 1202, 1206) */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, count);          /* unit 1 start */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, aio);            /* unit 2 start */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, subrequest_in_memory); /* unit 2 near end */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, cached);         /* unit 2 last bit */
 
-    /* Other heavily used structs. */
+    /* flags1: 2 storage units (offsets 1210, 1214) */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, gzip_tested);    /* unit 1 start */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, gzip_vary);      /* unit 1 early */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, realloc_captures);/* unit 1 interior */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, limit_conn_status);/* unit 1 interior */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, limit_req_status);/* unit 1 interior */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, chunked);        /* unit 1 before header_only */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, header_only);    /* unit 1 middle */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, internal);       /* unit 1 near end */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, done);           /* unit 1 late */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, logged);         /* unit 1/2 boundary */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, buffered);       /* unit 2 start */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, allow_ranges);   /* unit 2 middle */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, background);     /* unit 2 near end */
+
+    /* flags2: 1 storage unit */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, http_minor);     /* unit start */
+    PRINT_BITFIELD_OFFSET(ngx_http_request_t, http_major);     /* unit end */
     PRINT_BITFIELD_OFFSET(ngx_http_addr_conf_t, ssl);
     PRINT_BITFIELD_OFFSET(ngx_connection_t, buffered);
     PRINT_BITFIELD_OFFSET(ngx_listening_t, open);
@@ -256,10 +269,54 @@ int main(void) {
     PRINT_BITFIELD_OFFSET(ngx_slab_pool_t, log_nomem);
     PRINT_BITFIELD_OFFSET(ngx_http_file_cache_node_t, count);
 
-    /* Deep probe: verify internal storage unit boundaries */
-    PRINT_BITFIELD_OFFSET(ngx_http_request_t, aio);
-    PRINT_BITFIELD_OFFSET(ngx_http_request_t, allow_ranges);
-    PRINT_BITFIELD_OFFSET(ngx_http_request_t, http_major);
+    /* ngx_http_upstream_t deep probes: verify interior fields */
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_t, keepalive);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_t, response_received);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_conf_t, preserve_output);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_headers_in_t, expired);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_server_t, backup);
+
+    /* === Every remaining packed struct: first-field probes === */
+    PRINT_BITFIELD_OFFSET(ngx_file_t, valid_info);
+    PRINT_BITFIELD_OFFSET(ngx_variable_value_t, len);
+    PRINT_BITFIELD_OFFSET(ngx_dir_t, type);
+    PRINT_BITFIELD_OFFSET(ngx_process_t, respawn);
+    PRINT_BITFIELD_OFFSET(ngx_output_chain_ctx_t, sendfile);
+    PRINT_BITFIELD_OFFSET(ngx_temp_file_t, log_level);
+    PRINT_BITFIELD_OFFSET(ngx_ext_rename_file_t, create_path);
+    PRINT_BITFIELD_OFFSET(ngx_url_t, listen);
+    PRINT_BITFIELD_OFFSET(ngx_resolver_t, ipv4);
+    PRINT_BITFIELD_OFFSET(ngx_resolver_node_t, tcp);
+    PRINT_BITFIELD_OFFSET(ngx_ssl_ticket_key_t, size);
+    PRINT_BITFIELD_OFFSET(ngx_open_file_info_t, disable_symlinks);
+    PRINT_BITFIELD_OFFSET(ngx_cached_open_file_t, disable_symlinks);
+    PRINT_BITFIELD_OFFSET(ngx_syslog_peer_t, busy);
+    PRINT_BITFIELD_OFFSET(ngx_http_cache_t, lock);
+    PRINT_BITFIELD_OFFSET(ngx_peer_connection_t, cached);
+    PRINT_BITFIELD_OFFSET(ngx_event_pipe_t, read);
+    PRINT_BITFIELD_OFFSET(ngx_http_headers_in_t, connection_type);
+    PRINT_BITFIELD_OFFSET(ngx_http_connection_t, ssl);
+    PRINT_BITFIELD_OFFSET(ngx_http_script_engine_t, flushed);
+    PRINT_BITFIELD_OFFSET(ngx_http_script_compile_t, compile_args);
+    PRINT_BITFIELD_OFFSET(ngx_http_compile_complex_value_t, zero);
+    PRINT_BITFIELD_OFFSET(ngx_http_script_regex_code_t, test);
+    PRINT_BITFIELD_OFFSET(ngx_http_script_regex_end_code_t, uri);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_rr_peer_t, route);
+    PRINT_BITFIELD_OFFSET(ngx_http_upstream_rr_peers_t, single);
+    PRINT_BITFIELD_OFFSET(ngx_http_conf_addr_t, protocols);
+    PRINT_BITFIELD_OFFSET(ngx_http_v2_state_t, incomplete);
+    PRINT_BITFIELD_OFFSET(ngx_http_v2_connection_t, blocked);
+    PRINT_BITFIELD_OFFSET(ngx_http_v2_stream_t, initialized);
+    PRINT_BITFIELD_OFFSET(ngx_http_v2_out_frame_t, fin);
+    PRINT_BITFIELD_OFFSET(ngx_http_v3_session_t, goaway);
+#if (NGX_STREAM)
+    PRINT_BITFIELD_OFFSET(ngx_stream_upstream_server_t, backup);
+    PRINT_BITFIELD_OFFSET(ngx_stream_upstream_t, store);
+    PRINT_BITFIELD_OFFSET(ngx_stream_upstream_rr_peer_t, down);
+    PRINT_BITFIELD_OFFSET(ngx_stream_upstream_rr_peers_t, single);
+    PRINT_BITFIELD_OFFSET(ngx_stream_core_srv_conf_t, proxy_protocol);
+    PRINT_BITFIELD_OFFSET(ngx_stream_session_t, ssl);
+#endif
 
     /* === Key offsets: ngx_http_upstream_t === */
     PRINT_OFFSETOF(ngx_http_upstream_t, conf);

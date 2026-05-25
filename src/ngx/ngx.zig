@@ -1814,12 +1814,13 @@ const struct_ngx_http_request_flag0_s = packed struct(u64) {
     subrequest_in_memory: bool,
     waited: bool,
     cached: bool,
-    gzip_tested: bool,
-    gzip_ok: bool,
+    _pad: u2,
 };
 // flags1: C uses two 32-bit unsigned storage units at offsets 1210 and 1214.
 // Recipe B (align override) keeps the original packed struct(u64).
 const struct_ngx_http_request_flag1_s = packed struct(u64) {
+    gzip_tested: bool,
+    gzip_ok: bool,
     gzip_vary: bool,
     realloc_captures: bool,
     proxy: bool,
@@ -1864,7 +1865,7 @@ const struct_ngx_http_request_flag1_s = packed struct(u64) {
     stat_processing: bool,
     background: bool,
     health_check: bool,
-    padding: u14,
+    padding: u12,
 };
 // flags2: already u32-backed and correctly aligned after host_end pointer.
 const struct_ngx_http_request_flag2_s = packed struct(u32) {

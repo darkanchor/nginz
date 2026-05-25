@@ -8188,12 +8188,11 @@ fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_
         return core.NGX_DONE;
     }
 
-    // Mirror module sets header_only on background subrequests — skip all
-    // processing (no postgres connection, no body).  Also skip background
-    // subrequests generally: they are fire-and-forget; routing output
-    // through the postpone filter to r->main would inject garbage onto
-    // the client connection after the main response has terminated.
-    if (r.*.flags1.header_only or r.*.flags1.background) {
+    // Mirror module creates background subrequests with header_only=1.
+    // Only skip when BOTH are set: mirror fires these as side-effects and
+    // discards the response.  njs also creates background subrequests but
+    // without header_only — those need pgrest to process normally.
+    if (r.*.flags1.header_only and r.*.flags1.background) {
         return core.NGX_OK;
     }
 
@@ -9147,11 +9146,8 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
     ctx.*.request = null;
     release_pooled_ctx(ctx, false);
 
-    // Background subrequests (mirror module) are fire-and-forget.  Sending
-    // any output would route through the postpone filter to r->main and
-    // inject garbage (and an extra terminal chunk) onto the client
-    // connection after the main response has already terminated.
-    if (r.*.flags1.background) {
+    // Mirror background subrequests (header_only + background): fire-and-forget.
+    if (r.*.flags1.header_only and r.*.flags1.background) {
         http.ngx_http_finalize_request(r, core.NGX_OK);
         return;
     }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ngx = @import("ngx.zig");
 const nginx = @import("nginx.zig");
+const vx = nginx.vx;
 
 const log = nginx.log;
 const core = nginx.core;
@@ -274,6 +275,18 @@ pub const NSubrequest = extern struct {
     }
 };
 
+/// Compile-time byte offset of a bitfield within a parent struct.
+/// Mirrors the logic in tools/check_layout.zig to guard against
+/// packed-struct layout mismatches with the C compiler.
+fn flag_byte_offset(
+    comptime Parent: type,
+    comptime flag_field: []const u8,
+    comptime sub: []const u8,
+) usize {
+    const FlagType = @TypeOf(@field(@as(Parent, undefined), flag_field));
+    return @offsetOf(Parent, flag_field) + @bitOffsetOf(FlagType, sub) / 8;
+}
+
 test "http" {
     try expectEqual(@sizeOf(ngx_http_file_cache_node_t), 120);
     try expectEqual(@sizeOf(ngx_http_cache_t), 648);
@@ -297,6 +310,29 @@ test "http" {
     try expectEqual(@offsetOf(ngx_http_request_t, "host_end"), 1392);
     try expectEqual(@offsetOf(ngx_http_request_t, "flags2"), 1400);
 
+    // Bitfield byte-offset guards: catch layout mismatches at comptime.
+    // If any of these fail, the packed-struct definitions in ngx.zig
+    // don't match the C compiler's layout.
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags0", "count"), 1202);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags0", "aio"), 1206);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags0", "subrequest_in_memory"), 1209);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags0", "cached"), 1209);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "gzip_tested"), 1210);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "gzip_vary"), 1210);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "realloc_captures"), 1210);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "limit_conn_status"), 1210);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "limit_req_status"), 1211);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "chunked"), 1211);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "header_only"), 1212);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "internal"), 1212);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "done"), 1214);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "logged"), 1214);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "buffered"), 1214);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "allow_ranges"), 1215);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags1", "background"), 1216);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags2", "http_minor"), 1400);
+    try expectEqual(flag_byte_offset(ngx_http_request_t, "flags2", "http_major"), 1402);
+
     try expectEqual(@sizeOf(ngx_http_script_engine_t), 88);
     try expectEqual(@sizeOf(ngx_http_script_compile_t), 88);
     try expectEqual(@sizeOf(ngx_http_compile_complex_value_t), 32);
@@ -309,6 +345,36 @@ test "http" {
     try expectEqual(@sizeOf(ngx_http_upstream_t), 1096);
     try expectEqual(@sizeOf(ngx_http_upstream_rr_peer_t), 320);
     try expectEqual(@sizeOf(ngx_http_upstream_rr_peers_t), 96);
+
+    // Upstream bitfield byte-offset guards
+    try expectEqual(flag_byte_offset(ngx_http_upstream_t, "flags", "store"), 1088);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_t, "flags", "keepalive"), 1089);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_t, "flags", "response_received"), 1089);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_conf_t, "flags", "store"), 440);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_conf_t, "flags", "preserve_output"), 440);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_headers_in_t, "flags", "connection_close"), 304);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_headers_in_t, "flags", "expired"), 304);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_server_t, "flags", "backup"), 80);
+
+    // Every remaining http-related packed struct
+    try expectEqual(flag_byte_offset(ngx_http_variable_value_t, "flags", "len"), 0);
+    try expectEqual(flag_byte_offset(ngx_ssl_ticket_key_t, "flags", "size"), 88);
+    try expectEqual(flag_byte_offset(ngx_http_cache_t, "flags", "lock"), 640);
+    try expectEqual(flag_byte_offset(ngx_http_headers_in_t, "flags", "connection_type"), 376);
+    try expectEqual(flag_byte_offset(ngx_http_connection_t, "flags", "ssl"), 64);
+    try expectEqual(flag_byte_offset(ngx_http_script_engine_t, "flags", "flushed"), 64);
+    try expectEqual(flag_byte_offset(ngx_http_script_compile_t, "flags", "compile_args"), 80);
+    try expectEqual(flag_byte_offset(ngx_http_compile_complex_value_t, "flags", "zero"), 24);
+    try expectEqual(flag_byte_offset(ngx_http_script_regex_code_t, "flags", "test"), 48);
+    try expectEqual(flag_byte_offset(ngx_http_script_regex_end_code_t, "flags", "uri"), 8);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_rr_peer_t, "flags", "route"), 164);
+    try expectEqual(flag_byte_offset(ngx_http_upstream_rr_peers_t, "flags", "single"), 64);
+    try expectEqual(flag_byte_offset(ngx_http_conf_addr_t, "flags", "protocols"), 72);
+    try expectEqual(flag_byte_offset(vx.ngx_http_v2_state_t, "flags", "incomplete"), 25);
+    try expectEqual(flag_byte_offset(vx.ngx_http_v2_connection_t, "flags", "blocked"), 448);
+    try expectEqual(flag_byte_offset(vx.ngx_http_v2_stream_t, "flags", "initialized"), 120);
+    try expectEqual(flag_byte_offset(vx.ngx_http_v2_out_frame_t, "flags", "fin"), 48);
+    try expectEqual(flag_byte_offset(vx.ngx_http_v3_session_t, "flags", "goaway"), 312);
 
     try expectEqual(@sizeOf(ngx_ssl_connection_t), 96);
     try expectEqual(@sizeOf(ngx_ssl_ticket_key_t), 96);
