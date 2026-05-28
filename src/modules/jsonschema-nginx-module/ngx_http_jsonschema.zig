@@ -232,6 +232,9 @@ fn sendErrorResponse(r: [*c]ngx_http_request_t, message: []const u8) ngx_int_t {
     if (header_rc == NGX_ERROR or header_rc > NGX_OK) {
         return header_rc;
     }
+    if (r.*.method == http.NGX_HTTP_HEAD or r.*.flags1.header_only) {
+        return NGX_OK;
+    }
 
     // Create output buffer
     const b = core.castPtr(ngx_buf_t, core.ngx_pcalloc(r.*.pool, @sizeOf(ngx_buf_t))) orelse return NGX_ERROR;
@@ -239,7 +242,7 @@ fn sendErrorResponse(r: [*c]ngx_http_request_t, message: []const u8) ngx_int_t {
     b.*.pos = buf_ptr;
     b.*.last = buf_ptr + response_len;
     b.*.flags.memory = true;
-    b.*.flags.last_buf = true;
+    b.*.flags.last_buf = (r == r.*.main);
     b.*.flags.last_in_chain = true;
 
     var out: ngx_chain_t = undefined;

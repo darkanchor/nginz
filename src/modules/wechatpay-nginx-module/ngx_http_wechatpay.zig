@@ -490,19 +490,40 @@ fn wechatpay_preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     return NGX_OK;
 }
 
+fn ngx_http_wechatpay_preaccess_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    const lccf = core.castPtr(
+        wechatpay_loc_conf,
+        conf.ngx_http_get_module_loc_conf(r, &ngx_http_wechatpay_module),
+    ) orelse return NGX_DECLINED;
+
+    if (lccf.*.access_control == 0) return NGX_DECLINED;
+    if (r == r.*.main) return NGX_DECLINED;
+
+    ngx.log.ngz_log_error(ngx.log.NGX_LOG_WARN, r.*.connection.*.log, 0,
+        "wechatpay: subrequests are not supported on wechatpay-enabled locations", .{});
+    return http.NGX_HTTP_FORBIDDEN;
+}
+
 fn wechatpay_postconfiguration(
     cf: [*c]ngx_conf_t,
 ) callconv(.c) ngx_int_t {
-    if (core.castPtr(
+    const cmcf = core.castPtr(
         http.ngx_http_core_main_conf_t,
         conf.ngx_http_conf_get_module_main_conf(cf, &ngx_http_core_module),
-    )) |cmcf| {
-        var handlers = NArray(http.ngx_http_handler_pt).init0(
-            &cmcf[0].phases[http.NGX_HTTP_ACCESS_PHASE].handlers,
-        );
-        const h = handlers.append() catch return NGX_ERROR;
-        h.* = ngx_http_wechatpay_access_handler;
-    }
+    ) orelse return NGX_ERROR;
+
+    var preaccess_handlers = NArray(http.ngx_http_handler_pt).init0(
+        &cmcf[0].phases[http.NGX_HTTP_PREACCESS_PHASE].handlers,
+    );
+    const ph = preaccess_handlers.append() catch return NGX_ERROR;
+    ph.* = ngx_http_wechatpay_preaccess_handler;
+
+    var access_handlers = NArray(http.ngx_http_handler_pt).init0(
+        &cmcf[0].phases[http.NGX_HTTP_ACCESS_PHASE].handlers,
+    );
+    const h = access_handlers.append() catch return NGX_ERROR;
+    h.* = ngx_http_wechatpay_access_handler;
+
     return NGX_OK;
 }
 

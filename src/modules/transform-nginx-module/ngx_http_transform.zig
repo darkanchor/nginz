@@ -138,6 +138,11 @@ fn appendToBuffer(ctx: [*c]transform_ctx, data: []const u8, pool: [*c]core.ngx_p
 var ngx_http_transform_next_body_filter: http.ngx_http_output_body_filter_pt = null;
 
 export fn ngx_http_transform_body_filter(r: [*c]ngx_http_request_t, in: [*c]ngx_chain_t) callconv(.c) ngx_int_t {
+    if (r != r.*.main) {
+        if (ngx_http_transform_next_body_filter) |next| return next(r, in);
+        return NGX_OK;
+    }
+
     const lccf = core.castPtr(
         transform_loc_conf,
         conf.ngx_http_get_module_loc_conf(r, &ngx_http_transform_filter_module),
@@ -213,7 +218,7 @@ export fn ngx_http_transform_body_filter(r: [*c]ngx_http_request_t, in: [*c]ngx_
     out_buf.*.pos = output.data;
     out_buf.*.last = output.data + output.len;
     out_buf.*.flags.memory = true;
-    out_buf.*.flags.last_buf = true;
+    out_buf.*.flags.last_buf = (r == r.*.main);
     out_buf.*.flags.last_in_chain = true;
 
     var out_chain: ngx_chain_t = undefined;
@@ -230,6 +235,11 @@ export fn ngx_http_transform_body_filter(r: [*c]ngx_http_request_t, in: [*c]ngx_
 var ngx_http_transform_next_header_filter: http.ngx_http_output_header_filter_pt = null;
 
 export fn ngx_http_transform_header_filter(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    if (r != r.*.main) {
+        if (ngx_http_transform_next_header_filter) |next| return next(r);
+        return NGX_OK;
+    }
+
     const lccf = core.castPtr(
         transform_loc_conf,
         conf.ngx_http_get_module_loc_conf(r, &ngx_http_transform_filter_module),

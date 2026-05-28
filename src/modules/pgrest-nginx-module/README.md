@@ -13,6 +13,37 @@ The pgrest implementation is no longer a single growing file. The current split 
 
 This split is intentionally mechanical so future batches can grow one concern without dragging the whole module into context.
 
+## Current Hard Limits
+
+`pgrest` now correctly reconstructs nginx temp-file-spilled request bodies, so large-body handling is no longer limited by the old in-memory-only transport path. But the module still has several explicit fixed-size parser and query ceilings. Those are hard limits today, not soft guidance:
+
+| Area | Limit | Source |
+|---|---:|---|
+| SQL query buffer | `4096` bytes | `pgrest_query.zig:MAX_QUERY_SIZE` |
+| Response JSON formatting buffer | `65536` bytes | `ngx_http_pgrest.zig:MAX_JSON_SIZE` |
+| SQL parameter arena | `8192` bytes total | `ngx_http_pgrest.zig:MAX_PARAM_BUFFER` |
+| Write columns per row | `32` | `pgrest_query.zig:MAX_COLUMNS` |
+| Select columns | `32` | `pgrest_query.zig:MAX_SELECT_COLUMNS` |
+| Order columns | `8` | `pgrest_query.zig:MAX_ORDER_COLUMNS` |
+| Filters | `16` | `pgrest_query.zig:MAX_FILTERS` |
+| Bulk write rows | `16` | `ngx_http_pgrest.zig:MAX_WRITE_ROWS` |
+| JSON/form field name scratch | `256` bytes per field name | `pgrest_query.zig:name_buf`, `ngx_http_pgrest.zig` write-field storage |
+| Query/filter field value scratch | `1024` bytes per field value | `pgrest_query.zig:value_buf` |
+| JSON parser scratch for single-object write bodies | `< 4096` body bytes | `ngx_http_pgrest.zig` object-body parsing path |
+| JSON parser scratch for RPC JSON bodies | `< 4096` body bytes | `ngx_http_pgrest.zig` RPC body parsing path |
+| JSON parser scratch for bulk JSON array writes | `< 8192` body bytes | `ngx_http_pgrest.zig` bulk-array parsing path |
+| CSV single-row field value | `1024` bytes per field | `ngx_http_pgrest.zig:MAX_CSV_VALUE_LEN` |
+| RPC parameter count | `16` | `pgrest_rpc.zig:MAX_RPC_PARAMS` |
+| RPC parameter encoded-value scratch | `2048` bytes | `pgrest_rpc.zig:RpcParam.value_buf` |
+| RPC variadic parameter name scratch | `128` bytes | `pgrest_rpc.zig:variadic_param_name_buf` |
+| RPC input-parameter names scratch | `256` bytes | `pgrest_rpc.zig:input_param_names_buf` |
+
+Important nuance:
+
+- The spill-file fix means plain text and raw RPC request bodies are no longer artificially capped by the old local copy buffers on the transport path.
+- That does **not** mean every `pgrest` request body is effectively unbounded. JSON write bodies, JSON RPC bodies, SQL generation, parameter shaping, and response formatting still run into the fixed ceilings above.
+- Requests that exceed the active parameter/query/parser budget should fail explicitly rather than degrading into partial parsing or mixed raw/parameterized SQL.
+
 ## Features
 
 ### Core Features

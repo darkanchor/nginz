@@ -71,5 +71,26 @@ describe("hello module", () => {
       const body = await res.text();
       expect(body).toBe("");
     });
+
+    test("terminates SSI subrequests correctly", async () => {
+      const res = await fetch(`${TEST_URL}/hello-ssi-parent`);
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toBe("hello");
+    });
+
+    test("works as an auth_request target without emitting body", async () => {
+      const res = await fetch(`${TEST_URL}/hello-auth-parent`);
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toBe("auth-ok");
+    });
+
+    test("works as a mirror target without breaking the parent response", async () => {
+      const res = await fetch(`${TEST_URL}/hello-mirror-parent`);
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toBe("mirror-ok");
+    });
   });
 });

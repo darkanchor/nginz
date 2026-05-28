@@ -510,13 +510,13 @@ fn send_json_response(r: [*c]ngx_http_request_t, status: ngx_uint_t, body: ngx_s
 
     const header_rc = http.ngx_http_send_header(r);
     if (header_rc == NGX_ERROR or header_rc > NGX_OK) return header_rc;
-    if (r.*.method == http.NGX_HTTP_HEAD) return NGX_OK;
+    if (r.*.method == http.NGX_HTTP_HEAD or r.*.flags1.header_only) return NGX_OK;
 
     const out_buf = core.ngz_pcalloc_c(ngx_buf_t, r.*.pool) orelse return NGX_ERROR;
     out_buf.*.pos = body.data;
     out_buf.*.last = body.data + body.len;
     out_buf.*.flags.memory = true;
-    out_buf.*.flags.last_buf = true;
+    out_buf.*.flags.last_buf = (r == r.*.main);
     out_buf.*.flags.last_in_chain = true;
 
     const chain = core.ngz_pcalloc_c(ngx_chain_t, r.*.pool) orelse return NGX_ERROR;

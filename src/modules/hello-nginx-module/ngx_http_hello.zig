@@ -77,8 +77,12 @@ export fn ngx_http_hello_handler(
     http.ngx_http_clear_accept_ranges(r);
 
     // Send headers
-    if (http.ngx_http_send_header(r) != NGX_OK) {
+    const header_rc = http.ngx_http_send_header(r);
+    if (header_rc == NGX_ERROR or header_rc > NGX_OK) {
         return NGX_ERROR;
+    }
+    if (r.*.method == http.NGX_HTTP_HEAD or r.*.flags1.header_only) {
+        return NGX_OK;
     }
 
     // Allocate buffer for response
@@ -86,7 +90,8 @@ export fn ngx_http_hello_handler(
         b.*.pos = hello_str.data;
         b.*.last = hello_str.data + hello_str.len;
         b.*.flags.memory = true;
-        b.*.flags.last_buf = true;
+        b.*.flags.last_buf = (r == r.*.main);
+        b.*.flags.last_in_chain = true;
 
         // Allocate chain link
         if (core.ngz_pcalloc_c(ngx_chain_t, r.*.pool)) |chain| {

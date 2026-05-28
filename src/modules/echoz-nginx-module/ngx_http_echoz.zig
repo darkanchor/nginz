@@ -529,7 +529,7 @@ fn echoz_filter(
                     const parameters = try map(cmd.*.params, r, &total_length);
                     last = try chain.allocNStr(parameters, last);
                 }
-                last.*.buf.*.flags.last_buf = true;
+                last.*.buf.*.flags.last_buf = (r == r.*.main);
             }
         }
     }

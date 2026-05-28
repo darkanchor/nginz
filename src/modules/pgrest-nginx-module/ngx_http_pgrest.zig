@@ -1344,7 +1344,7 @@ fn send_json_payload(r: [*c]ngx_http_request_t, status: ngx_uint_t, body: []cons
         return header_rc;
     }
 
-    if (r.*.method == http.NGX_HTTP_HEAD) {
+    if (r.*.method == http.NGX_HTTP_HEAD or r.*.flags1.header_only) {
         return http.ngx_http_send_special(r, http.NGX_HTTP_LAST);
     }
 
@@ -1354,7 +1354,7 @@ fn send_json_payload(r: [*c]ngx_http_request_t, status: ngx_uint_t, body: []cons
 
     @memcpy(b.*.last[0..body.len], body);
     b.*.last += body.len;
-    b.*.flags.last_buf = true;
+    b.*.flags.last_buf = (r == r.*.main);
     b.*.flags.last_in_chain = true;
 
     var out: ngx_chain_t = std.mem.zeroes(ngx_chain_t);

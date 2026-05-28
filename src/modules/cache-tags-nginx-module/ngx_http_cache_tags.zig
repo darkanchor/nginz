@@ -460,6 +460,9 @@ export fn ngx_http_cache_tags_purge_handler(r: [*c]ngx_http_request_t) callconv(
     if (rc == NGX_ERROR or rc > NGX_OK) {
         return rc;
     }
+    if (r.*.method == http.NGX_HTTP_HEAD or r.*.flags1.header_only) {
+        return NGX_OK;
+    }
 
     // Allocate and send body
     const b = core.castPtr(ngx_buf_t, core.ngx_pcalloc(r.*.pool, @sizeOf(ngx_buf_t))) orelse return NGX_ERROR;
@@ -470,7 +473,7 @@ export fn ngx_http_cache_tags_purge_handler(r: [*c]ngx_http_request_t) callconv(
     b.*.pos = data;
     b.*.last = data + response_len;
     b.*.flags.memory = true;
-    b.*.flags.last_buf = true;
+    b.*.flags.last_buf = (r == r.*.main);
     b.*.flags.last_in_chain = true;
 
     var out: ngx_chain_t = undefined;
