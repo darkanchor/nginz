@@ -247,12 +247,12 @@ fn send_json_response(r: [*c]ngx_http_request_t, status: ngx_uint_t, body: ngx_s
     r.*.headers_out.content_length_n = @intCast(body.len);
     const header_rc = http.ngx_http_send_header(r);
     if (header_rc == core.NGX_ERROR or header_rc > core.NGX_OK) return header_rc;
-    if (r.*.method == http.NGX_HTTP_HEAD) return core.NGX_OK;
+    if (r.*.method == http.NGX_HTTP_HEAD or r.*.flags1.header_only) return core.NGX_OK;
     const out_buf = core.ngz_pcalloc_c(ngx_buf_t, r.*.pool) orelse return core.NGX_ERROR;
     out_buf.*.pos = body.data;
     out_buf.*.last = body.data + body.len;
     out_buf.*.flags.memory = true;
-    out_buf.*.flags.last_buf = true;
+    out_buf.*.flags.last_buf = (r == r.*.main);
     out_buf.*.flags.last_in_chain = true;
     const chain = core.ngz_pcalloc_c(ngx_chain_t, r.*.pool) orelse return core.NGX_ERROR;
     chain.*.buf = out_buf;
@@ -1874,6 +1874,10 @@ fn activate_snapshot_from_specs(
     new_snapshot.*.next_draining = null;
     record_store_success_locked(store);
 
+    // PUT replaces the entire peer set — drain state from the previous
+    // generation does not carry over.
+    store.*.drain_count = 0;
+
     const old_active = store.*.active;
     const store_typed: *UpstreamStore = @alignCast(@ptrCast(store));
     @atomicStore(usize, @as(*usize, @ptrCast(&store_typed.active)), @intFromPtr(new_snapshot), .release);
@@ -3056,6 +3060,10 @@ fn du_release_generation(
 // ── Main request handler ──────────────────────────────────────────────────────
 
 export fn ngx_http_dynamic_upstreams_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    // Dynamic upstreams API mutates shared state and is only meaningful
+    // for main requests. Refuse subrequests.
+    if (r != r.*.main) return http.NGX_HTTP_FORBIDDEN;
+
     const method = r.*.method;
     if (method == http.NGX_HTTP_GET or method == http.NGX_HTTP_HEAD) {
         return handle_get(r);

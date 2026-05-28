@@ -521,12 +521,12 @@ fn send_json_response(r: [*c]ngx_http_request_t, status: ngx_uint_t, body: ngx_s
     r.*.headers_out.content_length_n = @intCast(body.len);
     const header_rc = http.ngx_http_send_header(r);
     if (header_rc == core.NGX_ERROR or header_rc > core.NGX_OK) return header_rc;
-    if (r.*.method == http.NGX_HTTP_HEAD) return core.NGX_OK;
+    if (r.*.method == http.NGX_HTTP_HEAD or r.*.flags1.header_only) return core.NGX_OK;
     const out_buf = core.ngz_pcalloc(ngx.buf.ngx_buf_t, r.*.pool) orelse return core.NGX_ERROR;
     out_buf.pos = body.data;
     out_buf.last = body.data + body.len;
     out_buf.flags.memory = true;
-    out_buf.flags.last_buf = true;
+    out_buf.flags.last_buf = (r == r.*.main);
     out_buf.flags.last_in_chain = true;
     const chain = core.ngz_pcalloc(ngx.buf.ngx_chain_t, r.*.pool) orelse return core.NGX_ERROR;
     chain.buf = out_buf;
@@ -535,6 +535,10 @@ fn send_json_response(r: [*c]ngx_http_request_t, status: ngx_uint_t, body: ngx_s
 }
 
 export fn ngx_http_upstream_balancer_status_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
+    // Status endpoint reads shared-memory metrics and is only meaningful
+    // for main requests. Refuse subrequests.
+    if (r != r.*.main) return http.NGX_HTTP_FORBIDDEN;
+
     if (r.*.method != http.NGX_HTTP_GET and r.*.method != http.NGX_HTTP_HEAD) {
         return http.NGX_HTTP_NOT_ALLOWED;
     }
@@ -1028,16 +1032,21 @@ export fn upstream_balancer_register_peer_source(
 }
 
 export fn ngx_http_upstream_balancer_header_filter(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
-    if (core.castPtr(BalancerRequestCtx, r.*.ctx[ngx_http_upstream_balancer_module.ctx_index])) |ctx| {
-        if (ctx.*.pending_cookie.len > 0 and ctx.*.pending_cookie.data != null) {
-            var headers = NList(ngx_table_elt_t).init0(&r.*.headers_out.headers);
-            if (headers.append()) |h| {
-                h.*.hash = 1;
-                h.*.key = string.ngx_string("Set-Cookie");
-                h.*.value = ctx.*.pending_cookie;
-                h.*.lowcase_key = @constCast("set-cookie");
-            } else |_| {}
-            ctx.*.pending_cookie = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
+    // Only emit Set-Cookie for main requests. Subrequests that happen to
+    // pass through this filter must not leak affinity cookies into the
+    // parent response.
+    if (r == r.*.main) {
+        if (core.castPtr(BalancerRequestCtx, r.*.ctx[ngx_http_upstream_balancer_module.ctx_index])) |ctx| {
+            if (ctx.*.pending_cookie.len > 0 and ctx.*.pending_cookie.data != null) {
+                var headers = NList(ngx_table_elt_t).init0(&r.*.headers_out.headers);
+                if (headers.append()) |h| {
+                    h.*.hash = 1;
+                    h.*.key = string.ngx_string("Set-Cookie");
+                    h.*.value = ctx.*.pending_cookie;
+                    h.*.lowcase_key = @constCast("set-cookie");
+                } else |_| {}
+                ctx.*.pending_cookie = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
+            }
         }
     }
     if (ngx_http_upstream_balancer_next_header_filter) |next| return next(r);
