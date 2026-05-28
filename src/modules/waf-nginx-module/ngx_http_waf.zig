@@ -2013,8 +2013,12 @@ fn sendBlockedResponse(r: [*c]ngx_http_request_t, rule_type: []const u8, status:
     b.*.pos = buf_ptr;
     b.*.last = buf_ptr + response_len;
     b.*.flags.memory = true;
-    b.*.flags.last_buf = true;
+    b.*.flags.last_buf = (r == r.*.main);
     b.*.flags.last_in_chain = true;
+
+    if (r.*.flags1.header_only) {
+        return http.ngx_http_send_special(r, http.NGX_HTTP_LAST);
+    }
 
     var out: ngx_chain_t = undefined;
     out.buf = b;
