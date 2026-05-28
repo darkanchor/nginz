@@ -155,6 +155,20 @@ describe("Redis SET Operations", () => {
     expect(redisMock.getValue("set/escaped-body")).toBe(rawValue);
   });
 
+  test("stores spilled SET request bodies intact", async () => {
+    const rawValue = `spill-start-${"x".repeat(8192)}-spill-end`;
+
+    const res = await fetch(`${TEST_URL}/set-spill/spilled-body`, {
+      method: "POST",
+      body: rawValue,
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(redisMock.getValue("set-spill/spilled-body")).toBe(rawValue);
+  });
+
   test("rejects GET method for SET command", async () => {
     const res = await fetch(`${TEST_URL}/set/testkey`);
     expect(res.status).toBe(405);
@@ -308,6 +322,19 @@ describe("Redis EXPIRE Operations", () => {
 
     const body = await res.json();
     expect(body).toEqual({ error: "redis_error" });
+  });
+
+  test("parses spilled EXPIRE request bodies intact", async () => {
+    redisMock.setValue("expire-spill/ttlkey", "spilled-ttl");
+
+    const res = await fetch(`${TEST_URL}/expire-spill/ttlkey`, {
+      method: "POST",
+      body: "3600",
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.value).toBe(1);
   });
 });
 
@@ -593,6 +620,21 @@ describe("Redis HSET Operations", () => {
       body: "",
     });
     expect(res.status).toBe(400);
+  });
+
+  test("stores spilled HSET request bodies intact", async () => {
+    const rawValue = `spill-hset-${"z".repeat(8192)}-tail`;
+
+    const res = await fetch(`${TEST_URL}/hset-spill/myhash?field=large`, {
+      method: "POST",
+      body: rawValue,
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.value).toBe(1);
+    const stored = JSON.parse(redisMock.getValue("hset-spill/myhash"));
+    expect(stored.large).toBe(rawValue);
   });
 
   test("returns 400 when field parameter is missing", async () => {

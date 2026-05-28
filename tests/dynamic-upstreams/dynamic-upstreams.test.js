@@ -254,6 +254,25 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
     const final = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(final.peers).toEqual([{ address: "127.0.0.1:19003", weight: 1 }]);
   });
+
+  test("PUT accepts a temp-file-spilled JSON snapshot body", async () => {
+    const payload = `${JSON.stringify({
+      peers: [{ address: "127.0.0.1:19004", weight: 1 }],
+    })}${" ".repeat(8192)}`;
+
+    const res = await fetch(`${TEST_URL}/dynamic-upstreams-spill`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.status).toBe("ok");
+
+    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams-spill`)).json();
+    expect(state.peers).toEqual([{ address: "127.0.0.1:19004", weight: 1 }]);
+  });
 });
 
 describe("dynamic-upstreams Phase 3 — operational fields and worker-events fanout", () => {

@@ -703,12 +703,11 @@ fn parse_single_value_body(
     body: []const u8,
     fields: *[MAX_COLUMNS]JsonField,
 ) usize {
-    if (body.len == 0 or name.len > fields[0].name_buf.len or body.len > fields[0].value_buf.len) return 0;
+    if (body.len == 0 or name.len > fields[0].name_buf.len) return 0;
 
     @memcpy(fields[0].name_buf[0..name.len], name);
-    @memcpy(fields[0].value_buf[0..body.len], body);
     fields[0].name = fields[0].name_buf[0..name.len];
-    fields[0].value = fields[0].value_buf[0..body.len];
+    fields[0].value = body;
     fields[0].is_null = false;
     fields[0].is_number = false;
     fields[0].is_boolean = false;
@@ -6184,11 +6183,9 @@ fn parse_rpc_json_body(
     if (body.len == 0) return;
 
     if (rpc_call.prefer_single_object) {
-        if (body.len >= rpc_call.raw_body.len) return;
-        @memcpy(rpc_call.raw_body[0..body.len], body);
         rpc_call.raw_body_len = body.len;
         rpc_call.params[0].name = "data";
-        rpc_call.params[0].value = rpc_call.raw_body[0..body.len];
+        rpc_call.params[0].value = body;
         rpc_call.params[0].is_raw = false;
         rpc_call.params[0].is_null = false;
         rpc_call.params[0].is_numeric = false;
@@ -6419,16 +6416,16 @@ fn parse_rpc_form_body(body: []const u8, rpc_call: *RpcCall) void {
 }
 
 fn set_rpc_single_raw_param(rpc_call: *RpcCall, name: []const u8, body: []const u8) void {
-    if (body.len == 0 or name.len > rpc_call.params[0].value_buf.len or body.len > rpc_call.raw_body.len) return;
+    if (body.len == 0 or name.len > rpc_call.params[0].value_buf.len) return;
 
     @memcpy(rpc_call.params[0].value_buf[0..name.len], name);
-    @memcpy(rpc_call.raw_body[0..body.len], body);
     rpc_call.params[0].name = rpc_call.params[0].value_buf[0..name.len];
-    rpc_call.params[0].value = rpc_call.raw_body[0..body.len];
+    rpc_call.params[0].value = body;
     rpc_call.params[0].is_null = false;
     rpc_call.params[0].is_numeric = false;
     rpc_call.params[0].is_boolean = false;
     rpc_call.params[0].is_raw = false;
+    rpc_call.raw_body_len = body.len;
     rpc_call.param_count = 1;
 }
 
@@ -6551,16 +6548,102 @@ fn request_needs_body(r: [*c]ngx_http_request_t) bool {
 }
 
 fn get_request_body_slice(r: [*c]ngx_http_request_t) ?[]const u8 {
-    if (r.*.request_body == null or r.*.request_body.*.bufs == null) return null;
+    if (r.*.request_body == null) return null;
+    const rb = r.*.request_body;
 
-    const body_chain = r.*.request_body.*.bufs;
-    if (body_chain.*.buf == null) return null;
+    if (rb.*.buf != null and !buf.ngx_buf_special(rb.*.buf)) {
+        const b = rb.*.buf;
+        const chunk_len_off = buf.ngx_buf_size(b);
+        if (chunk_len_off < 0) return null;
+        const chunk_len: usize = @intCast(chunk_len_off);
+        if (chunk_len > 0) {
+            const raw = core.ngx_pnalloc(r.*.pool, chunk_len) orelse return null;
+            const out = core.castPtr(u8, raw) orelse return null;
 
-    const body_buf = body_chain.*.buf;
-    const body_len = @intFromPtr(body_buf.*.last) - @intFromPtr(body_buf.*.pos);
-    if (body_len == 0 or body_buf.*.pos == core.nullptr(u8)) return null;
+            if (buf.ngx_buf_in_memory_only(b)) {
+                @memcpy(out[0..chunk_len], core.slicify(u8, b.*.pos, chunk_len));
+                return out[0..chunk_len];
+            }
 
-    return body_buf.*.pos[0..body_len];
+            if (b.*.flags.in_file and b.*.file != null) {
+                const read_len = file.ngx_read_file(b.*.file, out, chunk_len, b.*.file_pos);
+                if (read_len == NGX_ERROR or @as(usize, @intCast(read_len)) != chunk_len) return null;
+                return out[0..chunk_len];
+            }
+        }
+    }
+
+    if (rb.*.bufs == null) {
+        const tf = rb.*.temp_file;
+        if (tf == null) return null;
+
+        const total_off = if (rb.*.received > 0) rb.*.received else tf.*.offset;
+        if (total_off <= 0) return null;
+
+        const total: usize = @intCast(total_off);
+        const raw = core.ngx_pnalloc(r.*.pool, total) orelse return null;
+        const out = core.castPtr(u8, raw) orelse return null;
+        const read_len = file.ngx_read_file(&tf.*.file, out, total, 0);
+        if (read_len == NGX_ERROR or @as(usize, @intCast(read_len)) != total) return null;
+        return out[0..total];
+    }
+
+    var total: usize = 0;
+    var chain = rb.*.bufs;
+    while (chain != null) : (chain = chain.*.next) {
+        const b = chain.*.buf;
+        if (b == null or buf.ngx_buf_special(b)) continue;
+        const chunk_len = buf.ngx_buf_size(b);
+        if (chunk_len < 0) return null;
+        total += @intCast(chunk_len);
+    }
+
+    if (total == 0) {
+        const tf = rb.*.temp_file;
+        if (tf == null) return null;
+
+        const total_off = if (rb.*.received > 0) rb.*.received else tf.*.offset;
+        if (total_off <= 0) return null;
+
+        const file_total: usize = @intCast(total_off);
+        const raw = core.ngx_pnalloc(r.*.pool, file_total) orelse return null;
+        const out = core.castPtr(u8, raw) orelse return null;
+        const read_len = file.ngx_read_file(&tf.*.file, out, file_total, 0);
+        if (read_len == NGX_ERROR or @as(usize, @intCast(read_len)) != file_total) return null;
+        return out[0..file_total];
+    }
+
+    const raw = core.ngx_pnalloc(r.*.pool, total) orelse return null;
+    const out = core.castPtr(u8, raw) orelse return null;
+
+    var offset: usize = 0;
+    chain = rb.*.bufs;
+    while (chain != null) : (chain = chain.*.next) {
+        const b = chain.*.buf;
+        if (b == null or buf.ngx_buf_special(b)) continue;
+
+        const chunk_len_off = buf.ngx_buf_size(b);
+        if (chunk_len_off < 0) return null;
+        const chunk_len: usize = @intCast(chunk_len_off);
+        if (chunk_len == 0) continue;
+
+        if (buf.ngx_buf_in_memory_only(b)) {
+            @memcpy(out[offset .. offset + chunk_len], core.slicify(u8, b.*.pos, chunk_len));
+            offset += chunk_len;
+            continue;
+        }
+
+        if (b.*.flags.in_file and b.*.file != null) {
+            const read_len = file.ngx_read_file(b.*.file, out + offset, chunk_len, b.*.file_pos);
+            if (read_len == NGX_ERROR or @as(usize, @intCast(read_len)) != chunk_len) return null;
+            offset += chunk_len;
+            continue;
+        }
+
+        return null;
+    }
+
+    return out[0..offset];
 }
 
 fn parse_write_body_fields(

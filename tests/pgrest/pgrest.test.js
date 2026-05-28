@@ -1075,6 +1075,24 @@ describe("pgrest module", () => {
     );
   });
 
+  test("POST /api-spill/users preserves full spilled text/plain body", async () => {
+    pgMock.clearTracking();
+    const payload = `spill-start-${"x".repeat(2048)}-spill-end`;
+
+    const res = await fetch(`${TEST_URL}/api-spill/users`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain",
+      },
+      body: payload,
+    });
+
+    expect(res.status).toBe(201);
+    expect(lastSql()).toBe(
+      `INSERT INTO users (data) VALUES ('${payload}') RETURNING *`
+    );
+  });
+
   test("POST /api/users with text/xml body maps payload into data column", async () => {
     pgMock.clearTracking();
 
@@ -1636,6 +1654,22 @@ describe("pgrest module", () => {
     expect(lastSql()).toBe(
       "SELECT import_csv(data => 'name,email\nCsv User,csv@example.com\n')"
     );
+  });
+
+  test("POST /rpc/import_csv preserves full spilled RPC body", async () => {
+    pgMock.clearTracking();
+    const payload = `name,email\nspill-${"y".repeat(2048)},spill@example.com\n`;
+
+    const res = await fetch(`${TEST_URL}/rpc/import_csv`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/csv",
+      },
+      body: payload,
+    });
+
+    expect(res.status).toBe(200);
+    expect(lastSql()).toBe(`SELECT import_csv(data => '${payload}')`);
   });
 
   test("POST /rpc/upload_blob with octet-stream body maps raw payload into data parameter", async () => {

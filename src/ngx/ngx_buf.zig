@@ -2,6 +2,7 @@ const std = @import("std");
 const ngx = @import("ngx.zig");
 const core = @import("ngx_core.zig");
 const array = @import("ngx_array.zig");
+const file = @import("ngx_file.zig");
 const string = @import("ngx_string.zig");
 const expectEqual = std.testing.expectEqual;
 
@@ -55,8 +56,11 @@ pub inline fn ngz_chain_length(cl: [*c]ngx_chain_t) ngx_uint_t {
     var total: ngx_uint_t = 0;
     var n: [*c]ngx_chain_t = cl;
     while (n != NChain.NP) {
-        if (n.*.buf != core.nullptr(ngx_buf_t) and ngx_buf_in_memory_only(n.*.buf)) {
-            total += @intFromPtr(n.*.buf.*.last) - @intFromPtr(n.*.buf.*.pos);
+        if (n.*.buf != core.nullptr(ngx_buf_t) and !ngx_buf_special(n.*.buf)) {
+            const chunk_len = ngx_buf_size(n.*.buf);
+            if (chunk_len > 0) {
+                total += @intCast(chunk_len);
+            }
         }
         n = n.*.next;
     }
@@ -81,11 +85,36 @@ pub inline fn ngz_chain_content(cl: [*c]ngx_chain_t, p: [*c]ngx_pool_t) !ngx_str
         var i: usize = 0;
         var s = core.slicify(u8, b, len);
         while (ngz_chain_iterate(&ll)) |bf| {
-            if (bf != core.nullptr(ngx_buf_t) and ngx_buf_in_memory_only(bf)) {
-                const l = @intFromPtr(bf.*.last) - @intFromPtr(bf.*.pos);
-                @memcpy(s[i .. i + l], core.slicify(u8, bf.*.pos, l));
-                i += l;
+            if (bf == core.nullptr(ngx_buf_t) or ngx_buf_special(bf)) {
+                continue;
             }
+
+            const chunk_len_off = ngx_buf_size(bf);
+            if (chunk_len_off < 0) {
+                return core.NError.FILE_ERROR;
+            }
+
+            const chunk_len: usize = @intCast(chunk_len_off);
+            if (chunk_len == 0) {
+                continue;
+            }
+
+            if (ngx_buf_in_memory_only(bf)) {
+                @memcpy(s[i .. i + chunk_len], core.slicify(u8, bf.*.pos, chunk_len));
+                i += chunk_len;
+                continue;
+            }
+
+            if (bf.*.flags.in_file and bf.*.file != core.nullptr(file.ngx_file_t)) {
+                const read_len = file.ngx_read_file(bf.*.file, b + i, chunk_len, bf.*.file_pos);
+                if (read_len == core.NGX_ERROR or @as(usize, @intCast(read_len)) != chunk_len) {
+                    return core.NError.FILE_ERROR;
+                }
+                i += chunk_len;
+                continue;
+            }
+
+            return core.NError.FILE_ERROR;
         }
         return ngx_str_t{ .data = b, .len = len };
     }

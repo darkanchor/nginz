@@ -4,6 +4,7 @@ const ngx = @import("ngx");
 const buf = ngx.buf;
 const core = ngx.core;
 const conf = ngx.conf;
+const file = ngx.file;
 const http = ngx.http;
 
 const NGX_OK = core.NGX_OK;
@@ -1168,20 +1169,90 @@ fn get_request_body(r: [*c]ngx_http_request_t) ngx_str_t {
         return ngx.string.ngx_null_str;
     }
     if (r.*.request_body.*.bufs == core.nullptr(ngx_chain_t)) {
+        const tf = r.*.request_body.*.temp_file;
+        if (tf == core.nullptr(file.ngx_temp_file_t)) {
+            return ngx.string.ngx_null_str;
+        }
+
+        const total_off = if (r.*.request_body.*.received > 0) r.*.request_body.*.received else tf.*.offset;
+        if (total_off <= 0) {
+            return ngx.string.ngx_null_str;
+        }
+
+        const total: usize = @intCast(total_off);
+        const raw = core.ngx_pnalloc(r.*.pool, total) orelse return ngx.string.ngx_null_str;
+        const out = core.castPtr(u8, raw) orelse return ngx.string.ngx_null_str;
+        const read_len = file.ngx_read_file(&tf.*.file, out, total, 0);
+        if (read_len == NGX_ERROR or @as(usize, @intCast(read_len)) != total) {
+            return ngx.string.ngx_null_str;
+        }
+        return ngx_str_t{ .data = out, .len = total };
+    }
+
+    var total: usize = 0;
+    var chain = r.*.request_body.*.bufs;
+    while (chain != core.nullptr(ngx_chain_t)) : (chain = chain.*.next) {
+        const b = chain.*.buf;
+        if (b == core.nullptr(ngx_buf_t) or buf.ngx_buf_special(b)) continue;
+        const chunk_len = buf.ngx_buf_size(b);
+        if (chunk_len < 0) return ngx.string.ngx_null_str;
+        total += @intCast(chunk_len);
+    }
+
+    if (total == 0) {
+        const tf = r.*.request_body.*.temp_file;
+        if (tf == core.nullptr(file.ngx_temp_file_t)) {
+            return ngx.string.ngx_null_str;
+        }
+
+        const total_off = if (r.*.request_body.*.received > 0) r.*.request_body.*.received else tf.*.offset;
+        if (total_off <= 0) {
+            return ngx.string.ngx_null_str;
+        }
+
+        const file_total: usize = @intCast(total_off);
+        const raw = core.ngx_pnalloc(r.*.pool, file_total) orelse return ngx.string.ngx_null_str;
+        const out = core.castPtr(u8, raw) orelse return ngx.string.ngx_null_str;
+        const read_len = file.ngx_read_file(&tf.*.file, out, file_total, 0);
+        if (read_len == NGX_ERROR or @as(usize, @intCast(read_len)) != file_total) {
+            return ngx.string.ngx_null_str;
+        }
+        return ngx_str_t{ .data = out, .len = file_total };
+    }
+
+    const raw = core.ngx_pnalloc(r.*.pool, total) orelse return ngx.string.ngx_null_str;
+    const out = core.castPtr(u8, raw) orelse return ngx.string.ngx_null_str;
+
+    var offset: usize = 0;
+    chain = r.*.request_body.*.bufs;
+    while (chain != core.nullptr(ngx_chain_t)) : (chain = chain.*.next) {
+        const b = chain.*.buf;
+        if (b == core.nullptr(ngx_buf_t) or buf.ngx_buf_special(b)) continue;
+
+        const chunk_len_off = buf.ngx_buf_size(b);
+        if (chunk_len_off < 0) return ngx.string.ngx_null_str;
+        const chunk_len: usize = @intCast(chunk_len_off);
+        if (chunk_len == 0) continue;
+
+        if (buf.ngx_buf_in_memory_only(b)) {
+            @memcpy(out[offset .. offset + chunk_len], core.slicify(u8, b.*.pos, chunk_len));
+            offset += chunk_len;
+            continue;
+        }
+
+        if (b.*.flags.in_file and b.*.file != core.nullptr(file.ngx_file_t)) {
+            const read_len = file.ngx_read_file(b.*.file, out + offset, chunk_len, b.*.file_pos);
+            if (read_len == NGX_ERROR or @as(usize, @intCast(read_len)) != chunk_len) {
+                return ngx.string.ngx_null_str;
+            }
+            offset += chunk_len;
+            continue;
+        }
+
         return ngx.string.ngx_null_str;
     }
 
-    const b = r.*.request_body.*.bufs.*.buf;
-    if (b == core.nullptr(ngx_buf_t)) {
-        return ngx.string.ngx_null_str;
-    }
-
-    const len = @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
-    if (len == 0) {
-        return ngx.string.ngx_null_str;
-    }
-
-    return ngx_str_t{ .data = b.*.pos, .len = len };
+    return ngx_str_t{ .data = out, .len = offset };
 }
 
 // Parse comma-separated keys from query string for MGET
