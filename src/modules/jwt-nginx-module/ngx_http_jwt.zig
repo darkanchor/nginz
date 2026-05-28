@@ -146,6 +146,7 @@ const jwt_loc_conf = extern struct {
     secret: ngx_str_t,
     // Token source: null = Authorization header, else nginx variable name
     token_var: ngx_str_t,
+    token_var_index: ngx_uint_t,
     // File-based keys
     key_file: ngx_str_t,
     key_format: ngx_uint_t, // 0=jwks, 1=keyval
@@ -871,10 +872,8 @@ fn jwt_validate_phase_request(r: [*c]ngx_http_request_t, lccf: [*c]jwt_loc_conf)
 
     // Extract token: prefer cookie/variable, fallback to Authorization header
     const token = if (lccf.*.token_var.len > 0) blk: {
-        const vn = lccf.*.token_var;
-        const vk = http.ngx_http_get_variable_index(null, @constCast(&vn));
-        if (vk != core.NGX_ERROR) {
-            if (http.ngx_http_get_flushed_variable(r, @intCast(vk))) |vv| {
+        if (lccf.*.token_var_index != conf.NGX_CONF_UNSET_UINT) {
+            if (http.ngx_http_get_flushed_variable(r, @intCast(lccf.*.token_var_index))) |vv| {
                 if (vv.*.flags.valid and vv.*.flags.len > 0) {
                     break :blk core.slicify(u8, vv.*.data, @intCast(vv.*.flags.len));
                 }
@@ -1097,6 +1096,7 @@ fn create_jwt_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.explicit_disable = 0;
         p.*.secret = ngx.string.ngx_null_str;
         p.*.token_var = ngx.string.ngx_null_str;
+        p.*.token_var_index = conf.NGX_CONF_UNSET_UINT;
         p.*.key_file = ngx.string.ngx_null_str;
         p.*.key_format = 1;
         p.*.keys_count = 0;
@@ -1139,6 +1139,7 @@ fn merge_jwt_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     if (ch.validate_sig == conf.NGX_CONF_UNSET) ch.validate_sig = p.validate_sig;
     if (ch.leeway == conf.NGX_CONF_UNSET) ch.leeway = p.leeway;
     if (ch.token_var.len == 0) ch.token_var = p.token_var;
+    if (ch.token_var_index == conf.NGX_CONF_UNSET_UINT) ch.token_var_index = p.token_var_index;
     if (ch.phase == conf.NGX_CONF_UNSET_UINT) ch.phase = p.phase;
 
     // key_requests array: child scope entries stay first, inherited parent entries append after
@@ -1225,10 +1226,14 @@ fn ngx_conf_set_jwt_secret(
                 lccf.*.enabled = 0;
                 lccf.*.explicit_disable = 1;
             } else if (std.mem.startsWith(u8, s, "token=")) {
-                const var_name = s["token=".len..];
+                const full_name = s["token=".len..];
+                const var_name = if (full_name.len > 0 and full_name[0] == '$') full_name[1..] else full_name;
                 if (core.castPtr(u8, core.ngx_pnalloc(cf.*.pool, var_name.len))) |copy| {
                     @memcpy(core.slicify(u8, copy, var_name.len), var_name);
                     lccf.*.token_var = ngx_str_t{ .data = copy, .len = var_name.len };
+                    const vi = http.ngx_http_get_variable_index(cf, &lccf.*.token_var);
+                    if (vi == core.NGX_ERROR) return conf.NGX_CONF_ERROR;
+                    lccf.*.token_var_index = @intCast(vi);
                 }
             } else {
                 lccf.*.secret = arg.*;

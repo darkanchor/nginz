@@ -2645,6 +2645,7 @@ pub const ngx_http_listen_opt_t = extern struct {
     tcp_keepintvl: c_int = @import("std").mem.zeroes(c_int),
     tcp_keepcnt: c_int = @import("std").mem.zeroes(c_int),
 };
+pub const NGX_HTTP_PREACCESS_PHASE: c_int = 5;
 pub const NGX_HTTP_ACCESS_PHASE: c_int = 6;
 pub const NGX_HTTP_CONTENT_PHASE: c_int = 9;
 pub const ngx_http_phase_handler_t = struct_ngx_http_phase_handler_s;

@@ -32,6 +32,7 @@ extern var ngx_http_mirror_module: ngx_module_t;
 extern var ngx_http_try_files_module: ngx_module_t;
 extern var ngx_http_auth_basic_module: ngx_module_t;
 extern var ngx_http_access_module: ngx_module_t;
+extern var ngx_http_auth_request_module: ngx_module_t;
 
 // Limit Modules
 extern var ngx_http_limit_conn_module: ngx_module_t;
@@ -185,6 +186,7 @@ export const ngx_modules = [_][*c]ngx_module_t{
     &ngx_http_try_files_module,
     &ngx_http_auth_basic_module,
     &ngx_http_access_module,
+    &ngx_http_auth_request_module,
 
     // Limit modules
     &ngx_http_limit_conn_module,
@@ -339,6 +341,7 @@ export const ngx_module_names = [_][*c]const u8{
     "ngx_http_try_files_module",
     "ngx_http_auth_basic_module",
     "ngx_http_access_module",
+    "ngx_http_auth_request_module",
     "ngx_http_limit_conn_module",
     "ngx_http_limit_req_module",
     "ngx_http_wechatpay_module",

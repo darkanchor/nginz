@@ -150,6 +150,40 @@ describe("acme module", () => {
     });
   });
 
+  describe("subrequest hardening", () => {
+    test("auth_request to acme-trigger is rejected and does not advance ACME state", async () => {
+      await restartAcmeEnvironment();
+
+      const gate = await fetch(`${TEST_URL}/auth-gate`, { redirect: "manual" });
+      expect(gate.status).toBe(403);
+
+      const firstTrigger = await triggerAcmeFlow();
+      expect(firstTrigger.status).toBe("initialized");
+    });
+
+    test("SSI include to acme-trigger is rejected and does not advance ACME state", async () => {
+      await restartAcmeEnvironment();
+
+      const ssi = await fetch(`${TEST_URL}/ssi-trigger`, { redirect: "manual" });
+      expect(ssi.status).toBe(200);
+      expect(await ssi.text()).toContain("403 Forbidden");
+
+      const firstTrigger = await triggerAcmeFlow();
+      expect(firstTrigger.status).toBe("initialized");
+    });
+
+    test("mirror to acme-trigger leaves the parent response intact and side-effect free", async () => {
+      await restartAcmeEnvironment();
+
+      const mirror = await fetch(`${TEST_URL}/mirror-trigger`, { redirect: "manual" });
+      expect(mirror.status).toBe(200);
+      expect(await mirror.text()).toBe("acme-mirror-ok");
+
+      const firstTrigger = await triggerAcmeFlow();
+      expect(firstTrigger.status).toBe("initialized");
+    });
+  });
+
   describe("ACME Protocol Flow (Mock Server)", () => {
     test("fetches directory from ACME server", async () => {
       const res = await fetch(`${ACME_MOCK_URL}/directory`);

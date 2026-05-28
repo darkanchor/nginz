@@ -341,6 +341,19 @@ describe("JWT — Key Request (Subrequest)", () => {
     expect(await res.text()).toBe("200");
   });
 
+  test("nested subrequest probe fails closed when inner jwt location opts into preaccess", async () => {
+    const res = await fetch(`${TEST_URL}/nested-probe-preaccess`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("401");
+  });
+
+  test("preaccess jwt_key_request route accepts valid token from query-variable token source", async () => {
+    const token = createHS256Token({ sub: "nested-preaccess", exp: FAR_FUTURE }, SUBREQ_SECRET);
+    const res = await fetch(`${TEST_URL}/protected-sub-inner-preaccess?token=${encodeURIComponent(token)}`);
+    expect(res.status).toBe(200);
+    expect((await res.text()).trim()).toBe("KEYREQUEST SUB INNER PREACCESS OK");
+  });
+
   // Missing/empty variable URL behavior
   test("empty variable URL rejects token (no keys loaded)", async () => {
     const token = createHS256Token({ sub: "empty-var", exp: FAR_FUTURE }, SUBREQ_SECRET);

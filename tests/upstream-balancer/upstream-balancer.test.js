@@ -748,4 +748,51 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
     expect((await res.json()).server).toBe("backend2");
     expect(res.headers.get("set-cookie")).toContain("route=peer:127.0.0.1:19003");
   });
+
+  test("draining and undraining a hashed sticky target remaps and restores deterministic selection", async () => {
+    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peers: [
+          { address: "127.0.0.1:19002", weight: 1 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      }),
+    });
+
+    const peer1Key = stickyKeyForPeer(0, 2, "drain-remap-peer1");
+
+    let res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${peer1Key}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend1");
+
+    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ drain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(200);
+
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${peer1Key}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend2");
+
+    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ undrain: "127.0.0.1:19002" }),
+    });
+    expect(res.status).toBe(200);
+
+    res = await fetch(`${TEST_URL}/`, {
+      headers: { Cookie: `route=${peer1Key}` },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).server).toBe("backend1");
+  });
 });

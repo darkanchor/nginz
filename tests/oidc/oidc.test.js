@@ -227,6 +227,50 @@ describe("oidc module", () => {
     });
   });
 
+  describe("subrequest hardening", () => {
+    test("auth_request fails closed without redirect when session is missing", async () => {
+      const res = await fetch(`${TEST_URL}/auth-gate`, { redirect: "manual" });
+      expect(res.status).toBe(401);
+      expect(res.headers.get("location")).toBeNull();
+    });
+
+    test("auth_request grants access when a valid session cookie is present", async () => {
+      const { sessionValue } = await createSession();
+
+      const res = await fetch(`${TEST_URL}/auth-gate`, {
+        headers: { Cookie: `oidc_session=${sessionValue}` },
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("oidc-granted");
+    });
+
+    test("SSI include fails closed without trying browser redirect flow", async () => {
+      const res = await fetch(`${TEST_URL}/ssi-protected`, { redirect: "manual" });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("location")).toBeNull();
+      expect(await res.text()).toContain("401 Authorization Required");
+    });
+
+    test("SSI include can render protected content with a valid session", async () => {
+      const { sessionValue } = await createSession();
+
+      const res = await fetch(`${TEST_URL}/ssi-protected`, {
+        headers: { Cookie: `oidc_session=${sessionValue}` },
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('"status":"protected_content"');
+    });
+
+    test("mirror subrequest returns parent response cleanly", async () => {
+      const res = await fetch(`${TEST_URL}/mirror-protected`, { redirect: "manual" });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("location")).toBeNull();
+      expect(await res.text()).toBe("oidc-mirror-ok");
+    });
+  });
+
   describe("public endpoints", () => {
     test("public endpoint allows access without OIDC", async () => {
       const res = await fetch(`${TEST_URL}/public`);
@@ -240,4 +284,5 @@ describe("oidc module", () => {
       expect((await res.json()).status).toBe("ok");
     });
   });
+
 });

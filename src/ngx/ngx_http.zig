@@ -153,6 +153,7 @@ pub fn ngz_set_upstream_header(
     return core.NGX_ERROR;
 }
 
+pub const NGX_HTTP_PREACCESS_PHASE = ngx.NGX_HTTP_PREACCESS_PHASE;
 pub const NGX_HTTP_ACCESS_PHASE = ngx.NGX_HTTP_ACCESS_PHASE;
 pub const NGX_HTTP_CONTENT_PHASE = ngx.NGX_HTTP_CONTENT_PHASE;
 
@@ -262,13 +263,27 @@ pub inline fn ngx_http_clear_etag(r: [*c]ngx_http_request_t) void {
 pub const NSubrequest = extern struct {
     const Self = @This();
 
+    pub const IN_MEMORY: ngx_uint_t = 2;
+    pub const WAITED: ngx_uint_t = 4;
+    pub const CLONE: ngx_uint_t = 8;
+    pub const BACKGROUND: ngx_uint_t = 16;
+
     pub fn create(
         r: [*c]ngx_http_request_t,
         location: [*c]ngx_str_t,
         args: [*c]ngx_str_t,
     ) ![*c]ngx_http_request_t {
+        return createWithFlags(r, location, args, 0);
+    }
+
+    pub fn createWithFlags(
+        r: [*c]ngx_http_request_t,
+        location: [*c]ngx_str_t,
+        args: [*c]ngx_str_t,
+        flags: ngx_uint_t,
+    ) ![*c]ngx_http_request_t {
         var sr: [*c]ngx_http_request_t = core.nullptr(ngx_http_request_t);
-        if (ngx_http_subrequest(r, location, args, &sr, core.nullptr(ngx_http_post_subrequest_t), 0) == NGX_OK) {
+        if (ngx_http_subrequest(r, location, args, &sr, core.nullptr(ngx_http_post_subrequest_t), flags) == NGX_OK) {
             return sr;
         }
         return core.NError.REQUEST_ERROR;

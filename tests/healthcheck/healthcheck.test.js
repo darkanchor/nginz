@@ -744,5 +744,33 @@ describe("healthcheck module", () => {
       const events = await getWorkerEvents();
       expect(events.events).toEqual([]);
     });
+
+    test("rapid probe flaps emit a coherent transition sequence without duplicate steady-state events", async () => {
+      probe.get("/probe", { status: 500, body: { status: "down" } });
+      await waitForStatus("/ready", 503);
+
+      probe.get("/probe", { status: 200, body: { status: "recovered" } });
+      await waitForStatus("/ready", 200);
+
+      probe.get("/probe", { status: 500, body: { status: "down-again" } });
+      await waitForStatus("/ready", 503);
+
+      const body = await waitForWorkerEvents((snapshot) => {
+        const transitions = snapshot.events.filter((event) => event.type === "transition");
+        return transitions.length >= 3;
+      });
+
+      const transitions = body.events
+        .filter((event) => event.type === "transition")
+        .map((event) => JSON.parse(event.payload))
+        .filter((payload) => payload.scope === "service");
+
+      expect(transitions.slice(-3).map((payload) => payload.healthy)).toEqual([
+        false,
+        true,
+        false,
+      ]);
+      expect(transitions.at(-1).status).toBe(500);
+    });
   });
 });

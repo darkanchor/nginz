@@ -304,9 +304,10 @@ fn timestamp(p: [*c]ngx_pool_t) !ngx_str_t {
 
 fn read_body(r: [*c]ngx_http_request_t) ngx_str_t {
     const res: ngx_str_t = ngx.string.ngx_null_str;
-    const b0 = r.*.request_body == core.nullptr(http.ngx_http_request_body_t);
-    const b1 = r.*.request_body.*.bufs == core.nullptr(buf.ngx_chain_t);
-    if (b0 or b1) {
+    if (r.*.request_body == core.nullptr(http.ngx_http_request_body_t)) {
+        return res;
+    }
+    if (r.*.request_body.*.bufs == core.nullptr(buf.ngx_chain_t)) {
         return res;
     }
 
@@ -405,7 +406,9 @@ fn build_request(
         const sign = try sign_request(lccf, r, data);
         var write: [*c]u8 = data;
         write = ngx_sprintf(write, "%V %V?%V HTTP/1.1\r\n", &r.*.method_name, &r.*.uri, &r.*.args);
-        var headers = NList(ngx_table_elt_t).init0(&r.*.headers_in.headers);
+        // Use main request headers: subrequest headers_in is a struct-copy whose
+        // embedded part and last pointer diverge (list inconsistent for iteration).
+        var headers = NList(ngx_table_elt_t).init0(&r.*.main.*.headers_in.headers);
         var it = headers.iterator();
         while (it.next()) |h| {
             write = ngx_sprintf(write, "%V: %V\r\n", &h.*.key, &h.*.value);
@@ -461,6 +464,14 @@ fn send_header(r: [*c]ngx_http_request_t) ngx_int_t {
 }
 
 fn send_body(r: [*c]ngx_http_request_t, chain: [*c]ngx_chain_t) ngx_int_t {
+    if (r.*.flags1.header_only) {
+        // auth_request subrequests: send headers (so status is readable) but no body.
+        if (!r.*.flags1.header_sent) {
+            const hrc = send_header(r);
+            if (hrc == NGX_ERROR or hrc > NGX_OK) return hrc;
+        }
+        return http.ngx_http_send_special(r, http.NGX_HTTP_LAST);
+    }
     if (!r.*.flags1.header_sent) {
         if (NGX_OK != send_header(r)) {
             return NGX_ERROR;
@@ -704,6 +715,18 @@ fn ngx_http_wechatpay_proxy_upstream_finalize_request(
             return;
         }
         const u = r.*.upstream;
+        // For header_only subrequests (auth_request): nginx upstream skips body
+        // reading so signature verification is impossible. Forward the upstream
+        // HTTP status directly; the header filter leaves BYPASS alone.
+        if (r.*.flags1.header_only) {
+            rctx.*.sig_verify = .SIG_VERIFICATION_BYPASS;
+            r.*.headers_out.status = u.*.headers_in.status_n;
+            http.ngx_http_clear_content_length(r);
+            http.ngx_http_clear_accept_ranges(r);
+            _ = http.ngx_http_send_header(r);
+            _ = http.ngx_http_send_special(r, http.NGX_HTTP_LAST);
+            return;
+        }
         var last: [*c]ngx_chain_t = core.nullptr(ngx_chain_t);
         rctx.*.sig_verify = .SIG_VERIFICATION_FAILED;
         last = buf.ngz_chain_last(rctx.*.res);
@@ -736,7 +759,7 @@ fn ngx_http_wechatpay_proxy_upstream_finalize_request(
         if (last != core.nullptr(ngx_chain_t) and
             last.*.buf != core.nullptr(ngx_buf_t))
         {
-            last.*.buf.*.flags.last_buf = true;
+            last.*.buf.*.flags.last_buf = (r == r.*.main);
             last.*.buf.*.flags.last_in_chain = true;
         }
         if (NGX_OK != send_body(r, rctx.*.res.*.next)) {
@@ -920,7 +943,7 @@ fn wechatpay_check_access(r: [*c]ngx_http_request_t) !ngx_int_t {
                     .next = core.nullptr(ngx_chain_t),
                 };
                 const last = try chain.allocStr(new_body, &out);
-                last.*.buf.*.flags.last_buf = true;
+                last.*.buf.*.flags.last_buf = (r == r.*.main);
                 last.*.buf.*.flags.last_in_chain = true;
                 r.*.request_body.*.bufs = last;
             }
@@ -1002,7 +1025,7 @@ fn execute_oaep_action(
     };
     var chain = NChain.init(r.*.pool);
     const last = try chain.allocStr(msg, &out);
-    last.*.buf.*.flags.last_buf = true;
+    last.*.buf.*.flags.last_buf = (r == r.*.main);
     last.*.buf.*.flags.last_in_chain = true;
 
     return send_body(r, out.next);

@@ -4,7 +4,7 @@ Content handler and filter module for outputting text, variables, and request bo
 
 ### Status
 
-**Implemented** - Core directives complete with 11 passing tests
+**Implemented** - Core directives complete with Bun coverage in `tests/echoz/`
 
 ### Features
 
@@ -13,7 +13,7 @@ Content handler and filter module for outputting text, variables, and request bo
 - [x] **Request Body Echo** - Output the request body content
 - [x] **String Duplication** - Repeat a string N times
 - [x] **Internal Redirects** - Redirect to named or regular locations
-- [x] **Async Subrequests** - Fire-and-forget subrequests to other locations
+- [x] **Async Subrequests** - Background fire-and-forget subrequests to other locations
 - [x] **Body Filters** - Prepend/append content to responses
 - [x] **Response Headers** - Set custom status codes and headers
 
@@ -29,7 +29,7 @@ Content handler and filter module for outputting text, variables, and request bo
 | `echoz_request_body` | - | location | Output request body |
 | `echoz_read_request_body` | - | location | Read request body into memory |
 | `echoz_exec` | `<location>` | location | Internal redirect to location |
-| `echoz_location_async` | `<location>` | location | Async subrequest (fire-and-forget) |
+| `echoz_location_async` | `<location>` | location | Background header-only subrequest (fire-and-forget) |
 | `echoz_before_body` | `<string>` | location | Prepend to response body (filter) |
 | `echoz_after_body` | `<string>` | location | Append to response body (filter) |
 | `echoz_status` | `<code>` | location | Set response status code |
@@ -123,6 +123,13 @@ The module provides two nginx modules in one:
    - Runs in output filter chain
    - Modifies responses from other handlers
 
+### Subrequest Semantics
+
+- `echozn` is safe as a subrequest target for `auth_request`, SSI, and mirror.
+- `echozn` does not emit a response body for `header_only` subrequests.
+- `echoz_location_async` now creates true background subrequests. The child response is discarded and not merged back into the parent response.
+- If you want the child body to appear in the parent response, use a foreground subrequest mechanism such as SSI rather than `echoz_location_async`.
+
 ### Test Coverage
 
 - `echoz` outputs text with newline
@@ -133,7 +140,8 @@ The module provides two nginx modules in one:
 - `echoz_exec` redirects to named locations
 - `echoz_exec` redirects to regular locations
 - `echoz_request_body` echoes POST body
-- `echoz_location_async` fires async subrequests
+- `echoz_location_async` issues detached background subrequests
+- `echozn` behaves correctly as an `auth_request`, SSI, and mirror target
 
 ### References
 
@@ -145,4 +153,4 @@ The module provides two nginx modules in one:
 - [x] Bun integration coverage exists at `tests/echoz/`.
 - [x] Gap recorded: README documents `echoz_status <code>`, but the current command surface and passing coverage use `echoz_status <code> <reason>`.
 - [x] Gap recorded: Bun guardrails for `echoz_flush`, `echoz_status`, `echoz_header`, and body-filter wrapping were added in this audit pass because those observable behaviors were implemented but previously unasserted.
-- [x] No additional documentation gaps were identified in this audit pass.
+- [x] Gap closed: README now documents true background semantics for `echoz_location_async` and bodyless `header_only` subrequest behavior for `echozn`.

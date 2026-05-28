@@ -1,5 +1,10 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { startNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
+import {
+  startNginz,
+  stopNginz,
+  cleanupRuntime,
+  TEST_URL,
+} from "../harness.js";
 
 const MODULE = "echoz";
 
@@ -49,6 +54,12 @@ describe("echoz module", () => {
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toBe("nonewline");
+    });
+
+    test("HEAD request stays bodyless", async () => {
+      const res = await fetch(`${TEST_URL}/echon`, { method: "HEAD" });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("");
     });
   });
 
@@ -105,9 +116,37 @@ describe("echoz module", () => {
       const res = await fetch(`${TEST_URL}/main`);
       expect(res.status).toBe(200);
       const body = await res.text();
-      // Main request continues, subrequest runs async
-      expect(body).toContain("before");
-      expect(body).toContain("after");
+      expect(body).toBe("before\nafter\n");
+    });
+
+    test("survives repeated subrequest fanout", async () => {
+      for (let i = 0; i < 3; i++) {
+        const res = await fetch(`${TEST_URL}/main`);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("before\nafter\n");
+      }
+    });
+  });
+
+  describe("echozn as subrequest target", () => {
+    test("auth_request can use echozn target", async () => {
+      const res = await fetch(`${TEST_URL}/auth-gate`);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("granted");
+    });
+
+    test("SSI can include echozn target without adding newline", async () => {
+      const res = await fetch(`${TEST_URL}/ssi-snippet`);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("preXpost");
+    });
+
+    test("mirror can target echozn repeatedly without crashing worker", async () => {
+      for (let i = 0; i < 3; i++) {
+        const res = await fetch(`${TEST_URL}/mirror-snippet`);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("mirror-ok");
+      }
     });
   });
 

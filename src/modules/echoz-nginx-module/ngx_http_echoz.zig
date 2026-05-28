@@ -227,6 +227,15 @@ fn send_body(
     chain: [*c]ngx_chain_t,
 ) ZError!void {
     try send_header(r, ctx);
+    if (r.*.flags1.header_only) {
+        if (r.*.flags1.background) {
+            return;
+        }
+        if (http.ngx_http_send_special(r, http.NGX_HTTP_LAST) != NGX_OK) {
+            return ZError.BODY_ERROR;
+        }
+        return;
+    }
     if (chain != core.nullptr(ngx_chain_t)) {
         if (http.ngx_http_output_filter(r, chain) != NGX_OK) {
             return ZError.BODY_ERROR;
@@ -326,8 +335,9 @@ fn echoz_exec_command(
         },
         .echoz_location_async => {
             const s2 = try parse_uri(r, &parameters);
-            const sr = try NSubrequest.create(r, s2, s2 + 1);
+            const sr = try NSubrequest.createWithFlags(r, s2, s2 + 1, NSubrequest.BACKGROUND);
             sr.*.header_in = r.*.header_in;
+            sr.*.flags1.header_only = true;
         },
         .echoz_request_body => {
             if (r.*.request_body != core.nullptr(http.ngx_http_request_body_t)) {

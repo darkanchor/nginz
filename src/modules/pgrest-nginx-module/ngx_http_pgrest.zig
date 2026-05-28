@@ -9146,9 +9146,27 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
     ctx.*.request = null;
     release_pooled_ctx(ctx, false);
 
-    // Mirror background subrequests (header_only + background): fire-and-forget.
-    if (r.*.flags1.header_only and r.*.flags1.background) {
-        http.ngx_http_finalize_request(r, core.NGX_OK);
+    // header_only subrequests (auth_request: header_only=1, background=0; mirror
+    // is already caught at handler entry by the background guard there).
+    // auth_request reads headers_out.status, so we still need to send headers —
+    // but must NOT output the body, which would leak into the parent's postponed
+    // output chain and corrupt the response.
+    if (r.*.flags1.header_only) {
+        const rc = finalize_response_send(
+            r,
+            response_body_buf,
+            response_len,
+            content_type,
+            ntuples,
+            ctx.*.response_range_start,
+            if (ctx.*.has_total_count) ctx.*.total_count else null,
+            opts,
+            ctx.*.write_status,
+            false,
+        );
+        const c = r.*.connection;
+        http.ngx_http_finalize_request(r, rc);
+        http.ngx_http_run_posted_requests(c);
         return;
     }
 

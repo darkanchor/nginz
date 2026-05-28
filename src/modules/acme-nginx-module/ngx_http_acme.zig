@@ -2352,7 +2352,7 @@ fn send_challenge_response(r: [*c]ngx_http_request_t, key_auth: ngx_str_t) ngx_i
 
     // Mark as last buffer
     if (out.next != core.nullptr(ngx_chain_t) and out.next.*.buf != core.nullptr(ngx_buf_t)) {
-        out.next.*.buf.*.flags.last_buf = true;
+        out.next.*.buf.*.flags.last_buf = (r == r.*.main);
         out.next.*.buf.*.flags.last_in_chain = true;
     }
 
@@ -3010,6 +3010,12 @@ export fn ngx_http_acme_trigger_handler(r: [*c]ngx_http_request_t) callconv(.c) 
         return NGX_DECLINED;
     }
 
+    // The trigger advances shared ACME session state and can place outbound
+    // orders. Keep that surface on main requests only.
+    if (r != r.*.main) {
+        return http.NGX_HTTP_FORBIDDEN;
+    }
+
     // Get main config
     const mcf = core.castPtr(acme_main_conf, conf.ngx_http_get_module_main_conf(r, &ngx_http_acme_module)) orelse {
         return NGX_DECLINED;
@@ -3187,7 +3193,7 @@ fn send_acme_status(r: [*c]ngx_http_request_t, status: []const u8, message: []co
     };
 
     if (out.next != core.nullptr(ngx_chain_t) and out.next.*.buf != core.nullptr(ngx_buf_t)) {
-        out.next.*.buf.*.flags.last_buf = true;
+        out.next.*.buf.*.flags.last_buf = (r == r.*.main);
         out.next.*.buf.*.flags.last_in_chain = true;
     }
 
@@ -3218,14 +3224,14 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     zone.*.init = ngx_http_acme_zone_init;
     ngx_http_acme_zone = zone;
 
-    // Register handlers in ACCESS phase - this runs before content handlers
-    // and allows us to intercept requests regardless of location content handler
+    // Register in PREACCESS so these URI guards also run for subrequests.
+    // Nginx core skips the ACCESS phase entirely for subrequests.
     const cmcf = core.castPtr(http.ngx_http_core_main_conf_t, conf.ngx_http_conf_get_module_main_conf(cf, &ngx_http_core_module)) orelse {
         return NGX_ERROR;
     };
 
     var handlers = NArray(http.ngx_http_handler_pt).init0(
-        &cmcf[0].phases[http.NGX_HTTP_ACCESS_PHASE].handlers,
+        &cmcf[0].phases[http.NGX_HTTP_PREACCESS_PHASE].handlers,
     );
 
     // Register challenge handler

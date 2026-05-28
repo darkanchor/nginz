@@ -214,6 +214,46 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
     expect(after.generation).toBe(before.generation);
     expect(after.peer_count).toBe(before.peer_count);
   });
+
+  test("rapid successive PUT snapshots remain coherent to concurrent readers", async () => {
+    const payloads = [
+      { peers: [{ address: "127.0.0.1:19002", weight: 1 }] },
+      {
+        peers: [
+          { address: "127.0.0.1:19002", weight: 2 },
+          { address: "127.0.0.1:19003", weight: 1 },
+        ],
+      },
+      { peers: [{ address: "127.0.0.1:19003", weight: 1 }] },
+    ];
+
+    const reader = (async () => {
+      for (let i = 0; i < 18; i++) {
+        const res = await fetch(`${TEST_URL}/dynamic-upstreams`);
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.peer_count).toBe(body.peers.length);
+        for (const peer of body.peers) {
+          expect(typeof peer.address).toBe("string");
+        }
+        await Bun.sleep(10);
+      }
+    })();
+
+    for (const payload of payloads) {
+      const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      expect(res.status).toBe(200);
+    }
+
+    await reader;
+
+    const final = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    expect(final.peers).toEqual([{ address: "127.0.0.1:19003", weight: 1 }]);
+  });
 });
 
 describe("dynamic-upstreams Phase 3 — operational fields and worker-events fanout", () => {

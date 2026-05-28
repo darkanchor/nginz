@@ -33,6 +33,8 @@ Fetch key material (JWKS or keyval) via an nginx subrequest. The subrequest resp
 
 If a variable-based URL resolves to an empty or missing value at request time, no subrequest is issued for that entry. If this leaves no key material available, the request is rejected with 401.
 
+Subrequest note: if the protected JWT location itself is executed as a subrequest, the default `access` phase behavior is skipped by nginx core. Use `jwt_phase preaccess;` for locations that must enforce JWT inside subrequests.
+
 ```nginx
 # Minimal: inline JWKS served from a return directive (no upstream round-trip)
 location /jwks {
@@ -345,6 +347,8 @@ Progress from implemented parity waves:
 - order-sensitive overflow regression proves declaration-order accumulation under parallel completion
 - invalid runtime URI regression proves the subrequest creation-failure path fails closed
 - nested subrequest probe confirms `jwt_key_request` is skipped when the protected location is executed as a subrequest
+- preaccess nested probe confirms JWT enforcement resumes when the protected inner location opts into `jwt_phase preaccess`
+- query-variable token source (`jwt_secret token=$arg_token`) is covered for request-time validation and no longer relies on request-time variable index lookup
 
 #### Follow-up TODOs
 

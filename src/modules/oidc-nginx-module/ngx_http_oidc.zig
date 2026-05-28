@@ -2022,13 +2022,17 @@ fn sendError(r: [*c]ngx_http_request_t, status: ngx_uint_t, message: []const u8)
         return rc;
     }
 
+    if (r.*.flags1.header_only) {
+        return http.ngx_http_send_special(r, http.NGX_HTTP_LAST);
+    }
+
     // Create response body
     const b = core.castPtr(ngx_buf_t, core.ngx_pcalloc(r.*.pool, @sizeOf(ngx_buf_t))) orelse return NGX_ERROR;
 
     b.*.pos = @constCast(message.ptr);
     b.*.last = @constCast(message.ptr) + message.len;
     b.*.flags.memory = true;
-    b.*.flags.last_buf = true;
+    b.*.flags.last_buf = (r == r.*.main);
     b.*.flags.last_in_chain = true;
 
     var out: ngx_chain_t = undefined;
@@ -2085,8 +2089,12 @@ export fn ngx_http_oidc_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_
         return handleCallback(r, lccf, rctx);
     }
 
-    // No session, not callback - redirect to authorization endpoint
+    // No session, not callback - redirect browser traffic to the authorization
+    // endpoint, but fail closed for any subrequest shape.
     rctx.*.done = 1;
+    if (r != r.*.main) {
+        return http.NGX_HTTP_UNAUTHORIZED;
+    }
     return redirectToAuthorization(r, lccf, rctx);
 }
 
@@ -2317,14 +2325,15 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         }
     }
 
-    // Register access phase handler
+    // Register in PREACCESS so the guard also runs for subrequests. Nginx's
+    // ACCESS phase is skipped for subrequests in core.
     const cmcf = core.castPtr(
         http.ngx_http_core_main_conf_t,
         conf.ngx_http_conf_get_module_main_conf(cf, &ngx_http_core_module),
     ) orelse return NGX_ERROR;
 
     var handlers = NArray(http.ngx_http_handler_pt).init0(
-        &cmcf[0].phases[http.NGX_HTTP_ACCESS_PHASE].handlers,
+        &cmcf[0].phases[http.NGX_HTTP_PREACCESS_PHASE].handlers,
     );
     const h = handlers.append() catch return NGX_ERROR;
     h.* = ngx_http_oidc_handler;
