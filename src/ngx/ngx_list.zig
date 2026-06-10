@@ -131,7 +131,7 @@ pub fn NSList(comptime T: type) type {
         node: [*c]T,
         next: [*c]Self,
 
-        pub fn init(pool: core.ngx_pool_t) ![*c]Self {
+        pub fn init(pool: [*c]core.ngx_pool_t) ![*c]Self {
             if (core.ngz_pcalloc_c(Self, pool)) |n| {
                 n.*.node = core.nullptr(T);
                 n.*.next = core.nullptr(Self);

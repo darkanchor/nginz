@@ -269,7 +269,7 @@ pub const NChain = extern struct {
     }
 
     pub fn free(self: *Self, cl: [*c]ngx_chain_t) void {
-        cl.*.buf.*.last = cl.*.buf.*.pos;
+        if (cl.*.buf != core.nullptr(ngx_buf_t)) cl.*.buf.*.last = cl.*.buf.*.pos;
         ngx_free_chain(self.pool, cl);
     }
 

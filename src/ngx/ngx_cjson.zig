@@ -192,8 +192,10 @@ pub const CJSON = extern struct {
             }
             if (i > 1) {
                 if (d == null) { // object
+                    const key_slice = path[1..i];
+                    if (key_slice.len >= 256) return null;
                     var key: [256]u8 = std.mem.zeroes([256]u8);
-                    @memcpy(key[0..path[1..i].len], path[1..i]);
+                    @memcpy(key[0..key_slice.len], key_slice);
                     return query(cJSON_GetObjectItem(j, &key), path[i..]);
                 } else { // array
                     return query(cJSON_GetArrayItem(j, @intCast(d.?)), path[i..]);
@@ -270,16 +272,18 @@ pub const CJSON = extern struct {
     }
 
     pub fn encode(self: *Self, j: [*c]cJSON) !ngx_str_t {
+        const MAX_ENCODE_SIZE: usize = 16 * 1024 * 1024;
         if (core.castPtr(core.ngx_pool_t, self.alloc.ctx)) |pool| {
             var size: usize = CJSON_BUFFER_LENTH;
             var len: usize = 0;
-            while (core.castPtr(u8, core.ngx_pnalloc(pool, size))) |p| {
+            while (size <= MAX_ENCODE_SIZE) {
+                const raw = core.ngx_pnalloc(pool, size) orelse break;
+                const p = core.castPtr(u8, raw) orelse break;
                 const b = cJSON_PrintPreallocated(j, p, @as(c_int, @intCast(size)), 0, &len);
                 if (b == 1) {
                     return ngx_str_t{ .len = len, .data = p };
-                } else {
-                    size *= 2;
                 }
+                size *= 2;
             }
         }
         return core.NError.OOM;
@@ -340,5 +344,12 @@ test "cjson" {
     const j = try cj.encode(parsed);
     try expectEqual(j.len, 62);
     // std.debug.print("{s}", .{core.slicify(u8, j.data, j.len)});
+
+    var long_key_path: [300]u8 = undefined;
+    long_key_path[0] = '$';
+    long_key_path[1] = '.';
+    @memset(long_key_path[2..], 'k');
+    try expectEqual(CJSON.query(parsed, long_key_path[0..]), null);
+
     cj.free(parsed);
 }

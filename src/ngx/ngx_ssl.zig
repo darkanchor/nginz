@@ -311,7 +311,7 @@ pub const NSSL_RSA = extern struct {
     }
 
     pub fn sign_sha256(self: *Self, msg: ngx_str_t, pool: [*c]ngx_pool_t) !ngx_str_t {
-        var buf: [256]u8 = undefined;
+        var buf: [512]u8 = undefined; // 512 bytes accommodates RSA-4096 signatures
         var len: usize = buf.len;
         if (core.castPtr(u8, core.ngx_pnalloc(pool, ngx_base64_encoded_length(len)))) |p| {
             defer _ = EVP_MD_CTX_reset(self.md_ctx);

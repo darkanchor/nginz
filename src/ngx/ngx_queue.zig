@@ -165,7 +165,7 @@ pub fn NQueue(comptime T: type, comptime field: []const u8) type {
         }
 
         pub fn reverse_iterator(self: *Self) ReverseIterator {
-            return Iterator{ .q = self.sentinel, .n = ngx_queue_prev(self.sentinel) };
+            return ReverseIterator{ .q = self.sentinel, .n = ngx_queue_prev(self.sentinel) };
         }
 
         pub fn size(self: *Self) ngx_uint_t {
@@ -256,4 +256,15 @@ test "queue" {
     }
     try expectEqual(q0.size(), total);
     try expectEqual(q0.at(total), null);
+
+    var rit = q0.reverse_iterator();
+    var rev_count: ngx_uint_t = 0;
+    var prev_n: ngx_uint_t = 5;
+    while (rit.next()) |elem| {
+        try std.testing.expect(elem.*.n < prev_n);
+        prev_n = elem.*.n;
+        rev_count += 1;
+    }
+    try expectEqual(rev_count, 5);
+    try expectEqual(prev_n, 0);
 }

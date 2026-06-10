@@ -97,6 +97,7 @@ pub const PGRES_POLLING_WRITING = pq.PGRES_POLLING_WRITING;
 pub const PGRES_POLLING_OK = pq.PGRES_POLLING_OK;
 
 pub fn is_valid_pq_conn(con: ngx_str_t, err: [*c]u8) bool {
+    if (con.len >= 256) return false;
     var str: [256]u8 = std.mem.zeroes([256]u8);
     core.ngz_memcpy(&str, con.data, con.len);
     const info = PQconninfoParse(&str, @constCast(&err));
@@ -113,4 +114,9 @@ const ngx_log_init = ngx.ngx_log_init;
 const ngx_create_pool = ngx.ngx_create_pool;
 const ngx_destroy_pool = ngx.ngx_destroy_pool;
 
-test "pq" {}
+test "pq" {
+    var long_dsn_buf: [300]u8 = undefined;
+    @memset(&long_dsn_buf, 'x');
+    const long_dsn = ngx_str_t{ .len = long_dsn_buf.len, .data = &long_dsn_buf };
+    try std.testing.expect(!is_valid_pq_conn(long_dsn, core.nullptr(u8)));
+}

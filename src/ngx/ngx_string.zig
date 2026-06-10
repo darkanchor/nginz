@@ -92,7 +92,7 @@ pub inline fn ngx_tolower(c: u8) u8 {
 }
 
 pub inline fn ngx_toupper(c: u8) u8 {
-    return if (c >= 'a' and c <= 'a') c & ~0x20 else c;
+    return if (c >= 'a' and c <= 'z') c & ~@as(u8, 0x20) else c;
 }
 
 pub inline fn eql(s0: ngx_str_t, s1: ngx_str_t) bool {
@@ -118,6 +118,16 @@ pub inline fn ngx_strlchr(p: [*c]u_char, last: [*c]u_char, c: u_char) [*c]u_char
 const ngx_log_init = ngx.ngx_log_init;
 const ngx_create_pool = ngx.ngx_create_pool;
 const ngx_destroy_pool = ngx.ngx_destroy_pool;
+test "ngx_toupper" {
+    for ('a'..'z' + 1) |c| {
+        const upper = ngx_toupper(@intCast(c));
+        try expectEqual(upper, @as(u8, @intCast(c)) & ~@as(u8, 0x20));
+    }
+    try expectEqual(ngx_toupper('A'), 'A');
+    try expectEqual(ngx_toupper('0'), '0');
+    try expectEqual(ngx_toupper(' '), ' ');
+}
+
 test "string" {
     try expectEqual(@sizeOf(ngx_str_t), 16);
     const log = ngx_log_init(core.c_str(""), core.c_str(""));
