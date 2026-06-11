@@ -276,7 +276,7 @@ pub const NChain = extern struct {
     pub fn freeN(self: *Self, cl: [*c]ngx_chain_t) void {
         var last: [*c]ngx_chain_t = cl;
         while (last.*.next != NP) {
-            last.*.buf.*.last = last.*.buf.*.pos;
+            if (last.*.buf != core.nullptr(ngx_buf_t)) last.*.buf.*.last = last.*.buf.*.pos;
             last = last.*.next;
         }
         last.*.next = self.pool.*.chain;
