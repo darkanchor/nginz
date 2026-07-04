@@ -8,6 +8,7 @@
  * - OIDC: HTTP-based OAuth2/OpenID Connect provider
  * - ACME: HTTP-based Let's Encrypt protocol
  * - HTTP: Generic HTTP upstream with configurable responses
+ * - MQTT: TCP-based CONNECT capture mock
  */
 
 export { RedisMock, createRedisMock } from "./redis.js";
@@ -15,6 +16,7 @@ export { PostgresMock, createPostgresMock } from "./postgres.js";
 export { ConsulMock, createConsulMock } from "./consul.js";
 export { OIDCMock, createOIDCMock } from "./oidc.js";
 export { ACMEMock, createACMEMock } from "./acme.js";
+export { MqttMock, createMqttMock, buildMqttConnect, parseMqttConnect } from "./mqtt.js";
 export {
   signWechatpayMessage,
   buildWechatpayHeaders,

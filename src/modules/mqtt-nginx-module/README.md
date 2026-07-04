@@ -6,7 +6,7 @@ stream modules while keeping the implementation in nginz/Zig.
 
 ## Status
 
-**Scaffolded, not feature-ready.**
+**Current MQTT module design implemented.**
 
 Implemented:
 
@@ -21,17 +21,34 @@ Implemented:
   `password`.
 - Stream filter hook installation.
 - Static nginz registration, package metadata, and dynmod eligibility.
+- Bounds-checked MQTT CONNECT parser for MQTT 3.1.1 and MQTT 5.0.
+- Preread population for `$mqtt_preread_clientid` and
+  `$mqtt_preread_username`.
+- Client-to-upstream CONNECT rewrite with buffering for split CONNECT packets.
+- Minimal TCP MQTT mock and packet helpers for stream integration tests.
+- Runtime stream proxy test that captures rewritten CONNECT fields at a mock
+  broker.
+- Runtime rewrite matrix coverage for adding, replacing, and removing
+  username/password fields.
+- Malformed CONNECT runtime behavior for preread-only and rewrite-enabled modes.
+- Split CONNECT runtime behavior for preread-only variable extraction.
+- Runtime MQTT 5 broker-proxy coverage with CONNECT properties.
+- TLS-terminated MQTT stream config and runtime coverage.
+- Phase 5 hardening guardrails: fuzz-like parser coverage, checked parser and
+  rewrite arithmetic, explicit rewrite buffer limit, and malformed/overflow
+  logging.
 
 Not implemented yet:
 
-- MQTT CONNECT parser.
-- Population of `$mqtt_preread_clientid` and `$mqtt_preread_username`.
-- CONNECT rewrite in the stream filter.
-- MQTT 5 property preservation tests.
-- Integration tests against a broker or TCP harness.
+- Broker-specific authentication/authorization.
+- MQTT packet inspection beyond the initial CONNECT packet.
+- MQTTS passthrough inspection without nginx stream SSL termination.
 
-The scaffold is intentionally conservative: enabled directives should not change
-traffic behavior until the parser and rewriter land.
+The implementation is still conservative: preread parsing is usable for stream
+routing, and rewrite is covered for split CONNECT frames and the main
+username/password mutation cases. Remaining work is compatibility expansion
+outside the current module scope rather than core CONNECT parsing/rewrite
+mechanics.
 
 ## Purpose and Boundaries
 
@@ -77,12 +94,13 @@ MQTT CONNECT packet visible and optionally rewritable inside the stream pipeline
 - `$mqtt_preread_clientid` and `$mqtt_preread_username` are registered as stream
   variables.
 - The preread module installs a stream preread phase handler.
-- The filter module wraps the stream top filter and currently passes chains
-  through unchanged.
+- The filter module wraps the stream top filter and rewrites the first complete
+  client-to-upstream CONNECT frame when `mqtt on;` and `mqtt_set_connect` are
+  configured.
 - Build, static registration, package metadata, and nginx config fixtures are
   wired.
-- The CONNECT parser and rewriter are not implemented yet; variables are not
-  populated and traffic is not modified.
+- The rewrite implementation buffers split CONNECT packets until the first full
+  frame is available.
 
 ## Current Test Coverage
 
@@ -92,12 +110,39 @@ MQTT CONNECT packet visible and optionally rewritable inside the stream pipeline
 - `nginx -t` accepts a valid stream config using `mqtt_preread`, `mqtt`,
   `mqtt_set_connect`, `upstream`, `hash`, and `proxy_pass`
 - unsupported `mqtt_set_connect` fields fail config testing
+- a live stream `return $mqtt_preread_username` fixture returns the username from
+  a real MQTT 3.1.1 CONNECT packet
+- repeated MQTT 3.1.1 CONNECT packets with the same client ID route to the same
+  stream upstream peer when the upstream uses `hash $mqtt_preread_clientid
+  consistent`
+- the mock broker observes rewritten `clientid`, `username`, and `password`
+  values while returning an unchanged MQTT CONNACK to the client
+- split CONNECT packets are buffered and rewritten before proxying
+- username/password add, replace, and remove cases update payload fields and
+  CONNECT flags as expected
+- malformed preread-only CONNECT leaves variables not found
+- malformed rewrite-enabled CONNECT fails closed before the mock broker observes
+  a CONNECT
+- MQTT 5 CONNECT packets with non-empty CONNECT properties are proxied and
+  rewritten
+- TLS-terminated MQTT streams are decrypted by nginx before MQTT preread and
+  rewrite
+- split CONNECT packets in preread-only mode return `NGX_AGAIN` until enough
+  bytes arrive to populate variables
 - the MQTT Zig module is included in `build.zig`
 - both exported MQTT stream modules are registered in `src/ngz_modules.zig`
 - package metadata marks both MQTT modules as `STREAM`
 
-The current tests are configuration and registration guardrails only. Runtime
-MQTT packet tests are exit criteria for parser and rewrite phases.
+Zig unit tests in `ngx_stream_mqtt.zig` cover MQTT remaining-length parsing,
+MQTT 3.1.1 CONNECT extraction, MQTT 5 CONNECT extraction, incomplete frames,
+invalid packet types, invalid CONNECT flags, and malformed variable-byte
+remaining lengths. They also cover the CONNECT rewrite frame builder, including
+client ID replacement, username replacement, password addition, remaining-length
+re-encoding, CONNECT flag updates, auth-field edge cases, and byte-for-byte
+preservation of MQTT 5 CONNECT properties and Will fields.
+
+The current module design is implemented; production rollout should still include
+site-specific broker compatibility and operational testing.
 
 ## Example Configuration
 
@@ -402,11 +447,12 @@ The filter should not mutate nginx buffers in place. It should allocate a new
 temporary buffer for the rewritten CONNECT frame and pass through the rest of the
 chain unchanged when possible.
 
-## Dynamic Upstream and Routing Contract
+## Stream Upstream and Routing Contract
 
 This module is a routing signal producer, not an upstream manager.
 
-The intended dynamic-upstream integration is:
+The currently supported upstream integration is nginx stream upstream selection
+using MQTT preread variables:
 
 ```nginx
 stream {
@@ -427,7 +473,7 @@ stream {
 }
 ```
 
-The upstream module, dynamic-upstreams module, or nginx core upstream code owns:
+The stream upstream module or nginx core stream upstream code owns:
 
 - peer membership
 - peer health and draining
@@ -438,6 +484,25 @@ The upstream module, dynamic-upstreams module, or nginx core upstream code owns:
 The MQTT module owns only the variable values that the stream upstream selector
 may consume.
 
+Important current-repo boundary: `dynamic-upstreams` is an **HTTP upstream**
+module today. It is implemented as `ngx_http_dynamic_upstreams_module`, its API
+lives in HTTP `location` context, and its peer-source handoff targets
+`ngx_http_upstream_srv_conf_t` / `ngx_http_upstream_rr_peers_t`. It does not
+currently manage `stream { upstream ... }` groups and cannot directly mutate the
+MQTT broker upstream list.
+
+To make runtime broker membership updates work for MQTT stream traffic, nginz
+would need a separate stream-side dynamic upstream implementation or a shared
+HTTP/stream peer-store abstraction with stream-specific adapters. That future
+work would need to target `ngx_stream_upstream_srv_conf_t` and
+`ngx_stream_upstream_rr_peers_t`, and it would need stream peer-source hooks
+equivalent to the current HTTP `upstream-balancer` / `dynamic-upstreams`
+contract.
+
+That stream dynamic-upstream work is outside this MQTT module's current design
+scope. MQTT contributes stable preread variables; stream upstream membership and
+peer snapshots belong to stream upstream infrastructure.
+
 Required behavior:
 
 - Variables must be available before stream upstream peer selection begins.
@@ -445,22 +510,10 @@ Required behavior:
   a stable byte-for-byte variable value across repeated connections.
 - If parsing fails in preread-only mode, variables are marked not found; routing
   then follows the configured nginx behavior for an empty/not-found variable.
-- Dynamic upstream membership changes may move clients according to the upstream
-  module's own consistent-hash semantics. The MQTT module must not cache selected
-  peers or depend on a specific upstream generation.
 - When `mqtt_set_connect clientid ...` rewrites the client ID, routing still uses
   the preread value seen before upstream selection unless the config explicitly
   hashes another variable. The rewrite path must not retroactively change the
   selected upstream.
-
-Traceability with `dynamic-upstreams`:
-
-| Requirement / claim | Evidence |
-|---|---|
-| MQTT variables are used only as routing inputs, not peer-table state | MQTT README boundary + stream config fixtures |
-| Dynamic peer snapshots remain owned by `dynamic-upstreams` / balancer modules | `src/modules/dynamic-upstreams-nginx-module/README.md` |
-| Sticky MQTT routing works across repeated connections | Future runtime test: same clientid reaches same backend with unchanged upstream generation |
-| Dynamic peer updates do not require MQTT module state migration | Future integration test with updated peer generation and no MQTT session-cache dependency |
 
 ## TLS Boundary
 
@@ -516,7 +569,8 @@ Preread-only mode:
 Rewrite mode:
 
 - Malformed CONNECT: fail the session.
-- Rewrite buffer overflow: fail the session.
+- Rewrite buffer overflow: fail the session. The current client-to-upstream
+  rewrite buffer limit is 1 MiB.
 - Complex value evaluation failure: fail the session.
 
 This split keeps routing useful for imperfect clients while ensuring the module
@@ -530,7 +584,12 @@ Unit tests:
   overflow, incomplete.
 - MQTT UTF-8 string bounds parser.
 - CONNECT parser for MQTT 3.1.1 and 5.0.
+- Deterministic fuzz-like parser coverage for random truncated and malformed
+  frames.
 - Optional username/password and will-field skipping.
+- Checked arithmetic for parser cursor movement, MQTT remaining-length math,
+  rewrite length deltas, and output offsets.
+- Explicit rewrite buffer-limit checks.
 - Rewriter length-delta cases:
   - same-length clientid
   - longer clientid
@@ -551,17 +610,20 @@ Integration tests:
 - `hash $mqtt_preread_clientid consistent;` routes repeat connections to the
   same backend.
 - `$mqtt_preread_username` is available in stream logs.
+- Split preread CONNECT packets wait for enough bytes before variables resolve.
 - Backend receives rewritten CONNECT fields.
 - Non-CONNECT first packet is passed through when only preread is enabled.
 - Malformed CONNECT closes when rewrite is enabled.
-- Dynamic upstream generation changes do not require MQTT session state and do
-  not crash active or new MQTT connections.
+- Malformed rewrite failures emit clear stream error-log messages.
+- TLS passthrough bytes are not interpreted as MQTT when nginx does not
+  terminate TLS before MQTT preread.
 
 Manual compatibility tests:
 
 - Mosquitto client against a Mosquitto backend.
 - MQTT 5 client with properties preserved.
 - TLS termination in nginx stream SSL before MQTT parsing.
+- MQTTS passthrough through a stream proxy without MQTT preread or rewrite.
 
 ## Traceability and Audit Hooks
 
@@ -571,16 +633,19 @@ Manual compatibility tests:
 | Unsupported rewrite fields fail config load | `tests/mqtt/nginx-invalid-field.conf` + negative test |
 | Both MQTT modules are stream modules in package metadata | `tests/mqtt/mqtt.test.js` package assertions |
 | Module registration includes preread and filter exports | `tests/mqtt/mqtt.test.js` registration assertions |
-| Preread variables are known to nginx | Current source registration; future runtime variable test |
-| CONNECT parser is bounds-safe | Future Zig unit tests for truncated and malformed packets |
-| Rewrite preserves MQTT frame structure | Future backend harness tests comparing parsed CONNECT fields |
-| TLS is nginx-owned, not module-owned | README TLS boundary + future stream SSL config fixture |
+| Preread variables are known to nginx | Runtime `return $mqtt_preread_username` test |
+| CONNECT parser is bounds-safe | Zig unit tests for truncated and malformed packets |
+| Rewrite preserves MQTT frame structure | Zig rewrite unit tests + backend mock field assertions |
+| TLS is nginx-owned, not module-owned | README TLS boundary + `tests/mqtt/nginx-tls.conf` runtime fixture + TLS passthrough negative test |
+| Parser malformed-input handling is bounded | Deterministic fuzz-like Zig parser test |
+| Rewrite buffer limit is explicit | `MQTT_REWRITE_BUFFER_LIMIT` Zig test |
+| Malformed rewrite failures are logged | Runtime malformed rewrite error-log assertion |
 
 ## Implementation Phases
 
 ### Phase 1 - Scaffold
 
-Current state: mostly complete.
+Complete.
 
 Exit criteria:
 
@@ -598,13 +663,14 @@ Implement CONNECT parser and variable population.
 
 Exit criteria:
 
-- [ ] `$mqtt_preread_clientid` works for MQTT 3.1.1.
-- [ ] `$mqtt_preread_username` works for MQTT 3.1.1.
-- [ ] `$mqtt_preread_clientid` works for MQTT 5.
-- [ ] `$mqtt_preread_username` works for MQTT 5.
-- [ ] Hash routing by client ID is covered by integration tests.
-- [ ] Incomplete packet handling is bounded and returns `NGX_AGAIN` correctly.
-- [ ] Malformed CONNECT in preread-only mode marks variables not found without
+- [x] `$mqtt_preread_clientid` parser support works for MQTT 3.1.1.
+- [x] `$mqtt_preread_username` parser support works for MQTT 3.1.1.
+- [x] `$mqtt_preread_clientid` parser support works for MQTT 5.
+- [x] `$mqtt_preread_username` parser support works for MQTT 5.
+- [x] Live stream preread variable test covers MQTT 3.1.1 username extraction.
+- [x] Hash routing by client ID is covered by integration tests.
+- [x] Incomplete packet handling is bounded and returns `NGX_AGAIN` correctly.
+- [x] Malformed CONNECT in preread-only mode marks variables not found without
   crashing or mutating stream buffers.
 
 ### Phase 3 - CONNECT Rewrite
@@ -613,30 +679,17 @@ Implement client-to-upstream filter rewrite.
 
 Exit criteria:
 
-- [ ] `mqtt_set_connect clientid` rewrites the field.
-- [ ] `mqtt_set_connect username` adds, replaces, and removes the field.
-- [ ] `mqtt_set_connect password` adds, replaces, and removes the field.
-- [ ] MQTT remaining length is re-encoded correctly after size changes.
-- [ ] CONNECT flags are updated correctly when username/password are added or
+- [x] `mqtt_set_connect clientid` rewrites the field.
+- [x] `mqtt_set_connect username` adds, replaces, and removes the field.
+- [x] `mqtt_set_connect password` adds, replaces, and removes the field.
+- [x] MQTT remaining length is re-encoded correctly after size changes.
+- [x] CONNECT flags are updated correctly when username/password are added or
   removed.
-- [ ] MQTT 5 properties and will fields are preserved byte-for-byte.
-- [ ] Backend test harness observes modified CONNECT packets.
-- [ ] Server-to-client packets are passed through unchanged.
-
-### Phase 4 - TLS and Dynamic-Upstream Integration
-
-Prove the module behaves correctly at nginx integration boundaries.
-
-Exit criteria:
-
-- [ ] TLS-terminated MQTT config passes `nginx -t` with stream SSL enabled.
-- [ ] TLS-terminated runtime test proves MQTT variables are populated after
-  nginx decrypts the stream.
-- [ ] TLS passthrough limitation is covered by a negative or documented manual
-  test.
-- [ ] Dynamic-upstream membership changes do not require MQTT state migration.
-- [ ] Repeated client IDs preserve routing stability across unchanged upstream
-  generations.
+- [x] MQTT 5 properties and will fields are preserved byte-for-byte.
+- [x] Backend test harness observes modified CONNECT packets.
+- [x] Server-to-client packets are passed through unchanged.
+- [x] Split CONNECT packets are buffered until the full frame is available or a
+  bounded failure policy applies.
 
 ### Phase 5 - Hardening
 
@@ -644,18 +697,23 @@ Add production guardrails.
 
 Exit criteria:
 
-- [ ] Fuzz-like parser tests for truncated and malformed packets.
-- [ ] Clear error logging for malformed CONNECT and rewrite overflow.
-- [ ] Parser and rewrite paths use checked arithmetic for every offset and
+- [x] Fuzz-like parser tests for truncated and malformed packets.
+- [x] Clear error logging for malformed CONNECT and rewrite overflow.
+- [x] Parser and rewrite paths use checked arithmetic for every offset and
   length.
-- [ ] Rewrite buffer limits are explicit and test-backed.
-- [ ] README limitations reflect remaining unsupported MQTT features.
+- [x] Rewrite buffer limits are explicit and test-backed.
+- [x] README limitations reflect remaining unsupported MQTT features.
 
 ## Limitations
 
-- This module is a scaffold and currently does not parse or rewrite MQTT packets.
 - The design targets TCP stream proxying.
 - TLS inspection requires nginx stream SSL termination before MQTT parsing.
+- Runtime MQTT 5 coverage includes CONNECT properties. Will-field preservation
+  is currently covered at Zig unit level.
+- Only the initial CONNECT packet is parsed and optionally rewritten. Publish,
+  subscribe, ping, disconnect, and server-to-client packets are passed through.
+- CONNECT rewrite is limited to `clientid`, `username`, and `password`.
+- Client-to-upstream rewrite buffering is capped at 1 MiB.
 - No broker-specific authentication or authorization is planned here; credential
   semantics should remain in upstream broker policy or a separate auth module.
 
