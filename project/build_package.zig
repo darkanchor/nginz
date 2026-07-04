@@ -4,6 +4,7 @@ pub const ModuleType = enum {
     HTTP,
     HTTP_FILTER,
     HTTP_AUX_FILTER,
+    STREAM,
 };
 
 pub const ModuleInfo = struct {
@@ -162,6 +163,13 @@ pub const module_infos = [_]ModuleInfo{
         .source = "src/modules/prometheus-nginx-module/ngx_http_prometheus.zig",
         .modules = &.{"ngx_http_prometheus_module"},
         .types = &.{.HTTP},
+    },
+
+    // Stream Modules
+    .{
+        .source = "src/modules/mqtt-nginx-module/ngx_stream_mqtt.zig",
+        .modules = &.{ "ngx_stream_mqtt_preread_module", "ngx_stream_mqtt_filter_module" },
+        .types = &.{ .STREAM, .STREAM },
     },
 };
 
@@ -346,6 +354,7 @@ fn moduleTypeStr(comptime mod_type: ModuleType) []const u8 {
         .HTTP => "HTTP",
         .HTTP_FILTER => "HTTP_FILTER",
         .HTTP_AUX_FILTER => "HTTP_AUX_FILTER",
+        .STREAM => "STREAM",
     };
 }
 
@@ -355,6 +364,7 @@ fn moduleVarStr(comptime mod_type: ModuleType) []const u8 {
         .HTTP => "HTTP_MODULES",
         .HTTP_FILTER => "HTTP_FILTER_MODULES",
         .HTTP_AUX_FILTER => "HTTP_AUX_FILTER_MODULES",
+        .STREAM => "STREAM_MODULES",
     };
 }
 

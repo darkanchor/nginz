@@ -134,6 +134,8 @@ extern var ngx_http_prometheus_module: ngx_module_t;
 // Stream Modules
 extern var ngx_stream_module: ngx_module_t;
 extern var ngx_stream_core_module: ngx_module_t;
+extern var ngx_stream_proxy_module: ngx_module_t;
+extern var ngx_stream_upstream_module: ngx_module_t;
 extern var ngx_stream_ssl_module: ngx_module_t;
 extern var ngx_stream_realip_module: ngx_module_t;
 extern var ngx_stream_limit_conn_module: ngx_module_t;
@@ -150,6 +152,8 @@ extern var ngx_stream_upstream_random_module: ngx_module_t;
 extern var ngx_stream_upstream_zone_module: ngx_module_t;
 extern var ngx_stream_ssl_preread_module: ngx_module_t;
 extern var ngx_stream_write_filter_module: ngx_module_t;
+extern var ngx_stream_mqtt_preread_module: ngx_module_t;
+extern var ngx_stream_mqtt_filter_module: ngx_module_t;
 extern var ngx_stream_log_module: ngx_module_t;
 
 // Ordered list of modules (following nginx's module loading order)
@@ -292,6 +296,8 @@ export const ngx_modules = [_][*c]ngx_module_t{
     // Stream modules
     &ngx_stream_module,
     &ngx_stream_core_module,
+    &ngx_stream_proxy_module,
+    &ngx_stream_upstream_module,
     &ngx_stream_ssl_module,
     &ngx_stream_realip_module,
     &ngx_stream_limit_conn_module,
@@ -307,7 +313,9 @@ export const ngx_modules = [_][*c]ngx_module_t{
     &ngx_stream_upstream_random_module,
     &ngx_stream_upstream_zone_module,
     &ngx_stream_ssl_preread_module,
+    &ngx_stream_mqtt_preread_module,
     &ngx_stream_write_filter_module,
+    &ngx_stream_mqtt_filter_module,
     &ngx_stream_log_module,
 
     // Null terminator
@@ -417,6 +425,8 @@ export const ngx_module_names = [_][*c]const u8{
     // Stream modules
     "ngx_stream_module",
     "ngx_stream_core_module",
+    "ngx_stream_proxy_module",
+    "ngx_stream_upstream_module",
     "ngx_stream_ssl_module",
     "ngx_stream_realip_module",
     "ngx_stream_limit_conn_module",
@@ -432,7 +442,9 @@ export const ngx_module_names = [_][*c]const u8{
     "ngx_stream_upstream_random_module",
     "ngx_stream_upstream_zone_module",
     "ngx_stream_ssl_preread_module",
+    "ngx_stream_mqtt_preread_module",
     "ngx_stream_write_filter_module",
+    "ngx_stream_mqtt_filter_module",
     "ngx_stream_log_module",
 
     // Null terminator

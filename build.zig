@@ -59,6 +59,9 @@ var modules = [_][]const u8{
 
     // Security & Network Modules
     "src/modules/nftset-nginx-module/ngx_http_nftset.zig",
+
+    // Stream Modules
+    "src/modules/mqtt-nginx-module/ngx_stream_mqtt.zig",
 };
 
 var tests = [_][]const u8{
@@ -111,6 +114,9 @@ var tests = [_][]const u8{
 
     // Security & Network Modules
     "src/modules/nftset-nginx-module/ngx_http_nftset.zig",
+
+    // Stream Modules
+    "src/modules/mqtt-nginx-module/ngx_stream_mqtt.zig",
 };
 
 const PN = struct {

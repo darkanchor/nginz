@@ -1,0 +1,1 @@
+2026/07/04 11:36:46 [emerg] 18211#18211: "mqtt_set_connect" directive invalid MQTT CONNECT field in /home/kaiwu/Documents/gitea/nginz/tests/mqtt/nginx-invalid-field.conf:13

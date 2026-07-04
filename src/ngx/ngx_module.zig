@@ -6,6 +6,7 @@ const expectEqual = std.testing.expectEqual;
 
 pub const ngx_module_t = ngx.ngx_module_t;
 pub const NGX_HTTP_MODULE = ngx.NGX_HTTP_MODULE;
+pub const NGX_STREAM_MODULE = @as(c_int, 0x4d525453);
 
 const ngx_uint_t = core.ngx_uint_t;
 const ngx_conf_t = core.ngx_conf_t;
@@ -46,6 +47,12 @@ pub inline fn make_module(cmds: [*c]ngx_command_t, ctx: ?*anyopaque) ngx_module_
         .spare_hook6 = 0,
         .spare_hook7 = 0,
     };
+}
+
+pub inline fn make_stream_module(cmds: [*c]ngx_command_t, ctx: ?*anyopaque) ngx_module_t {
+    var m = make_module(cmds, ctx);
+    m.type = NGX_STREAM_MODULE;
+    return m;
 }
 
 test "module" {

@@ -434,6 +434,7 @@ const ngx_resolver_t = ngx.ngx_resolver_t;
 const ngx_resolver_ctx_t = ngx.ngx_resolver_ctx_t;
 const ngx_variable_value_t = ngx.ngx_variable_value_t;
 const ngx_addr_t = ngx.ngx_addr_t;
+const uintptr_t = usize;
 
 // ngx_stream_variable_value_t is typedef'd to ngx_variable_value_t
 pub const ngx_stream_variable_value_t = ngx_variable_value_t;
@@ -474,6 +475,59 @@ pub const ngx_stream_phase_handler_t = extern struct {
 pub const ngx_stream_phase_engine_t = extern struct {
     handlers: [*c]ngx_stream_phase_handler_t = null,
 };
+
+pub const ngx_stream_phase_t = extern struct {
+    handlers: ngx_array_t = undefined,
+};
+
+pub const NGX_STREAM_POST_ACCEPT_PHASE: usize = 0;
+pub const NGX_STREAM_PREACCESS_PHASE: usize = 1;
+pub const NGX_STREAM_ACCESS_PHASE: usize = 2;
+pub const NGX_STREAM_SSL_PHASE: usize = 3;
+pub const NGX_STREAM_PREREAD_PHASE: usize = 4;
+pub const NGX_STREAM_CONTENT_PHASE: usize = 5;
+pub const NGX_STREAM_LOG_PHASE: usize = 6;
+
+pub const ngx_stream_core_main_conf_t = extern struct {
+    servers: ngx_array_t = undefined,
+    phase_engine: ngx_stream_phase_engine_t = .{},
+    variables_hash: ngx_hash_t = undefined,
+    variables: ngx_array_t = undefined,
+    prefix_variables: ngx_array_t = undefined,
+    ncaptures: ngx_uint_t = 0,
+    server_names_hash_max_size: ngx_uint_t = 0,
+    server_names_hash_bucket_size: ngx_uint_t = 0,
+    variables_hash_max_size: ngx_uint_t = 0,
+    variables_hash_bucket_size: ngx_uint_t = 0,
+    variables_keys: ?*anyopaque = null,
+    ports: [*c]ngx_array_t = null,
+    phases: [NGX_STREAM_LOG_PHASE + 1]ngx_stream_phase_t = undefined,
+};
+
+pub const ngx_stream_variable_s = extern struct {
+    name: ngx_str_t = .{ .len = 0, .data = null },
+    set_handler: ?*const fn (
+        s: [*c]ngx_stream_session_t,
+        v: [*c]ngx_stream_variable_value_t,
+        data: uintptr_t,
+    ) callconv(.c) void = null,
+    get_handler: ?*const fn (
+        s: [*c]ngx_stream_session_t,
+        v: [*c]ngx_stream_variable_value_t,
+        data: uintptr_t,
+    ) callconv(.c) ngx_int_t = null,
+    data: uintptr_t = 0,
+    flags: ngx_uint_t = 0,
+    index: ngx_uint_t = 0,
+};
+pub const ngx_stream_variable_t = ngx_stream_variable_s;
+
+pub const NGX_STREAM_VAR_CHANGEABLE: ngx_uint_t = 1;
+pub const NGX_STREAM_VAR_NOCACHEABLE: ngx_uint_t = 2;
+pub const NGX_STREAM_VAR_INDEXED: ngx_uint_t = 4;
+pub const NGX_STREAM_VAR_NOHASH: ngx_uint_t = 8;
+pub const NGX_STREAM_VAR_WEAK: ngx_uint_t = 16;
+pub const NGX_STREAM_VAR_PREFIX: ngx_uint_t = 32;
 
 pub const ngx_stream_upstream_main_conf_t = extern struct {
     upstreams: ngx_array_t = undefined,
@@ -715,6 +769,36 @@ pub const ngx_stream_complex_value_t = extern struct {
     values: ?*anyopaque = null,
     u: ngx_stream_complex_value_u = undefined,
 };
+
+const ngx_stream_compile_complex_value_flags_s = packed struct(u32) {
+    zero: bool,
+    conf_prefix: bool,
+    root_prefix: bool,
+    complete_lengths: bool,
+    complete_values: bool,
+    padding: u27,
+};
+
+pub const ngx_stream_compile_complex_value_t = extern struct {
+    cf: [*c]ngx_conf_t = null,
+    value: [*c]ngx_str_t = null,
+    complex_value: [*c]ngx_stream_complex_value_t = null,
+    flags: ngx_stream_compile_complex_value_flags_s = @bitCast(@as(u32, 0)),
+};
+
+pub extern fn ngx_stream_add_variable(
+    cf: [*c]ngx_conf_t,
+    name: [*c]ngx_str_t,
+    flags: ngx_uint_t,
+) [*c]ngx_stream_variable_t;
+pub extern fn ngx_stream_complex_value(
+    s: [*c]ngx_stream_session_t,
+    val: [*c]ngx_stream_complex_value_t,
+    value: [*c]ngx_str_t,
+) ngx_int_t;
+pub extern fn ngx_stream_compile_complex_value(
+    ccv: [*c]ngx_stream_compile_complex_value_t,
+) ngx_int_t;
 
 // ngx_stream_filter_pt
 pub const ngx_stream_filter_pt = ?*const fn (
