@@ -713,7 +713,10 @@ Exit criteria:
 - Only the initial CONNECT packet is parsed and optionally rewritten. Publish,
   subscribe, ping, disconnect, and server-to-client packets are passed through.
 - CONNECT rewrite is limited to `clientid`, `username`, and `password`.
-- Client-to-upstream rewrite buffering is capped at 1 MiB.
+- Client-to-upstream rewrite buffering is capped at 1 MiB. While a split CONNECT
+  is incomplete, the module withholds those client bytes from upstream until the
+  full first frame is available or the session fails; nginx stream timeouts bound
+  clients that never finish the CONNECT.
 - No broker-specific authentication or authorization is planned here; credential
   semantics should remain in upstream broker policy or a separate auth module.
 

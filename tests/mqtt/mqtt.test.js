@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { spawn, spawnSync } from "bun";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "fs";
 import { join } from "path";
 import net from "net";
 import tls from "tls";
@@ -16,8 +16,14 @@ const MODULE_SRC = "src/modules/mqtt-nginx-module/ngx_stream_mqtt.zig";
 const NGINZ_BIN = "./zig-out/bin/nginz";
 
 function runtimeDir(name) {
-  const dir = join(process.cwd(), "tests", MODULE, name);
-  if (existsSync(dir)) rmSync(dir, { recursive: true });
+  const dir = join(process.cwd(), "tests", MODULE, "runtime");
+  if (existsSync(dir)) {
+    if (process.env.KEEP_LOGS) {
+      renameSync(dir, `${dir}.${name}.${Date.now()}`);
+    } else {
+      rmSync(dir, { recursive: true });
+    }
+  }
   mkdirSync(join(dir, "logs"), { recursive: true });
   return dir;
 }
@@ -29,6 +35,32 @@ function nginxTest(configPath, name) {
     stdout: "pipe",
     stderr: "pipe",
   });
+}
+
+function extractZigArrayItems(src, name) {
+  const marker = `export const ${name}`;
+  const start = src.indexOf(marker);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const open = src.indexOf("{", start);
+  expect(open).toBeGreaterThanOrEqual(0);
+  let depth = 0;
+  let end = -1;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    if (src[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  expect(end).toBeGreaterThan(open);
+  return src.slice(open + 1, end)
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/, "").trim())
+    .filter((line) => line.length > 0)
+    .map((line) => line.replace(/,$/, "").trim());
 }
 
 async function waitForTcpPort(port, timeout = 5000) {
@@ -187,6 +219,17 @@ describe("mqtt stream module scaffold", () => {
     expect(modules).toContain("extern var ngx_stream_mqtt_filter_module");
     expect(modules).toContain("&ngx_stream_mqtt_preread_module");
     expect(modules).toContain("&ngx_stream_mqtt_filter_module");
+  });
+
+  test("module names stay aligned with module pointer order", () => {
+    const src = readFileSync("src/ngz_modules.zig", "utf8");
+    const modules = extractZigArrayItems(src, "ngx_modules")
+      .filter((item) => item.startsWith("&"))
+      .map((item) => item.slice(1));
+    const names = extractZigArrayItems(src, "ngx_module_names")
+      .filter((item) => item.startsWith('"'))
+      .map((item) => item.slice(1, -1));
+    expect(names).toEqual(modules);
   });
 
   test("nginx -t accepts MQTT stream directives and variables", () => {
@@ -483,7 +526,7 @@ describe("mqtt stream module scaffold", () => {
       broker2.stop();
     }
 
-    const errorLog = readFileSync(join(process.cwd(), "tests", MODULE, "runtime-rewrite-malformed", "logs", "error.log"), "utf8");
+    const errorLog = readFileSync(join(process.cwd(), "tests", MODULE, "runtime", "logs", "error.log"), "utf8");
     expect(errorLog).toContain("mqtt rewrite malformed CONNECT");
   });
 });
