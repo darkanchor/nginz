@@ -145,7 +145,6 @@ export { createPostgresMock, PostgresMock } from "./mocks/postgres.js";
 export { createConsulMock, ConsulMock } from "./mocks/consul.js";
 export { createOIDCMock, OIDCMock } from "./mocks/oidc.js";
 export { createACMEMock, ACMEMock } from "./mocks/acme.js";
-export { createMqttMock, MqttMock, buildMqttConnect, parseMqttConnect } from "./mocks/mqtt.js";
 export {
   createHTTPMock,
   createStaticMock,
@@ -162,8 +161,6 @@ export const MOCK_PORTS = {
   CONSUL: 18500,
   OIDC: 19000,
   ACME: 14000,
-  MQTT_UPSTREAM_1: 18884,
-  MQTT_UPSTREAM_2: 18885,
   HTTP: 19001,
   HTTP_UPSTREAM_1: 19002,
   HTTP_UPSTREAM_2: 19003,

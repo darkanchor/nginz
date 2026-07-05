@@ -27,5 +27,4 @@ comptime {
     _ = @import("modules/cache-purge-nginx-module/ngx_http_cache_purge.zig");
     _ = @import("modules/prometheus-nginx-module/ngx_http_prometheus.zig");
     _ = @import("modules/nftset-nginx-module/ngx_http_nftset.zig");
-    _ = @import("modules/mqtt-nginx-module/ngx_stream_mqtt.zig");
 }

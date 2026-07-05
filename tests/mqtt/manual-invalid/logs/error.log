@@ -1,2 +1,0 @@
-2026/07/04 11:24:54 [emerg] 16459#16459: "mqtt_set_connect" directive invalid MQTT CONNECT field in /home/kaiwu/Documents/gitea/nginz/tests/mqtt/nginx-invalid-field.conf:13
-2026/07/04 11:25:04 [emerg] 16494#16494: "mqtt_set_connect" directive invalid MQTT CONNECT field in /home/kaiwu/Documents/gitea/nginz/tests/mqtt/nginx-invalid-field.conf:13

@@ -164,13 +164,6 @@ pub const module_infos = [_]ModuleInfo{
         .modules = &.{"ngx_http_prometheus_module"},
         .types = &.{.HTTP},
     },
-
-    // Stream Modules
-    .{
-        .source = "src/modules/mqtt-nginx-module/ngx_stream_mqtt.zig",
-        .modules = &.{ "ngx_stream_mqtt_preread_module", "ngx_stream_mqtt_filter_module" },
-        .types = &.{ .STREAM, .STREAM },
-    },
 };
 
 /// Extract module short name from source path
