@@ -477,13 +477,11 @@ fn ngx_conf_set_timeout(
 }
 
 fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
-    if (ngx_http_circuit_breaker_zone == core.nullptr(core.ngx_shm_zone_t)) {
-        var zone_name = ngx_string("circuit_breaker_zone");
-        const zone = shm.ngx_shared_memory_add(cf, &zone_name, CIRCUIT_ZONE_SIZE, @constCast(&ngx_http_circuit_breaker_module));
-        if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
-        zone.*.init = ngx_http_circuit_breaker_zone_init;
-        ngx_http_circuit_breaker_zone = zone;
-    }
+    var zone_name = ngx_string("circuit_breaker_zone");
+    const zone = shm.ngx_shared_memory_add(cf, &zone_name, CIRCUIT_ZONE_SIZE, @constCast(&ngx_http_circuit_breaker_module));
+    if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
+    zone.*.init = ngx_http_circuit_breaker_zone_init;
+    ngx_http_circuit_breaker_zone = zone;
 
     // Register $ngz_circuit_state variable
     var vs = [_]http.ngx_http_variable_t{http.ngx_http_variable_t{

@@ -70,6 +70,13 @@ export async function stopNginz() {
   }
 }
 
+export async function reloadNginz() {
+  if (!nginzProcess) throw new Error("nginz is not running");
+  nginzProcess.kill("SIGHUP");
+  await Bun.sleep(200);
+  await waitForPort(TEST_PORT);
+}
+
 // Wait until nothing is listening on the port (previous nginx fully gone)
 async function waitForPortFree(port, timeout = 5000) {
   const start = Date.now();

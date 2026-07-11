@@ -1928,13 +1928,13 @@ fn preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
 fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
 
     // Service-level shared zone.
-    if (ngx_http_healthcheck_zone == core.nullptr(core.ngx_shm_zone_t)) {
-        var zone_name = ngx_string("healthcheck_zone");
-        const zone = shm.ngx_shared_memory_add(cf, &zone_name, HEALTHCHECK_ZONE_SIZE, @constCast(&ngx_http_healthcheck_module));
-        if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
-        zone.*.init = healthcheck_zone_init;
-        ngx_http_healthcheck_zone = zone;
-    }
+    // Register the zone in every configuration cycle.  Skipping this on reload
+    // makes nginx unmap the old zone while workers retain this global pointer.
+    var service_zone_name = ngx_string("healthcheck_zone");
+    const service_zone = shm.ngx_shared_memory_add(cf, &service_zone_name, HEALTHCHECK_ZONE_SIZE, @constCast(&ngx_http_healthcheck_module));
+    if (service_zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
+    service_zone.*.init = healthcheck_zone_init;
+    ngx_http_healthcheck_zone = service_zone;
 
     // Variables.
     var vs = [_]http.ngx_http_variable_t{

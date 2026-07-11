@@ -2,6 +2,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } fr
 import {
   startNginz,
   stopNginz,
+  reloadNginz,
   cleanupRuntime,
   TEST_URL,
   createHTTPMock,
@@ -110,6 +111,21 @@ describe("healthcheck module", () => {
     upstream.get("/", { status: 200, body: { message: "upstream response" } });
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
     await waitForStatus("/ready", 200);
+  });
+
+  test("shared health zone remains mapped across graceful reload", async () => {
+    const before = await getHealthSnapshot();
+    await reloadNginz();
+
+    // Ordinary responses enter the healthcheck LOG handler and take the zone's
+    // slab mutex. The health endpoint then reads the same zone after LOG phase.
+    const response = await fetch(`${TEST_URL}/`);
+    expect(response.status).toBe(200);
+    await response.arrayBuffer();
+    await Bun.sleep(100);
+
+    const after = await getHealthSnapshot();
+    expect(after.requests).toBeGreaterThanOrEqual(before.requests + 1);
   });
 
   test("actively probes the configured target and exposes probe state on /health", async () => {

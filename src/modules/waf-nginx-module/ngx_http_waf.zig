@@ -2889,13 +2889,11 @@ fn ngx_http_waf_category_variable(
 }
 
 fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
-    if (ngx_http_waf_ban_zone == core.nullptr(core.ngx_shm_zone_t)) {
-        var zone_name = ngx_string("waf_ban_zone");
-        const zone = shm.ngx_shared_memory_add(cf, &zone_name, WAF_BAN_ZONE_SIZE, @constCast(&ngx_http_waf_module));
-        if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
-        zone.*.init = ngx_http_waf_ban_zone_init;
-        ngx_http_waf_ban_zone = zone;
-    }
+    var zone_name = ngx_string("waf_ban_zone");
+    const zone = shm.ngx_shared_memory_add(cf, &zone_name, WAF_BAN_ZONE_SIZE, @constCast(&ngx_http_waf_module));
+    if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_ERROR;
+    zone.*.init = ngx_http_waf_ban_zone_init;
+    ngx_http_waf_ban_zone = zone;
 
     var vs = [_]http.ngx_http_variable_t{
         http.ngx_http_variable_t{ .name = ngx_string("waf_result"), .set_handler = null, .get_handler = ngx_http_waf_result_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
