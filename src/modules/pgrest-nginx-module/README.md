@@ -1309,6 +1309,7 @@ Error responses:
 |-----------|--------|---------|---------|-------------|
 | `pgrest_pass` | `pgrest_pass "conninfo"` | `location` | — | PostgreSQL connection string for the location. Registers the pgrest content handler. All `pgrest_pass` locations in a worker process share one connection pool; pointing two locations at different hosts is not supported while connections are active. |
 | `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum number of pooled connections (1–16). Inherited by nested locations. |
+| `pgrest_timeout` | `pgrest_timeout 15s` | `location` | 15s | Connect/query socket timeout. Inherited by nested locations. The default accommodates dashboard-style analytical reads during sustained telemetry ingestion; latency-sensitive APIs can set a shorter value. |
 | `pgrest_schemas` | `pgrest_schemas "schema1, schema2"` | `location` | — | Allowlist of schemas. The first schema becomes the default. Disallowed schemas receive `PGRST106`. |
 | `pgrest_jwt_secret` | `pgrest_jwt_secret "secret"` | `location` | — | HS256 secret for JWT signature validation. When set, tokens are validated before role extraction. |
 | `pgrest_anon_role` | `pgrest_anon_role "role"` | `location` | — | PostgreSQL role to use when no valid JWT is provided. |

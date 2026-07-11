@@ -98,6 +98,7 @@ const ngx_pgrest_loc_conf_t = extern struct {
     conninfo: ngx_str_t,
     schemas_raw: ngx_str_t,
     pool_size: ngx_int_t, // max pooled connections; NGX_CONF_UNSET means use default
+    timeout: ngx_msec_t, // connect/query socket timeout
 
     // JWT role-based access control
     jwt_secret: ngx_str_t,
@@ -112,7 +113,10 @@ const ngx_pgrest_loc_conf_t = extern struct {
 
 /// Maximum connections in the pool
 const POOL_MAX_CONNECTIONS = 16;
-const PGREST_POOL_TIMEOUT_MS: ngx_msec_t = 5000;
+// Dashboard-style analytical reads can contend with sustained telemetry writes.
+// Fifteen seconds kept the 200 req/s monitoring workload inside the request
+// budget while remaining bounded; latency-sensitive APIs can override it.
+const PGREST_DEFAULT_TIMEOUT_MS: ngx_msec_t = 15000;
 const PGREST_READ_DRAIN_LIMIT: usize = 8;
 
 /// Connection state in the pool
@@ -289,6 +293,7 @@ const PgRequestCtx = extern struct {
     trace_query_seq: usize,
     trace_started_msec: ngx_msec_t,
     trace_last_progress_msec: ngx_msec_t,
+    timeout: ngx_msec_t,
     trace_last_flush_result: c_int,
     trace_last_poll_status: c_int,
     trace_read_calls: usize,
@@ -1641,7 +1646,7 @@ fn set_pooled_timer_mode(ctx: *PgRequestCtx, pool_conn: *PgPoolConn, want_read: 
             return false;
         }
         if (want_read) {
-            event.ngx_event_add_timer(ngx_conn.*.read, PGREST_POOL_TIMEOUT_MS);
+            event.ngx_event_add_timer(ngx_conn.*.read, ctx.*.timeout);
         }
     }
 
@@ -1654,7 +1659,7 @@ fn set_pooled_timer_mode(ctx: *PgRequestCtx, pool_conn: *PgPoolConn, want_read: 
             return false;
         }
         if (want_write) {
-            event.ngx_event_add_timer(ngx_conn.*.write, PGREST_POOL_TIMEOUT_MS);
+            event.ngx_event_add_timer(ngx_conn.*.write, ctx.*.timeout);
         }
     }
 
@@ -1947,6 +1952,10 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
     ctx.*.trace_req_seq = g_pgrest_trace_seq;
     ctx.*.trace_started_msec = ngx_current_msec;
     ctx.*.trace_last_progress_msec = ngx_current_msec;
+    ctx.*.timeout = if (loc_conf.*.timeout == conf.NGX_CONF_UNSET_MSEC)
+        PGREST_DEFAULT_TIMEOUT_MS
+    else
+        loc_conf.*.timeout;
     ctx.*.trace_last_flush_result = -999;
     ctx.*.trace_last_poll_status = -999;
     ctx.*.trace_last_event_len = 0;
@@ -2568,6 +2577,7 @@ fn pgrest_create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         loc.*.jwt_role_claim = ngx_string("role");
         loc.*.jwt_role_claim_explicit = 0;
         loc.*.pool_size = NGX_CONF_UNSET;
+        loc.*.timeout = conf.NGX_CONF_UNSET_MSEC;
         return loc;
     }
     return null;
@@ -2591,6 +2601,7 @@ fn pgrest_merge_loc_conf(
         cur.*.jwt_role_claim_explicit = prev.*.jwt_role_claim_explicit;
     }
     if (cur.*.pool_size == NGX_CONF_UNSET) cur.*.pool_size = prev.*.pool_size;
+    if (cur.*.timeout == conf.NGX_CONF_UNSET_MSEC) cur.*.timeout = prev.*.timeout;
     return NGX_CONF_OK;
 }
 
@@ -9327,6 +9338,14 @@ export const ngx_http_pgrest_commands = [_]ngx_command_t{
         .set = ngx_conf_set_pgrest_pool_size,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("pgrest_timeout"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_msec_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(ngx_pgrest_loc_conf_t, "timeout"),
         .post = null,
     },
     ngx_command_t{
