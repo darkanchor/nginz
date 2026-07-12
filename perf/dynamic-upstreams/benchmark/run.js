@@ -13,6 +13,7 @@ const MODULE = "dynamic-upstreams";
 const PERF_DIR = join(process.cwd(), "perf", MODULE);
 const BENCH_DIR = join(PERF_DIR, "benchmark");
 const OUTPUT_DIR = join(BENCH_DIR, "output");
+const EVENTS_ZONE = "milestone2_bus";
 const EVENTS_CHANNEL = "milestone2";
 const UPSTREAM_NAME = "combo_backend";
 
@@ -69,12 +70,13 @@ function buildNginzConfig(workerEventsMode = "per_target") {
     "            dynamic_upstreams_api;",
     `            dynamic_upstreams_target ${UPSTREAM_NAME};`,
     "            dynamic_upstreams_source static;",
+    `            dynamic_upstreams_worker_events_zone ${EVENTS_ZONE};`,
     `            dynamic_upstreams_worker_events_channel ${EVENTS_CHANNEL};`,
     "        }",
     "",
     "        location /worker-events {",
     "            worker_events_api;",
-    "            worker_events_zone milestone2_bus;",
+    `            worker_events_zone ${EVENTS_ZONE};`,
     `            worker_events_channel ${EVENTS_CHANNEL};`,
     "            worker_events_ring_size 256;",
     "        }",
@@ -85,6 +87,7 @@ function buildNginzConfig(workerEventsMode = "per_target") {
     "            cache_purge_match exact;",
     "            cache_purge_authorize off;",
     "            cache_purge_max_keys 16;",
+    `            cache_purge_worker_events_zone ${EVENTS_ZONE};`,
     `            cache_purge_worker_events_channel ${EVENTS_CHANNEL};`,
     `            cache_purge_worker_events_mode ${workerEventsMode};`,
     "        }",

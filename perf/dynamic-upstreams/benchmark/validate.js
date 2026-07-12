@@ -28,6 +28,12 @@ export async function validateRuntime(context) {
   if (!Array.isArray(events.events)) {
     return { ok: false, error: "worker-events response missing events array" };
   }
+  if (!events.events.some((event) => event?.type === "snapshot_activated")) {
+    return {
+      ok: false,
+      error: "worker-events did not receive the seeded snapshot_activated event; check the explicit zone routing",
+    };
+  }
 
   const healthRes = await fetch(`${context.baseUrl}/health`);
   if (healthRes.status !== 200) {
