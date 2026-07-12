@@ -102,6 +102,14 @@ const SSL_CTRL_SET_TLSEXT_HOSTNAME_C: c_int = 55;
 const TLSEXT_NAMETYPE_HOST_NAME_C: c_long = 0;
 const X509_V_OK_C: c_long = 0;
 
+fn timingSafeTokenEql(a: []const u8, b: []const u8) bool {
+    const token_hex_len = STATE_SIZE * 2;
+    if (a.len != token_hex_len or b.len != token_hex_len) return false;
+    const a_fixed: *const [token_hex_len]u8 = @ptrCast(a.ptr);
+    const b_fixed: *const [token_hex_len]u8 = @ptrCast(b.ptr);
+    return std.crypto.timing_safe.eql([token_hex_len]u8, a_fixed.*, b_fixed.*);
+}
+
 // Headers to pass through from upstream
 const oidc_pass_headers = [_]ngx_str_t{
     ngx.string.ngx_null_str,
@@ -1870,7 +1878,7 @@ fn validateIdToken(pool: [*c]ngx_pool_t, lccf: *oidc_loc_conf, token: []const u8
 
     const expected_nonce_slice = core.slicify(u8, expected_nonce.data, expected_nonce.len);
     const actual_nonce = core.slicify(u8, claims.nonce.data, claims.nonce.len);
-    if (!std.mem.eql(u8, actual_nonce, expected_nonce_slice)) return null;
+    if (!timingSafeTokenEql(actual_nonce, expected_nonce_slice)) return null;
 
     return claims;
 }
@@ -2052,14 +2060,16 @@ fn handleCallback(r: [*c]ngx_http_request_t, lccf: *oidc_loc_conf, rctx: *oidc_r
     };
 
     // Verify state matches
-    if (CJSON.query(state_json, "$.state")) |stored_state_node| {
-        if (CJSON.stringValue(stored_state_node)) |stored_state| {
-            const state_param_slice = core.slicify(u8, state_param.data, state_param.len);
-            const stored_state_slice = core.slicify(u8, stored_state.data, stored_state.len);
-            if (!std.mem.eql(u8, state_param_slice, stored_state_slice)) {
-                return sendError(r, 400, "State mismatch");
-            }
-        }
+    const stored_state_node = CJSON.query(state_json, "$.state") orelse {
+        return sendError(r, 400, "Missing state cookie value");
+    };
+    const stored_state = CJSON.stringValue(stored_state_node) orelse {
+        return sendError(r, 400, "Invalid state cookie value");
+    };
+    const state_param_slice = core.slicify(u8, state_param.data, state_param.len);
+    const stored_state_slice = core.slicify(u8, stored_state.data, stored_state.len);
+    if (!timingSafeTokenEql(state_param_slice, stored_state_slice)) {
+        return sendError(r, 400, "State mismatch");
     }
 
     // Get original URI

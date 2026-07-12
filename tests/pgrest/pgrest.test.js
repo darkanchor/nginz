@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import {
   startNginz,
+  reloadNginz,
   stopNginz,
   cleanupRuntime,
   TEST_URL,
@@ -588,6 +589,22 @@ describe("pgrest module", () => {
     expect(body[0]).toHaveProperty("id");
     expect(body[0]).toHaveProperty("name");
     expect(body[0]).toHaveProperty("email");
+  });
+
+  test("rejects a PostgreSQL result above the serialization bound without truncating JSON", async () => {
+    pgMock.setQueryHandler(/^SELECT \* FROM oversized_response$/, () => ({
+      columns: ["payload"],
+      rows: [["x".repeat(70 * 1024)]],
+    }));
+
+    const res = await fetch(`${TEST_URL}/api/oversized_response`);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({
+      message: "PostgreSQL response exceeds pgrest serialization limit",
+    });
+
+    const followup = await fetch(`${TEST_URL}/api/users`);
+    expect(followup.status).toBe(200);
   });
 
   test("different pgrest_pass backends keep independent live pools", async () => {
@@ -2416,6 +2433,39 @@ describe("pgrest module", () => {
       expect(res.status).toBe(406);
       const body = await res.json();
       expect(body.message).toBe("Embedded resources are only available for JSON responses");
+    });
+  });
+
+  describe("backend registry capacity and reload", () => {
+    test("rejects excess per-worker backends without aliasing and resets cleanly on reload", async () => {
+      await stopNginz();
+      await startNginz(`tests/${MODULE}/nginx-capacity-reload.conf`, MODULE);
+
+      const statuses = [];
+      for (let round = 0; round < 6; round++) {
+        const results = await Promise.all(Array.from({ length: 17 }, (_, i) =>
+          fetch(`${TEST_URL}/backend-${i}/users`, { headers: { Connection: "close" } })
+            .then((res) => res.status)
+        ));
+        statuses.push(...results);
+      }
+      expect(statuses).toContain(503);
+
+      let retainedStatus = false;
+      for (let i = 0; i < 17 && !retainedStatus; i++) {
+        const probes = await Promise.all(Array.from({ length: 8 }, () =>
+          fetch(`${TEST_URL}/backend-${i}/users`, { headers: { Connection: "close" } })
+            .then((res) => res.status)
+        ));
+        retainedStatus = probes.includes(200);
+      }
+      expect(retainedStatus).toBe(true);
+
+      await reloadNginz();
+      const afterReload = await fetch(`${TEST_URL}/backend-16/users`, {
+        headers: { Connection: "close" },
+      });
+      expect(afterReload.status).toBe(200);
     });
   });
 });

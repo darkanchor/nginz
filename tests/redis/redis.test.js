@@ -25,6 +25,7 @@ beforeAll(async () => {
   redisMock.setValue("get/counter", "42");
   redisMock.setValue("get/json-data", '{"name":"test","count":123}');
   redisMock.setValue("get/large-value", `start-${"x".repeat(12000)}-end`);
+  redisMock.setValue("get/max-value", "m".repeat(32 * 1024));
 
   await startNginz(`tests/${MODULE_NAME}/nginx.conf`, MODULE_NAME);
 });
@@ -90,6 +91,12 @@ describe("Redis GET Operations", () => {
 
     const followup = await fetch(`${TEST_URL}/get/mykey`);
     expect(followup.status).toBe(200);
+  });
+
+  test("accepts an exact-limit RESP value whose framing exceeds the old upstream buffer", async () => {
+    const res = await fetch(`${TEST_URL}/get/max-value`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).value).toBe("m".repeat(32 * 1024));
   });
 
   test("rejects oversized RESP lengths without losing the worker", async () => {

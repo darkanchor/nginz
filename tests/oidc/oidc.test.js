@@ -76,6 +76,13 @@ describe("oidc module", () => {
   });
 
   describe("authorization redirect", () => {
+    test("fails closed when remote JWKS metadata exceeds the 1 MiB bound", async () => {
+      const flow = await beginFlow("/oversized-metadata");
+      const res = await finishFlow(flow);
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain("Failed to validate id_token");
+    });
+
     test("redirects unauthenticated request using discovery-backed authorize endpoint", async () => {
       const res = await fetch(`${TEST_URL}/protected`, { redirect: "manual" });
       expect(res.status).toBe(302);

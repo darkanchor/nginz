@@ -151,6 +151,21 @@ export class ConsulMock {
         await Bun.sleep(behavior.delayMs);
       }
       if (behavior?.rawBody !== undefined || behavior?.status !== undefined) {
+        if (behavior.chunked) {
+          const raw = behavior.rawBody ?? JSON.stringify(results);
+          const midpoint = Math.max(1, Math.floor(raw.length / 2));
+          const encoder = new TextEncoder();
+          return new Response(new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(raw.slice(0, midpoint)));
+              controller.enqueue(encoder.encode(raw.slice(midpoint)));
+              controller.close();
+            },
+          }), {
+            status: behavior.status ?? 200,
+            headers: behavior.headers || { "Content-Type": "application/json" },
+          });
+        }
         return new Response(behavior.rawBody ?? JSON.stringify(results), {
           status: behavior.status ?? 200,
           headers:

@@ -154,7 +154,10 @@ fn escapedJsonLen(value: []const u8) ?usize {
 
 fn init_upstream_conf(cf: [*c]http.ngx_http_upstream_conf_t) void {
     cf.*.buffering = 0;
-    cf.*.buffer_size = 8 * ngx_pagesize;
+    // RESP is validated as one bounded frame in process_header. This must fit
+    // the maximum accepted JSON-producing frame plus RESP metadata so legal
+    // 32 KiB bulk values and fragmented reads cannot fill the header buffer.
+    cf.*.buffer_size = REDIS_MAX_JSON_SIZE + 16 * 1024;
     cf.*.ssl_verify = 0;
     cf.*.connect_timeout = 5000;
     cf.*.send_timeout = 5000;

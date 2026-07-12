@@ -193,6 +193,26 @@ async function triggerUntilIssued({ maxSteps = 24 } = {}) {
   return last;
 }
 
+async function assertTlsRejected(configName) {
+  await stopNginz();
+  await startNginz(`tests/${MODULE}/${configName}`, MODULE);
+  await waitForRunnerReady();
+
+  // First call initializes the durable ACME session; subsequent calls attempt
+  // the verified TLS connection. A transport failure may be rendered as JSON
+  // or terminate the upstream request, so accept either client manifestation.
+  await triggerAcmeFlow();
+  for (let i = 0; i < 2; i++) {
+    try { await triggerAcmeFlow(); } catch {}
+  }
+  await Bun.sleep(100);
+
+  const certPath = join(STORAGE_DIR, "certs", DOMAIN, "fullchain.pem");
+  expect(existsSync(certPath)).toBe(false);
+  const errorLog = readRunnerLog(ERROR_LOG);
+  expect(errorLog).toMatch(/certificate verify|certificate does not match|upstream SSL/i);
+}
+
 function readRunnerLog(path) {
   return readFileSync(path, "utf8");
 }
@@ -251,5 +271,27 @@ describe("acme module live Pebble integration", () => {
 
     const errorLog = readRunnerLog(join(process.cwd(), "tests", MODULE, "runtime", "logs", "error.log"));
     expect(errorLog).not.toContain("header already sent");
+  });
+
+  test("rejects Pebble when its private CA is not explicitly trusted", async () => {
+    await assertTlsRejected("nginx.live-untrusted.conf");
+  }, 30000);
+
+  test("rejects a trusted certificate when the ACME hostname does not match", async () => {
+    await assertTlsRejected("nginx.live-hostname-mismatch.conf");
+  }, 30000);
+
+  test("rejects malformed trust material during configuration", () => {
+    const result = runResult([
+      "./zig-out/bin/nginz",
+      "-t",
+      "-p",
+      join(process.cwd(), "tests", MODULE, "runtime"),
+      "-c",
+      join(process.cwd(), "tests", MODULE, "nginx.live-malformed-trust.conf"),
+    ]);
+    expect(result.exitCode).not.toBe(0);
+    const diagnostic = `${result.stdout}${result.stderr}${existsSync(ERROR_LOG) ? readFileSync(ERROR_LOG, "utf8") : ""}`;
+    expect(diagnostic).toMatch(/certificate|PEM|SSL/i);
   });
 });

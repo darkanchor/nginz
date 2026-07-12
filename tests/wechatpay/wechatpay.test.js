@@ -216,6 +216,32 @@ describe("wechatpay module", () => {
   });
 
   describe("access verification", () => {
+    test("rejects signed request bodies above wechatpay_body_max_size", async () => {
+      const body = "x".repeat(128);
+      const res = await fetch(`${TEST_URL}/notify-bounded`, {
+        method: "POST",
+        headers: buildWechatpayHeaders(body),
+        body,
+      });
+      expect(res.status).toBe(413);
+    });
+
+    test("rejects chunked signed request bodies above wechatpay_body_max_size", async () => {
+      const body = "y".repeat(128);
+      const res = await httpRequest({
+        method: "POST",
+        path: "/notify-bounded",
+        headers: {
+          ...buildWechatpayHeaders(body),
+          "Transfer-Encoding": "chunked",
+        },
+      }, (req) => {
+        req.write(body.slice(0, 40));
+        req.end(body.slice(40));
+      });
+      expect(res.status).toBe(413);
+    });
+
     test("rejects requests with invalid signatures", async () => {
       const body = JSON.stringify({ event: "bad" });
       const headers = buildWechatpayHeaders(body, {
@@ -407,6 +433,36 @@ describe("wechatpay module", () => {
   });
 
   describe("proxy signing and response verification", () => {
+    test("rejects upstream bodies above wechatpay_body_max_size", async () => {
+      const responseBody = "x".repeat(128);
+      upstreamMock.post("/proxy-bounded", async () => signedUpstreamResponse(responseBody));
+
+      const res = await fetch(`${TEST_URL}/proxy-bounded`, {
+        method: "POST",
+        body: "small",
+      });
+      expect(res.status).toBe(502);
+    });
+
+    test("rejects chunked upstream bodies above wechatpay_body_max_size", async () => {
+      const responseBody = "z".repeat(128);
+      const signed = signedUpstreamResponse(responseBody);
+      const encoder = new TextEncoder();
+      upstreamMock.post("/proxy-bounded", async () => new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(responseBody.slice(0, 48)));
+            controller.enqueue(encoder.encode(responseBody.slice(48)));
+            controller.close();
+          },
+        }),
+        { status: 200, headers: signed.headers },
+      ));
+
+      const res = await fetch(`${TEST_URL}/proxy-bounded`, { method: "POST", body: "small" });
+      expect(res.status).toBe(502);
+    });
+
     test("signs upstream requests and forwards verified responses", async () => {
       let observedRequest = null;
 

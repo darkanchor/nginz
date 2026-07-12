@@ -162,7 +162,9 @@ const BoundedWriter = struct {
 
 fn init_upstream_conf(cf: [*c]http.ngx_http_upstream_conf_t) void {
     cf.*.buffering = 0;
-    cf.*.buffer_size = 16 * ngx_pagesize;
+    // process_header validates and transforms the complete bounded Consul
+    // frame. Leave explicit headroom for status/headers and chunk metadata.
+    cf.*.buffer_size = CONSUL_RENDER_MAX + 16 * 1024;
     cf.*.ssl_verify = 0;
     cf.*.connect_timeout = 5000;
     cf.*.send_timeout = 5000;
@@ -598,12 +600,7 @@ fn parse_content_length(headers: []const u8) ?usize {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " \t");
         const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            // The current adapter deliberately accepts only bounded,
-            // Content-Length-framed responses. Never parse a partial chunked
-            // payload as if it were a complete JSON document.
-            return null;
-        }
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) return null;
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             const parsed = std.fmt.parseInt(usize, value, 10) catch return null;
             if (parsed > CONSUL_RENDER_MAX) return null;
@@ -612,6 +609,58 @@ fn parse_content_length(headers: []const u8) ?usize {
         }
     }
     return result;
+}
+
+fn has_chunked_encoding(headers: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            return std.ascii.eqlIgnoreCase(value, "chunked");
+        }
+    }
+    return false;
+}
+
+const ChunkScan = union(enum) { incomplete, invalid, complete: usize };
+
+fn scan_chunked_body(input: []const u8) ChunkScan {
+    var pos: usize = 0;
+    var decoded: usize = 0;
+    while (true) {
+        const line_rel = std.mem.indexOf(u8, input[pos..], "\r\n") orelse return .incomplete;
+        const line = input[pos .. pos + line_rel];
+        if (line.len == 0 or std.mem.indexOfScalar(u8, line, ';') != null) return .invalid;
+        const chunk_len = std.fmt.parseInt(usize, line, 16) catch return .invalid;
+        pos += line_rel + 2;
+        if (chunk_len == 0) {
+            if (input.len - pos < 2) return .incomplete;
+            if (!std.mem.eql(u8, input[pos .. pos + 2], "\r\n")) return .invalid;
+            return .{ .complete = decoded };
+        }
+        if (chunk_len > CONSUL_RENDER_MAX - decoded) return .invalid;
+        if (input.len - pos < chunk_len + 2) return .incomplete;
+        if (!std.mem.eql(u8, input[pos + chunk_len .. pos + chunk_len + 2], "\r\n")) return .invalid;
+        decoded += chunk_len;
+        pos += chunk_len + 2;
+    }
+}
+
+fn decode_chunked_body(input: []const u8, output: []u8) bool {
+    var pos: usize = 0;
+    var written: usize = 0;
+    while (true) {
+        const line_rel = std.mem.indexOf(u8, input[pos..], "\r\n") orelse return false;
+        const chunk_len = std.fmt.parseInt(usize, input[pos .. pos + line_rel], 16) catch return false;
+        pos += line_rel + 2;
+        if (chunk_len == 0) return written == output.len;
+        @memcpy(output[written .. written + chunk_len], input[pos .. pos + chunk_len]);
+        written += chunk_len;
+        pos += chunk_len + 2;
+    }
 }
 
 // Parse HTTP response from Consul
@@ -634,12 +683,29 @@ fn ngx_http_consul_upstream_process_header(
         const status: ngx_uint_t = std.fmt.parseInt(ngx_uint_t, status_line[first_space + 1 .. first_space + 4], 10) catch return NGX_ERROR;
         if (status < 100 or status > 599) return NGX_ERROR;
 
-        const expected_body_len = parse_content_length(received[0 .. header_end + 2]) orelse return NGX_ERROR;
         const body_offset = header_end + 4;
         const available_body_len = received.len - body_offset;
-        if (available_body_len < expected_body_len) return NGX_AGAIN;
-        const body_start = b.*.pos + body_offset;
-        const body_len = expected_body_len;
+        const headers = received[0 .. header_end + 2];
+        var body_start = b.*.pos + body_offset;
+        var body_len: usize = 0;
+        if (has_chunked_encoding(headers)) {
+            switch (scan_chunked_body(received[body_offset..])) {
+                .incomplete => return NGX_AGAIN,
+                .invalid => return http.NGX_HTTP_UPSTREAM_INVALID_HEADER,
+                .complete => |decoded_len| {
+                    if (decoded_len > 0) {
+                        const decoded = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, decoded_len)) orelse return NGX_ERROR;
+                        if (!decode_chunked_body(received[body_offset..], decoded[0..decoded_len])) return NGX_ERROR;
+                        body_start = decoded;
+                    }
+                    body_len = decoded_len;
+                },
+            }
+        } else {
+            const expected_body_len = parse_content_length(headers) orelse return NGX_ERROR;
+            if (available_body_len < expected_body_len) return NGX_AGAIN;
+            body_len = expected_body_len;
+        }
 
         // Store response data
         rctx.*.response_data = ngx_str_t{

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, rmSync, readFileSync } from "fs";
 import { join } from "path";
 import {
   startNginz,
+  reloadNginz,
   stopNginz,
   cleanupRuntime,
   TEST_URL,
@@ -480,6 +481,39 @@ describe("acme module", () => {
       if (!(cert.includes("-----BEGIN CERTIFICATE-----") && key.includes("-----BEGIN "))) {
         expect(["complete", "started"]).toContain(final.status);
       }
+    });
+  });
+
+  describe("shared session capacity and reload", () => {
+    test("rejects the seventeenth domain and preserves all live sessions across graceful reload", async () => {
+      await stopNginz();
+      await startNginz(`tests/${MODULE}/nginx-capacity-reload.conf`, MODULE);
+
+      for (let i = 0; i < 16; i++) {
+        const res = await fetch(`${TEST_URL}/.well-known/acme-trigger`, {
+          headers: { Host: `domain-${i}.example.com`, Connection: "close" },
+        });
+        expect(res.status).toBe(200);
+        expect((await res.json()).status).toBe("initialized");
+      }
+
+      const overflow = await fetch(`${TEST_URL}/.well-known/acme-trigger`, {
+        headers: { Host: "domain-16.example.com", Connection: "close" },
+      });
+      expect(overflow.status).toBe(503);
+      expect((await overflow.json()).message).toContain("session store full");
+
+      await reloadNginz();
+
+      const preserved = await fetch(`${TEST_URL}/.well-known/acme-trigger`, {
+        headers: { Host: "domain-0.example.com", Connection: "close" },
+      });
+      expect(preserved.status).toBe(200);
+
+      const stillFull = await fetch(`${TEST_URL}/.well-known/acme-trigger`, {
+        headers: { Host: "domain-16.example.com", Connection: "close" },
+      });
+      expect(stillFull.status).toBe(503);
     });
   });
 });

@@ -55,6 +55,7 @@ export class OIDCMock {
 
     this.registerClient("test-client", "test-secret", [
       "http://localhost:8888/callback",
+      "http://localhost:8888/callback-oversized",
       "http://127.0.0.1:8888/callback",
     ]);
 
@@ -133,6 +134,13 @@ export class OIDCMock {
 
     if (path === "/.well-known/jwks.json") {
       return this.jsonResponse(this.getJwks());
+    }
+
+    if (path === "/.well-known/oversized-jwks.json") {
+      return new Response("x".repeat(1024 * 1024 + 1), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     if (path === "/authorize") {

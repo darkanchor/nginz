@@ -99,6 +99,28 @@ describe("consul module", () => {
       expect(body.services[0].port).toBe(8080);
     });
 
+    test("decodes bounded chunked Consul responses split across writes", async () => {
+      const rawBody = JSON.stringify([{
+        Node: { ID: "node", Node: "mock", Address: "127.0.0.1", Datacenter: "dc1" },
+        Service: { ID: "chunked-1", Service: "chunked-service", Address: "10.2.0.1", Port: 9443, Tags: ["chunked"], Meta: {} },
+        Checks: [{ Status: "passing" }],
+      }]);
+      consulMock.setHealthBehavior({ rawBody, chunked: true });
+      try {
+        const res = await fetch(`${TEST_URL}/services/chunked-service`);
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.services).toEqual([{
+          id: "chunked-1",
+          address: "10.2.0.1",
+          port: 9443,
+          tags: ["chunked"],
+        }]);
+      } finally {
+        consulMock.clearHealthBehavior();
+      }
+    });
+
     test("renders responses larger than the old 8 KiB scratch buffer safely", async () => {
       const res = await fetch(`${TEST_URL}/services/large-service`);
       expect(res.status).toBe(200);

@@ -1,0 +1,6 @@
+{
+  "issuer": "http://127.0.0.1:9999",
+  "authorization_endpoint": "http://127.0.0.1:9999/authorize",
+  "token_endpoint": "http://127.0.0.1:9999/token",
+  "jwks_uri": "http://127.0.0.1:9999/.well-known/oversized-jwks.json"
+}

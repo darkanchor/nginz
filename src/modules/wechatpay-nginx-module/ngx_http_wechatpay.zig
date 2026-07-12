@@ -49,6 +49,8 @@ const PAGE_SIZE = 4096;
 const WECHATPAY_MAX_CLOCK_SKEW_SEC: i64 = 300;
 const WECHATPAY_REPLAY_CAPACITY: usize = 1024;
 const WECHATPAY_REPLAY_ZONE_SIZE: usize = 256 * 1024;
+const WECHATPAY_DEFAULT_BODY_MAX_SIZE: usize = 1024 * 1024;
+const NGX_HTTP_REQUEST_ENTITY_TOO_LARGE: ngx_int_t = 413;
 const WECHATPAY_AUTH_HEADER = ngx_string("WECHATPAY2-SHA256-RSA2048");
 extern var ngx_pagesize: ngx_uint_t;
 extern var ngx_http_core_module: ngx_module_t;
@@ -84,8 +86,34 @@ fn replay_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) callconv(.
     return NGX_OK;
 }
 
-fn acceptFreshNonce(nonce_value: []const u8, now: i64) bool {
+fn acceptFreshNonceInStore(store: *ReplayStore, nonce_value: []const u8, now: i64) bool {
     if (nonce_value.len == 0 or nonce_value.len > 64) return false;
+    var reusable_index: ?usize = null;
+    for (&store.entries) |*entry| {
+        if (entry.nonce_len == nonce_value.len and entry.accepted_at >= now - WECHATPAY_MAX_CLOCK_SKEW_SEC and
+            std.mem.eql(u8, entry.nonce[0..nonce_value.len], nonce_value)) return false;
+    }
+
+    var offset: usize = 0;
+    while (offset < WECHATPAY_REPLAY_CAPACITY) : (offset += 1) {
+        const index = (store.next_index + offset) % WECHATPAY_REPLAY_CAPACITY;
+        const candidate = &store.entries[index];
+        if (candidate.nonce_len == 0 or candidate.accepted_at < now - WECHATPAY_MAX_CLOCK_SKEW_SEC) {
+            reusable_index = index;
+            break;
+        }
+    }
+    const index = reusable_index orelse return false;
+    const entry = &store.entries[index];
+    entry.* = std.mem.zeroes(ReplayEntry);
+    entry.nonce_len = @intCast(nonce_value.len);
+    entry.accepted_at = now;
+    @memcpy(entry.nonce[0..nonce_value.len], nonce_value);
+    store.next_index = (index + 1) % WECHATPAY_REPLAY_CAPACITY;
+    return true;
+}
+
+fn acceptFreshNonce(nonce_value: []const u8, now: i64) bool {
     const zone = wechatpay_replay_zone;
     if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null or zone.*.shm.addr == null) return false;
     const store_c = core.castPtr(ReplayStore, zone.*.data) orelse return false;
@@ -94,19 +122,7 @@ fn acceptFreshNonce(nonce_value: []const u8, now: i64) bool {
 
     shm.ngx_shmtx_lock(&shpool.*.mutex);
     defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
-
-    for (&store.entries) |*entry| {
-        if (entry.nonce_len == nonce_value.len and entry.accepted_at >= now - WECHATPAY_MAX_CLOCK_SKEW_SEC and
-            std.mem.eql(u8, entry.nonce[0..nonce_value.len], nonce_value)) return false;
-    }
-
-    const entry = &store.entries[store.next_index % WECHATPAY_REPLAY_CAPACITY];
-    entry.* = std.mem.zeroes(ReplayEntry);
-    entry.nonce_len = @intCast(nonce_value.len);
-    entry.accepted_at = now;
-    @memcpy(entry.nonce[0..nonce_value.len], nonce_value);
-    store.next_index = (store.next_index + 1) % WECHATPAY_REPLAY_CAPACITY;
-    return true;
+    return acceptFreshNonceInStore(store, nonce_value, now);
 }
 
 const WError = error{
@@ -142,6 +158,7 @@ const wechatpay_request_context = extern struct {
     sig_verify: signature_verification_status,
     status: http.ngx_http_status_t,
     done_access: ngx_flag_t,
+    response_bytes: usize,
 };
 
 const wechatpay_loc_conf = extern struct {
@@ -156,6 +173,7 @@ const wechatpay_loc_conf = extern struct {
     oaep_encrypt: ngx_flag_t,
     oaep_decrypt: ngx_flag_t,
     allow_insecure_http: ngx_flag_t,
+    body_max_size: usize,
     ctx: [*c]wechatpay_context,
     ups: http.ngx_http_upstream_conf_t,
 };
@@ -238,6 +256,7 @@ fn wechatpay_create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.oaep_encrypt = conf.NGX_CONF_UNSET;
         p.*.oaep_decrypt = conf.NGX_CONF_UNSET;
         p.*.allow_insecure_http = conf.NGX_CONF_UNSET;
+        p.*.body_max_size = conf.NGX_CONF_UNSET_SIZE;
         p.*.aes_secret = ngx.string.ngx_null_str;
         p.*.access_control = 0;
 
@@ -296,6 +315,12 @@ inline fn merge_loc(ch: [*c]wechatpay_loc_conf, pr: [*c]wechatpay_loc_conf) void
     conf.ngx_conf_merge_str_value(&ch.*.mch_id, &pr.*.mch_id, ngx_string(""));
     if (ch.*.allow_insecure_http == conf.NGX_CONF_UNSET) {
         ch.*.allow_insecure_http = if (pr.*.allow_insecure_http == conf.NGX_CONF_UNSET) 0 else pr.*.allow_insecure_http;
+    }
+    if (ch.*.body_max_size == conf.NGX_CONF_UNSET_SIZE) {
+        ch.*.body_max_size = if (pr.*.body_max_size == conf.NGX_CONF_UNSET_SIZE)
+            WECHATPAY_DEFAULT_BODY_MAX_SIZE
+        else
+            pr.*.body_max_size;
     }
 }
 
@@ -439,6 +464,25 @@ fn read_body(r: [*c]ngx_http_request_t) ngx_str_t {
     }
 
     return ngx_str_t{ .data = out, .len = offset };
+}
+
+fn request_body_exceeds_limit(r: [*c]ngx_http_request_t, limit: usize) bool {
+    if (r.*.headers_in.content_length_n > 0 and
+        @as(u64, @intCast(r.*.headers_in.content_length_n)) > @as(u64, @intCast(limit))) return true;
+    if (r.*.request_body == core.nullptr(http.ngx_http_request_body_t) or
+        r.*.request_body.*.bufs == core.nullptr(buf.ngx_chain_t)) return false;
+
+    var total: usize = 0;
+    var chain = r.*.request_body.*.bufs;
+    while (chain != core.nullptr(buf.ngx_chain_t)) : (chain = chain.*.next) {
+        const b = chain.*.buf;
+        if (b == core.nullptr(buf.ngx_buf_t) or buf.ngx_buf_special(b)) continue;
+        const chunk_len = buf.ngx_buf_size(b);
+        if (chunk_len < 0) return true;
+        total = std.math.add(usize, total, @intCast(chunk_len)) catch return true;
+        if (total > limit) return true;
+    }
+    return false;
 }
 
 fn sign_request(
@@ -766,6 +810,15 @@ fn ngx_http_wechatpay_proxy_upstream_process_header(
                     if (u.*.headers_in.flags.chunked) {
                         u.*.headers_in.content_length_n = -1;
                     }
+                    const rctx = core.castPtr(
+                        wechatpay_request_context,
+                        r.*.ctx[ngx_http_wechatpay_module.ctx_index],
+                    ) orelse return NGX_ERROR;
+                    if (u.*.headers_in.content_length_n > 0 and
+                        @as(u64, @intCast(u.*.headers_in.content_length_n)) > @as(u64, @intCast(rctx.*.lccf.*.body_max_size)))
+                    {
+                        return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                    }
                     return NGX_OK;
                 },
                 else => return http.NGX_HTTP_UPSTREAM_INVALID_HEADER,
@@ -780,6 +833,16 @@ fn ngx_http_wechatpay_proxy_upstream_input_filter_init(
 ) callconv(.c) ngx_int_t {
     if (core.castPtr(ngx_http_request_t, ctx)) |r| {
         const u = r.*.upstream;
+        const rctx = core.castPtr(
+            wechatpay_request_context,
+            r.*.ctx[ngx_http_wechatpay_module.ctx_index],
+        ) orelse return NGX_ERROR;
+        rctx.*.response_bytes = 0;
+        if (u.*.headers_in.content_length_n > 0 and
+            @as(u64, @intCast(u.*.headers_in.content_length_n)) > @as(u64, @intCast(rctx.*.lccf.*.body_max_size)))
+        {
+            return NGX_ERROR;
+        }
         u.*.length = u.*.headers_in.content_length_n;
     }
     return NGX_OK;
@@ -796,6 +859,8 @@ fn ngx_http_wechatpay_proxy_upstream_input_filter(
         )) |rctx| {
             const u = r.*.upstream;
             const len: usize = @intCast(bytes);
+            rctx.*.response_bytes = std.math.add(usize, rctx.*.response_bytes, len) catch return NGX_ERROR;
+            if (rctx.*.response_bytes > rctx.*.lccf.*.body_max_size) return NGX_ERROR;
             var chain = NChain.init(r.*.pool);
             const last = buf.ngz_chain_last(rctx.*.res);
             const cl = chain.alloc(len, last) catch return NGX_ERROR;
@@ -831,7 +896,16 @@ fn ngx_http_wechatpay_proxy_upstream_finalize_request(
         r.*.ctx[ngx_http_wechatpay_module.ctx_index],
     )) |rctx| {
         if (rc != NGX_OK) {
+            // Transport/framing failures are gateway errors, not signature
+            // failures. BYPASS prevents the header filter rewriting 502 to 401.
             rctx.*.sig_verify = .SIG_VERIFICATION_BYPASS;
+            if (!r.*.flags1.header_sent) {
+                r.*.headers_out.status = http.NGX_HTTP_BAD_GATEWAY;
+                http.ngx_http_clear_content_length(r);
+                http.ngx_http_clear_accept_ranges(r);
+                _ = http.ngx_http_send_header(r);
+                _ = http.ngx_http_send_special(r, http.NGX_HTTP_LAST);
+            }
             return;
         }
         const u = r.*.upstream;
@@ -941,6 +1015,10 @@ export fn ngx_http_wechatpay_proxy_body_handler(
         wechatpay_request_context,
         r.*.ctx[ngx_http_wechatpay_module.ctx_index],
     )) |rctx| {
+        if (request_body_exceeds_limit(r, rctx.*.lccf.*.body_max_size)) {
+            http.ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+            return;
+        }
         const rc = create_upstream(r, rctx) catch {
             http.ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
             return;
@@ -968,6 +1046,7 @@ export fn ngx_http_wechatpay_proxy_handler(
         if (rctx.*.lccf == core.nullptr(wechatpay_loc_conf)) {
             rctx.*.lccf = lccf;
         }
+        if (request_body_exceeds_limit(r, lccf.*.body_max_size)) return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
         r.*.flags1.discard_body = false;
         const rc = http.ngx_http_read_client_request_body(r, ngx_http_wechatpay_proxy_body_handler);
         return if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) rc else core.NGX_DONE;
@@ -1077,6 +1156,17 @@ fn wechatpay_check_access(r: [*c]ngx_http_request_t) !ngx_int_t {
 export fn ngx_http_wechatpay_access_body_handler(
     r: [*c]ngx_http_request_t,
 ) callconv(.c) void {
+    const rctx = core.castPtr(
+        wechatpay_request_context,
+        r.*.ctx[ngx_http_wechatpay_module.ctx_index],
+    ) orelse {
+        http.ngx_http_finalize_request(r, NGX_HTTP_SERVICE_UNAVAILABLE);
+        return;
+    };
+    if (request_body_exceeds_limit(r, rctx.*.lccf.*.body_max_size)) {
+        http.ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+        return;
+    }
     if (wechatpay_check_access(r)) |_| {
         r.*.write_event_handler = http.ngx_http_core_run_phases;
         http.ngx_http_core_run_phases(r);
@@ -1112,6 +1202,7 @@ export fn ngx_http_wechatpay_access_handler(
             rctx.*.lccf = lccf;
             rctx.*.done_access = 0;
         }
+        if (request_body_exceeds_limit(r, lccf.*.body_max_size)) return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
         r.*.flags1.discard_body = false;
         const rc = http.ngx_http_read_client_request_body(r, ngx_http_wechatpay_access_body_handler);
         if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) {
@@ -1158,6 +1249,10 @@ export fn ngx_http_wechatpay_oaep_body_handler(
         wechatpay_request_context,
         r.*.ctx[ngx_http_wechatpay_module.ctx_index],
     )) |rctx| {
+        if (request_body_exceeds_limit(r, rctx.*.lccf.*.body_max_size)) {
+            http.ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+            return;
+        }
         if (execute_oaep_action(r, rctx.*.lccf.*.ctx)) |rc| {
             http.ngx_http_finalize_request(r, rc);
         } else |e| {
@@ -1187,6 +1282,7 @@ export fn ngx_http_wechatpay_oaep_handler(
         if (rctx.*.lccf == core.nullptr(wechatpay_loc_conf)) {
             rctx.*.lccf = lccf;
         }
+        if (request_body_exceeds_limit(r, lccf.*.body_max_size)) return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
         const rc = http.ngx_http_read_client_request_body(r, ngx_http_wechatpay_oaep_body_handler);
         return if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) rc else core.NGX_DONE;
     }
@@ -1220,6 +1316,14 @@ export const ngx_http_wechatpay_commands = [_]ngx_command_t{
         .set = conf.ngx_conf_set_flag_slot,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = @offsetOf(wechatpay_loc_conf, "allow_insecure_http"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("wechatpay_body_max_size"),
+        .type = CONF_PHASES | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_size_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(wechatpay_loc_conf, "body_max_size"),
         .post = null,
     },
     ngx_command_t{
@@ -1399,4 +1503,21 @@ test "wechatpay module" {
     try expectEqual(host2.port, 8080);
     try expectEqual(host2.ssl, false);
     try expectEqual(ngx.string.eql(host2.host, ngx_string("abcd.com")), true);
+}
+
+test "replay store fails closed at capacity and reclaims only expired entries" {
+    var store = std.mem.zeroes(ReplayStore);
+    const now: i64 = 10_000;
+    var nonce_buf: [64]u8 = undefined;
+
+    for (0..WECHATPAY_REPLAY_CAPACITY) |i| {
+        const value = try std.fmt.bufPrint(&nonce_buf, "nonce-{d}", .{i});
+        try std.testing.expect(acceptFreshNonceInStore(&store, value, now));
+    }
+
+    try std.testing.expect(!acceptFreshNonceInStore(&store, "capacity-overflow", now));
+    try std.testing.expect(!acceptFreshNonceInStore(&store, "nonce-0", now));
+
+    const after_window = now + WECHATPAY_MAX_CLOCK_SKEW_SEC + 1;
+    try std.testing.expect(acceptFreshNonceInStore(&store, "reclaimed-after-expiry", after_window));
 }

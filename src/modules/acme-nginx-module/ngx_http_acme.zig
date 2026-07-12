@@ -3060,11 +3060,11 @@ export fn ngx_http_acme_trigger_handler(r: [*c]ngx_http_request_t) callconv(.c) 
 
     const shared_store = getAcmeStore() orelse {
         if (shpool) |sp| shm.ngx_shmtx_unlock(&sp.*.mutex);
-        return send_acme_status_and_finalize(r, "error", "Shared ACME store unavailable");
+        return send_acme_status_code_and_finalize(r, http.NGX_HTTP_SERVICE_UNAVAILABLE, "error", "Shared ACME store unavailable");
     };
     const session = get_or_create_session_entry(shared_store, domain_slice) orelse {
         if (shpool) |sp| shm.ngx_shmtx_unlock(&sp.*.mutex);
-        return send_acme_status_and_finalize(r, "error", "Shared ACME session store full");
+        return send_acme_status_code_and_finalize(r, http.NGX_HTTP_SERVICE_UNAVAILABLE, "error", "Shared ACME session store full");
     };
 
     const was_initialized = session.*.directory_url_len > 0 or session.*.state != @intFromEnum(AcmeState.idle);
@@ -3170,11 +3170,11 @@ export fn ngx_http_acme_trigger_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     return rc;
 }
 
-fn send_acme_status(r: [*c]ngx_http_request_t, status: []const u8, message: []const u8) ngx_int_t {
+fn send_acme_status_code(r: [*c]ngx_http_request_t, http_status: ngx_uint_t, status: []const u8, message: []const u8) ngx_int_t {
     const response = build_acme_status_json(r.*.pool, status, message) orelse return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
 
     // Set headers
-    r.*.headers_out.status = 200;
+    r.*.headers_out.status = http_status;
     r.*.headers_out.content_type = ngx_string("application/json");
     r.*.headers_out.content_type_len = 16;
     r.*.headers_out.content_length_n = @intCast(response.len);
@@ -3201,6 +3201,19 @@ fn send_acme_status(r: [*c]ngx_http_request_t, status: []const u8, message: []co
     }
 
     return http.ngx_http_output_filter(r, out.next);
+}
+
+fn send_acme_status(r: [*c]ngx_http_request_t, status: []const u8, message: []const u8) ngx_int_t {
+    return send_acme_status_code(r, http.NGX_HTTP_OK, status, message);
+}
+
+fn send_acme_status_code_and_finalize(r: [*c]ngx_http_request_t, http_status: ngx_uint_t, status: []const u8, message: []const u8) ngx_int_t {
+    const rc = send_acme_status_code(r, http_status, status, message);
+    if (rc == NGX_ERROR or rc >= http.NGX_HTTP_SPECIAL_RESPONSE) {
+        return rc;
+    }
+    http.ngx_http_finalize_request(r, rc);
+    return NGX_DONE;
 }
 
 fn send_acme_status_and_finalize(r: [*c]ngx_http_request_t, status: []const u8, message: []const u8) ngx_int_t {
@@ -3493,6 +3506,56 @@ test "challenge storage" {
 
     const after_remove = find_challenge(pool, "token1", "example.com");
     try std.testing.expect(after_remove == null);
+}
+
+test "challenge storage rejects capacity overflow without eviction" {
+    acme_test_store = std.mem.zeroes(acme_store);
+
+    var tokens: [MAX_CHALLENGES][16]u8 = undefined;
+    var token_lengths: [MAX_CHALLENGES]usize = undefined;
+    for (0..MAX_CHALLENGES) |i| {
+        const token = try std.fmt.bufPrint(&tokens[i], "token-{d}", .{i});
+        token_lengths[i] = token.len;
+        try std.testing.expect(add_challenge(
+            ngx_str_t{ .len = token.len, .data = token.ptr },
+            ngx_string("key-authorization"),
+            ngx_string("example.com"),
+            std.math.maxInt(ngx_msec_t),
+        ));
+    }
+
+    try std.testing.expectEqual(@as(ngx_uint_t, MAX_CHALLENGES), acme_test_store.challenge_count);
+    try std.testing.expect(!add_challenge(
+        ngx_string("overflow"),
+        ngx_string("overflow.key-authorization"),
+        ngx_string("example.com"),
+        std.math.maxInt(ngx_msec_t),
+    ));
+    try std.testing.expectEqual(@as(ngx_uint_t, MAX_CHALLENGES), acme_test_store.challenge_count);
+    try std.testing.expectEqualStrings(
+        tokens[0][0..token_lengths[0]],
+        fixed_string_slice(&acme_test_store.challenges[0].token, acme_test_store.challenges[0].token_len),
+    );
+}
+
+test "session storage rejects capacity overflow without eviction" {
+    var store = std.mem.zeroes(acme_store);
+    var domains: [MAX_ACME_SESSIONS][32]u8 = undefined;
+    var domain_lengths: [MAX_ACME_SESSIONS]usize = undefined;
+
+    for (0..MAX_ACME_SESSIONS) |i| {
+        const domain = try std.fmt.bufPrint(&domains[i], "domain-{d}.example.com", .{i});
+        domain_lengths[i] = domain.len;
+        try std.testing.expect(get_or_create_session_entry(&store, domain) != null);
+    }
+
+    try std.testing.expectEqual(@as(ngx_uint_t, MAX_ACME_SESSIONS), store.session_count);
+    try std.testing.expect(get_or_create_session_entry(&store, "overflow.example.com") == null);
+    try std.testing.expectEqual(@as(ngx_uint_t, MAX_ACME_SESSIONS), store.session_count);
+    try std.testing.expectEqualStrings(
+        domains[0][0..domain_lengths[0]],
+        fixed_string_slice(&store.sessions[0].domain, store.sessions[0].domain_len),
+    );
 }
 
 test "jwk thumbprint" {

@@ -49,6 +49,11 @@ const SOCK_RAW_C: c_int = 3;
 const NETLINK_NETFILTER_PROT: c_int = 12;
 const SOL_SOCKET_C: c_int = 1;
 const SO_RCVTIMEO_C: c_int = 20;
+// Netlink runs synchronously in the access phase. Keep each receive bounded to
+// a single-digit worker-latency budget; a confirmed miss may require two
+// exchanges (GETSETELEM followed by GETSET), so worst-case lookup blocking is
+// bounded to roughly twice this value.
+const NFTSET_NETLINK_RECV_BUDGET_US: i64 = 10_000;
 
 // nftables Netlink subsystem and message types
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
@@ -220,8 +225,8 @@ const nftset_lookup_cache_store = extern struct {
 const RateLimitEntry = extern struct {
     key: u64,
     count: u32,
-    window_start_sec: u64,
-    last_used_sec: u64,
+    window_start_ms: u64,
+    last_used_ms: u64,
 };
 
 const nftset_ratelimit_store = extern struct {
@@ -539,8 +544,8 @@ fn fnv1a64(seed: u64, bytes: []const u8) u64 {
     return hash;
 }
 
-fn currentWindowSec() u64 {
-    return @intCast(ngx_current_msec / 1000);
+fn currentWindowMs() u64 {
+    return @intCast(ngx_current_msec);
 }
 
 fn buildRateLimitKey(scope: []const u8, table_fam: u8, ip_bytes: []const u8) u64 {
@@ -619,7 +624,11 @@ fn ngx_http_nftset_lookup_cache_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?
     return NGX_OK;
 }
 
-fn getOrCreateRateLimitEntry(store: *nftset_ratelimit_store, rate_key: u64, current_sec: u64) *RateLimitEntry {
+fn rateLimitWindowExpired(window_start_ms: u64, current_ms: u64) bool {
+    return current_ms < window_start_ms or current_ms - window_start_ms >= 1000;
+}
+
+fn getOrCreateRateLimitEntry(store: *nftset_ratelimit_store, rate_key: u64, current_ms: u64) *RateLimitEntry {
     var empty_slot: ?*RateLimitEntry = null;
     var reusable_slot: ?*RateLimitEntry = null;
     var oldest_slot: ?*RateLimitEntry = null;
@@ -630,8 +639,8 @@ fn getOrCreateRateLimitEntry(store: *nftset_ratelimit_store, rate_key: u64, curr
             continue;
         }
         if (entry.key == rate_key) return entry;
-        if (entry.window_start_sec < current_sec and reusable_slot == null) reusable_slot = entry;
-        if (oldest_slot == null or entry.last_used_sec < oldest_slot.?.last_used_sec) oldest_slot = entry;
+        if (rateLimitWindowExpired(entry.window_start_ms, current_ms) and reusable_slot == null) reusable_slot = entry;
+        if (oldest_slot == null or entry.last_used_ms < oldest_slot.?.last_used_ms) oldest_slot = entry;
     }
 
     const slot = empty_slot orelse reusable_slot orelse oldest_slot orelse unreachable;
@@ -639,22 +648,22 @@ fn getOrCreateRateLimitEntry(store: *nftset_ratelimit_store, rate_key: u64, curr
     slot.* = .{
         .key = rate_key,
         .count = 0,
-        .window_start_sec = current_sec,
-        .last_used_sec = current_sec,
+        .window_start_ms = current_ms,
+        .last_used_ms = current_ms,
     };
     return slot;
 }
 
 fn checkRateLimit(store: *nftset_ratelimit_store, rate_key: u64, rate: ngx_uint_t, burst: ngx_uint_t) bool {
-    const current_sec = currentWindowSec();
-    const entry = getOrCreateRateLimitEntry(store, rate_key, current_sec);
+    const current_ms = currentWindowMs();
+    const entry = getOrCreateRateLimitEntry(store, rate_key, current_ms);
 
-    if (current_sec > entry.window_start_sec) {
-        entry.window_start_sec = current_sec;
+    if (rateLimitWindowExpired(entry.window_start_ms, current_ms)) {
+        entry.window_start_ms = current_ms;
         entry.count = 0;
     }
 
-    entry.last_used_sec = current_sec;
+    entry.last_used_ms = current_ms;
     const limit = @as(u64, @intCast(rate)) + @as(u64, @intCast(burst));
     if (@as(u64, entry.count) < limit) {
         entry.count += 1;
@@ -1021,7 +1030,7 @@ fn nftset_ip_in_set(
     var found = false;
 
     // Receive loop: found case requires 2 datagrams (NEWSETELEM + ACK).
-    // Socket has a 100 ms receive timeout set in init_process.
+    // Socket has a strict receive budget set in init_process.
     var iters: u8 = 0;
     while (iters < 4) : (iters += 1) {
         const rcvd = recv(netlink_fd, &rbuf, rbuf.len, 0);
@@ -1165,8 +1174,7 @@ fn nftset_init_process(cycle: [*c]core.ngx_cycle_t) callconv(.c) ngx_int_t {
         return NGX_OK;
     }
 
-    // 100 ms receive timeout prevents hanging when the kernel is slow
-    const tv = Timeval{ .tv_sec = 0, .tv_usec = 100_000 };
+    const tv = Timeval{ .tv_sec = 0, .tv_usec = NFTSET_NETLINK_RECV_BUDGET_US };
     if (setsockopt(netlink_fd, SOL_SOCKET_C, SO_RCVTIMEO_C, &tv, @sizeOf(Timeval)) < 0) {
         ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, cycle.*.log, 0, "nftset: failed to set netlink receive timeout", .{});
     }

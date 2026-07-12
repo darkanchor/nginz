@@ -124,6 +124,16 @@ they can be added in the `objs/ngx_modules.c` as following.
 
 The directive specifies the upstream wechatpay gateway. *note* apart from `ngx_http_proxy_module` whose *proxy_pass* directive usually
 requires an explicit `$request_uri`, *wechatpay_proxy_pass* does not need them as wechatpay gateway uses uri path and args to compute
+
+#### wechatpay_body_max_size
+
+*syntax: wechatpay_body_max_size size*
+
+*default: 1m*
+
+*context: http, server, location*
+
+Bounds request bodies used for signing, access verification, and OAEP operations, and bounds upstream response bodies retained for signature verification. Oversized client bodies return 413; oversized or invalidly framed upstream responses return 502. The limit applies to both fixed-length and chunked bodies.
 the signature and it makes little sense to modify them. The module uses the *method*, *uri path* and *uri args* of the original request
 for the upstream.
 
@@ -219,4 +229,4 @@ request body, decrypts and appends plaintxt for the location's content handler, 
 
 ### Engineering Audit Verdict (2026-07-12)
 
-**Verdict: S0 TRANSPORT/AUTHENTICITY FIXED; S1 CAPACITY OPEN.** HTTPS upstreams use system CA trust, SNI, certificate verification, and hostname validation; plain HTTP requires explicit `wechatpay_allow_insecure_http on`. Signed requests and upstream responses outside a ±300-second window are rejected. Successfully verified nonces enter a 1,024-entry shared-memory replay window, and a two-worker parallel regression proves twelve reuses are rejected after the first acceptance. Configurable replay capacity/telemetry and request/upstream body-size limits remain S1 work.
+**Verdict: S0 TRANSPORT/AUTHENTICITY FIXED; S1 CORE BOUNDS FIXED.** HTTPS upstreams use system CA trust, SNI, certificate verification, and hostname validation; plain HTTP requires explicit `wechatpay_allow_insecure_http on`. Signed requests and upstream responses outside a ±300-second window are rejected. Successfully verified nonces enter a 1,024-entry shared-memory replay window, fail closed at capacity without overwriting fresh entries, and reclaim only expired slots. `wechatpay_body_max_size` bounds fixed-length and chunked request/upstream bodies before signature-path allocations; focused 413/502 regressions keep transport failures distinct from authentication failures. The 24-case focused suite is green; capacity telemetry and TLS-negative integration remain proof work.

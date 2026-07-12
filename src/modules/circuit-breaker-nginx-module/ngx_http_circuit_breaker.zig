@@ -435,6 +435,40 @@ fn ngx_http_circuit_admission_variable(
     return NGX_OK;
 }
 
+const CIRCUIT_METRIC_ENTRIES: core.uintptr_t = 0;
+const CIRCUIT_METRIC_CAPACITY: core.uintptr_t = 1;
+
+fn ngx_http_circuit_metric_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    var value: ngx_uint_t = MAX_CIRCUITS;
+    if (data == CIRCUIT_METRIC_ENTRIES) {
+        const shpool = getCircuitShpool() orelse {
+            v.*.flags.not_found = true;
+            return NGX_OK;
+        };
+        shm.ngx_shmtx_lock(&shpool.*.mutex);
+        const store = getCircuitStore() orelse {
+            shm.ngx_shmtx_unlock(&shpool.*.mutex);
+            v.*.flags.not_found = true;
+            return NGX_OK;
+        };
+        value = store.*.circuit_count;
+        shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    }
+
+    const out = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, 32)) orelse return NGX_ERROR;
+    const rendered = std.fmt.bufPrint(out[0..32], "{d}", .{value}) catch return NGX_ERROR;
+    v.*.data = rendered.ptr;
+    v.*.flags.len = @intCast(rendered.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
 fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     if (core.ngz_pcalloc_c(circuit_breaker_loc_conf, cf.*.pool)) |p| {
         p.*.enabled = conf.NGX_CONF_UNSET;
@@ -568,6 +602,20 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         .set_handler = null,
         .get_handler = ngx_http_circuit_admission_variable,
         .data = 0,
+        .flags = http.NGX_HTTP_VAR_NOCACHEABLE,
+        .index = 0,
+    }, http.ngx_http_variable_t{
+        .name = ngx_string("ngz_circuit_entries"),
+        .set_handler = null,
+        .get_handler = ngx_http_circuit_metric_variable,
+        .data = CIRCUIT_METRIC_ENTRIES,
+        .flags = http.NGX_HTTP_VAR_NOCACHEABLE,
+        .index = 0,
+    }, http.ngx_http_variable_t{
+        .name = ngx_string("ngz_circuit_capacity"),
+        .set_handler = null,
+        .get_handler = ngx_http_circuit_metric_variable,
+        .data = CIRCUIT_METRIC_CAPACITY,
         .flags = http.NGX_HTTP_VAR_NOCACHEABLE,
         .index = 0,
     }};

@@ -388,6 +388,34 @@ fn get_or_create_pool(conninfo: []const u8, max_conn: usize) ?*PgConnPool {
     return pool;
 }
 
+fn reset_pool_registry() void {
+    for (g_conn_pools[0..g_conn_pool_count]) |*pool| {
+        for (&pool.connections) |*pool_conn| {
+            if (pool_conn.conn) |conn| pgFinish(conn);
+            pool_conn.conn = null;
+            pool_conn.request_ctx = null;
+            if (pool_conn.ngx_conn) |ngx_conn| ngx_conn.*.data = null;
+            pool_conn.ngx_conn = null;
+            pool_conn.fd = -1;
+            pool_conn.state = .free;
+        }
+        pool.init();
+    }
+    g_conn_pool_count = 0;
+}
+
+fn pgrest_init_process(_: [*c]core.ngx_cycle_t) callconv(.c) ngx_int_t {
+    // Workers normally inherit an untouched registry from the master. Reset it
+    // explicitly so embedding and repeated-cycle test harnesses have the same
+    // lifecycle contract.
+    reset_pool_registry();
+    return NGX_OK;
+}
+
+fn pgrest_exit_process(_: [*c]core.ngx_cycle_t) callconv(.c) void {
+    reset_pool_registry();
+}
+
 /// Maximum size for JSON result buffer
 const MAX_JSON_SIZE = 65536;
 
@@ -2250,10 +2278,11 @@ fn estimate_response_buffer_size(
                 while (row < ntuples) : (row += 1) {
                     if (row > 0) estimated += 1;
                     estimated += estimate_json_row_size(result, row, nfields, opts.strip_nulls, column_meta);
-                    if (estimated >= clamped_max) return clamped_max;
+                    if (estimated > clamped_max) return clamped_max + 1;
                 }
             }
-            return @max(clamped_min, @min(estimated, clamped_max));
+            if (estimated > clamped_max) return clamped_max + 1;
+            return @max(clamped_min, estimated);
         },
         .binary => {
             if (result != null and ntuples == 1 and nfields == 1 and pgGetisnull(result, 0, 0) == 0) {
@@ -9169,6 +9198,13 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
         &ctx.*.raw_json_field_lens,
         ctx.*.raw_json_field_count,
     );
+    if (response_buffer_size > MAX_JSON_SIZE) {
+        const rc = send_json_error(r, http.NGX_HTTP_BAD_GATEWAY, "{\"message\":\"PostgreSQL response exceeds pgrest serialization limit\"}");
+        ctx.*.request = null;
+        release_pooled_ctx(ctx, false);
+        http.ngx_http_finalize_request(r, rc);
+        return;
+    }
     const response_body_buf = buf.ngx_create_temp_buf(r.*.pool, response_buffer_size) orelse {
         ctx.*.request = null;
         release_pooled_ctx(ctx, true);
@@ -9350,10 +9386,15 @@ export const ngx_http_pgrest_commands = [_]ngx_command_t{
     conf.ngx_null_command,
 };
 
-export var ngx_http_pgrest_module = ngx.module.make_module(
-    @constCast(&ngx_http_pgrest_commands),
-    @constCast(&ngx_http_pgrest_module_ctx),
-);
+export var ngx_http_pgrest_module = blk: {
+    var m = ngx.module.make_module(
+        @constCast(&ngx_http_pgrest_commands),
+        @constCast(&ngx_http_pgrest_module_ctx),
+    );
+    m.init_process = pgrest_init_process;
+    m.exit_process = pgrest_exit_process;
+    break :blk m;
+};
 
 const expectEqual = std.testing.expectEqual;
 const expect = std.testing.expect;
@@ -9361,6 +9402,23 @@ const expectEqualStrings = std.testing.expectEqualStrings;
 
 test "pgrest module" {
     try expect(ngx_http_pgrest_module.version > 0);
+}
+
+test "backend pool registry rejects capacity overflow without aliasing" {
+    reset_pool_registry();
+    defer reset_pool_registry();
+
+    var names: [MAX_BACKEND_POOLS][32]u8 = undefined;
+    var name_lengths: [MAX_BACKEND_POOLS]usize = undefined;
+    for (0..MAX_BACKEND_POOLS) |i| {
+        const name = try std.fmt.bufPrint(&names[i], "backend-{d}", .{i});
+        name_lengths[i] = name.len;
+        try expect(get_or_create_pool(name, 1) != null);
+    }
+
+    try expectEqual(@as(usize, MAX_BACKEND_POOLS), g_conn_pool_count);
+    try expect(get_or_create_pool("backend-overflow", 1) == null);
+    try expectEqualStrings(names[0][0..name_lengths[0]], g_conn_pools[0].conninfo[0..g_conn_pools[0].conninfo_len]);
 }
 
 test "parse_order supports null ordering modifiers" {

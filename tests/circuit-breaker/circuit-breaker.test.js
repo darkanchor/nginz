@@ -44,6 +44,9 @@ describe("circuit-breaker module", () => {
     test("allows requests when circuit is closed", async () => {
       const res = await fetch(`${TEST_URL}/protected`);
       expect(res.status).toBe(200);
+      expect(res.headers.get("X-Circuit-Admission")).toBe("allow");
+      expect(res.headers.get("X-Circuit-Entries")).toBe("1");
+      expect(res.headers.get("X-Circuit-Capacity")).toBe("64");
     });
 
     test("forwards requests to upstream", async () => {
