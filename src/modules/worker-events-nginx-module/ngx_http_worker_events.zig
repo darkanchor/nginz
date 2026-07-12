@@ -37,7 +37,13 @@ const MAX_CHANNEL_LEN: usize = 64;
 const MAX_TYPE_LEN: usize = 64;
 const MAX_PAYLOAD_LEN: usize = 512;
 
-export var ngx_http_worker_events_default_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_shm_zone_t);
+const MAX_WORKER_EVENT_ZONES: usize = 16;
+const WorkerEventsZoneBinding = struct {
+    name: ngx_str_t,
+    zone: [*c]core.ngx_shm_zone_t,
+};
+var worker_events_zone_count: usize = 0;
+var worker_events_zones: [MAX_WORKER_EVENT_ZONES]WorkerEventsZoneBinding = undefined;
 
 // ── Shared-memory data structures (C ABI) ────────────────────────────────────
 
@@ -186,6 +192,18 @@ export fn ngx_http_worker_events_publish_internal(
     payload_str: ngx_str_t,
 ) callconv(.c) ngx_int_t {
     return if (publish_to_ring(zone, channel_str, type_str, payload_str) != null) NGX_OK else NGX_ERROR;
+}
+
+/// Backward-compatible native publisher path.  It is intentionally available
+/// only when the current configuration cycle contains exactly one event zone;
+/// ambiguous multi-zone configurations fail instead of cross-routing events.
+export fn ngx_http_worker_events_publish_default(
+    channel_str: ngx_str_t,
+    type_str: ngx_str_t,
+    payload_str: ngx_str_t,
+) callconv(.c) ngx_int_t {
+    if (worker_events_zone_count != 1) return NGX_ERROR;
+    return ngx_http_worker_events_publish_internal(worker_events_zones[0].zone, channel_str, type_str, payload_str);
 }
 
 // ── Zone init callback ───────────────────────────────────────────────────────
@@ -1013,11 +1031,30 @@ fn create_shared_zone(cf: [*c]ngx_conf_t, lccf: [*c]worker_events_loc_conf) [*c]
         const zone = shm.ngx_shared_memory_add(cf, name_ptr, zone_size, @constCast(&ngx_http_worker_events_module));
         if (zone != core.nullptr(core.ngx_shm_zone_t)) {
             zone.*.init = zone_init;
-            ngx_http_worker_events_default_zone = zone;
+            var already_registered = false;
+            for (worker_events_zones[0..worker_events_zone_count]) |binding| {
+                if (string.eql(binding.name, lccf.*.zone_name)) {
+                    already_registered = true;
+                    break;
+                }
+            }
+            if (!already_registered) {
+                if (worker_events_zone_count >= MAX_WORKER_EVENT_ZONES) return core.nullptr(core.ngx_shm_zone_t);
+                worker_events_zones[worker_events_zone_count] = .{ .name = lccf.*.zone_name, .zone = zone };
+                worker_events_zone_count += 1;
+            }
             return zone;
         }
     }
     return core.nullptr(core.ngx_shm_zone_t);
+}
+
+fn preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
+    _ = cf;
+    // The master parses each reload in the same process.  Never retain a zone
+    // descriptor from the prior cycle in the new cycle's native registry.
+    worker_events_zone_count = 0;
+    return NGX_OK;
 }
 
 // ── Postconfiguration ────────────────────────────────────────────────────────
@@ -1032,7 +1069,7 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
 // ── Module exports ───────────────────────────────────────────────────────────
 
 export const ngx_http_worker_events_module_ctx = ngx_http_module_t{
-    .preconfiguration = null,
+    .preconfiguration = preconfiguration,
     .postconfiguration = postconfiguration,
     .create_main_conf = null,
     .init_main_conf = null,
@@ -1090,5 +1127,22 @@ export var ngx_http_worker_events_module = ngx.module.make_module(
     @constCast(&ngx_http_worker_events_commands),
     @constCast(&ngx_http_worker_events_module_ctx),
 );
+
+test "native default publisher rejects zero or ambiguous zones" {
+    const saved = worker_events_zone_count;
+    defer worker_events_zone_count = saved;
+
+    worker_events_zone_count = 0;
+    try std.testing.expectEqual(NGX_ERROR, ngx_http_worker_events_publish_default(ngx_string("c"), ngx_string("t"), ngx_null_str));
+
+    worker_events_zone_count = 2;
+    try std.testing.expectEqual(NGX_ERROR, ngx_http_worker_events_publish_default(ngx_string("c"), ngx_string("t"), ngx_null_str));
+}
+
+test "preconfiguration clears the prior cycle registry" {
+    worker_events_zone_count = 3;
+    try std.testing.expectEqual(NGX_OK, preconfiguration(core.nullptr(ngx_conf_t)));
+    try std.testing.expectEqual(@as(usize, 0), worker_events_zone_count);
+}
 
 test "worker events scaffold module" {}

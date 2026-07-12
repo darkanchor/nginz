@@ -29,6 +29,7 @@ const NList = ngx.list.NList;
 const canary_loc_conf = extern struct {
     enabled: ngx_flag_t,
     percentage: ngx_uint_t, // 0-100
+    percentage_set: ngx_flag_t,
     header_name: ngx_str_t,
     header_value: ngx_str_t,
 };
@@ -96,7 +97,11 @@ fn should_route_to_canary(r: [*c]ngx_http_request_t, lccf: *canary_loc_conf) boo
     if (lccf.percentage > 0) {
         // Generate random number 0-99
         var random_byte: [1]u8 = undefined;
-        _ = std.c.getrandom(&random_byte, random_byte.len, 0);
+        if (std.c.getrandom(&random_byte, random_byte.len, 0) != random_byte.len) {
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, r.*.connection.*.log, 0,
+                "canary: entropy acquisition failed; routing to stable", .{});
+            return false;
+        }
         const random_value: u32 = @as(u32, random_byte[0]) * 100 / 256;
 
         if (random_value < lccf.percentage) {
@@ -165,6 +170,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     if (core.ngz_pcalloc_c(canary_loc_conf, cf.*.pool)) |p| {
         p.*.enabled = conf.NGX_CONF_UNSET;
         p.*.percentage = 0;
+        p.*.percentage_set = 0;
         p.*.header_name = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
         p.*.header_value = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
         return p;
@@ -187,8 +193,9 @@ fn merge_loc_conf(
     }
 
     // Merge percentage
-    if (c.*.percentage == 0) {
+    if (c.*.percentage_set == 0) {
         c.*.percentage = prev.*.percentage;
+        c.*.percentage_set = prev.*.percentage_set;
     }
 
     // Merge header name/value
@@ -211,11 +218,11 @@ fn ngx_conf_set_canary_percentage(
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             const slice = core.slicify(u8, arg.*.data, arg.*.len);
-            lccf.*.percentage = std.fmt.parseInt(ngx_uint_t, slice, 10) catch 0;
-            // Clamp to 0-100
-            if (lccf.*.percentage > 100) {
-                lccf.*.percentage = 100;
-            }
+            lccf.*.percentage = std.fmt.parseInt(ngx_uint_t, slice, 10) catch
+                return @constCast("canary_percentage must be an integer from 0 to 100");
+            if (lccf.*.percentage > 100)
+                return @constCast("canary_percentage must be an integer from 0 to 100");
+            lccf.*.percentage_set = 1;
         }
     }
     return conf.NGX_CONF_OK;
@@ -303,4 +310,15 @@ const expectEqual = std.testing.expectEqual;
 const expect = std.testing.expect;
 
 test "canary module" {
+}
+
+test "explicit zero percentage does not inherit" {
+    var parent: canary_loc_conf = std.mem.zeroes(canary_loc_conf);
+    var child: canary_loc_conf = std.mem.zeroes(canary_loc_conf);
+    parent.percentage = 50;
+    parent.percentage_set = 1;
+    child.percentage = 0;
+    child.percentage_set = 1;
+    if (child.percentage_set == 0) child.percentage = parent.percentage;
+    try expectEqual(@as(ngx_uint_t, 0), child.percentage);
 }

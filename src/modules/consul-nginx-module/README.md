@@ -290,3 +290,7 @@ These variables expose per-request Consul state to `nginz-njs` scripted modules 
 - [x] Gap fixed in this audit pass: KV responses now preserve empty decoded values instead of collapsing them to `null`.
 - [x] Gap fixed in this audit pass: KV responses now JSON-escape decoded and raw fallback values so quoted payloads remain valid JSON.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 FIXED; S1 FRAMING FOLLOW-UP (2026-07-12).** Request construction now uses a checked 16 KiB pool writer with URL encoding and header-injection rejection; `host[:port]` parsing rejects invalid/overflow ports and supports bracketed IPv6. Service/catalog JSON uses a checked, fully escaping 64 KiB pool writer instead of fixed stack buffers. Response parsing waits for a bounded, complete Content-Length body and rejects unsupported framing. Focused coverage renders 80 escaped service records beyond the former 8 KiB limit. Chunked Consul responses remain a deliberate S1 feature gap and currently fail safely rather than being partially parsed.

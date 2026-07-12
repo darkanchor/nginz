@@ -207,3 +207,7 @@ Revisit whether service readiness should remain purely service-probe-driven once
 
 - Add policy-specific tests for whichever readiness mode is chosen.
 - Add metrics/JSON assertions proving the reason data is operator-visible and not inferred indirectly from status codes.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 RELOAD LIFETIME FIXED; S1 PROBE I/O OPEN.** Preconfiguration now resets every service-probe option, fixed buffer, event-channel pointer, zone descriptor, and upstream/peer registry before a new cycle is parsed. Removing directives therefore restores defaults instead of inheriting retired-cycle state, with a unit regression covering the reset and the 37-case focused reload/probe suite green. TLS peer verification, event-driven probe I/O, explicit event-zone naming, and hard failure/telemetry beyond the fixed probe capacities remain S1 work.

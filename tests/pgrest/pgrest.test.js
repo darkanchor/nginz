@@ -21,7 +21,10 @@ describe("pgrest module", () => {
     // Start PostgreSQL mock server
     pgMock = createPostgresMock(MOCK_PORTS.POSTGRES);
     resetPgMock = createPostgresMock(15434);
-    resetPgMock.setQueryHandler(/^SELECT \* FROM users$/, () => ({ close: true }));
+    resetPgMock.setQueryHandler(/^SELECT \* FROM users$/, () => ({
+      columns: ["id", "name"],
+      rows: [["99", "Secondary Backend"]],
+    }));
 
     // Default handler for SELECT * FROM users (no filters)
     pgMock.setQueryHandler(/^SELECT \* FROM users$/, (query) => ({
@@ -585,6 +588,20 @@ describe("pgrest module", () => {
     expect(body[0]).toHaveProperty("id");
     expect(body[0]).toHaveProperty("name");
     expect(body[0]).toHaveProperty("email");
+  });
+
+  test("different pgrest_pass backends keep independent live pools", async () => {
+    const primaryBefore = await fetch(`${TEST_URL}/api/users`);
+    expect(primaryBefore.status).toBe(200);
+    expect((await primaryBefore.json())[0].name).toBe("John Doe");
+
+    const secondary = await fetch(`${TEST_URL}/api-secondary/users`);
+    expect(secondary.status).toBe(200);
+    expect(await secondary.json()).toEqual([{ id: "99", name: "Secondary Backend" }]);
+
+    const primaryAfter = await fetch(`${TEST_URL}/api/users`);
+    expect(primaryAfter.status).toBe(200);
+    expect((await primaryAfter.json())[0].name).toBe("John Doe");
   });
 
   test("GET /api/users with select parameter returns specified columns", async () => {

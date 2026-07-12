@@ -96,6 +96,13 @@ NGX_OK (pass to proxy_pass) or 400 Bad Request
 - Query with comments → comments ignored
 - Multiple selection sets → depth tracked correctly
 - Fragment introspection (`__typename`) → detected
+- `graphql_body_max_size` overflow → 413; temp-file request bodies → explicit rejection
+
+### Body limit
+
+`graphql_body_max_size <size>;` is a location directive with a `1m` default.
+The module rejects declared or accumulated larger bodies with 413 and rejects
+file-backed bodies rather than copying them into request-pool memory.
 
 ### Phase 2: Future Enhancements
 
@@ -117,4 +124,10 @@ NGX_OK (pass to proxy_pass) or 400 Bad Request
 - [x] Bun integration coverage exists at `tests/graphql/`.
 - [x] Bun integration coverage now verifies introspection keywords inside quoted strings are ignored, malformed non-string `query` fields are rejected, and unmatched closing braces are rejected.
 - [x] Gap fixed in this audit pass: the lightweight parser now rejects unmatched closing braces instead of silently accepting malformed queries whose final depth returns to zero.
+- [x] Block strings and regular-string escape parity are tokenized without counting embedded braces or introspection text.
+- [x] Fragment spreads and inline fragments fail closed because the bounded depth heuristic does not expand fragment selection sets.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S1 HEURISTIC FAIL-CLOSED.** This remains a bounded depth/introspection heuristic rather than a complete GraphQL parser. It handles block strings and escape parity, rejects fragment syntax it cannot safely expand, enforces `graphql_body_max_size` (1 MiB default), and rejects temp-file request bodies explicitly. A real GraphQL parser and semantic complexity model remain feature work rather than a hidden security guarantee.

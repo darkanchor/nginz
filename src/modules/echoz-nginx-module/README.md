@@ -154,3 +154,7 @@ The module provides two nginx modules in one:
 - [x] Gap recorded: README documents `echoz_status <code>`, but the current command surface and passing coverage use `echoz_status <code> <reason>`.
 - [x] Gap recorded: Bun guardrails for `echoz_flush`, `echoz_status`, `echoz_header`, and body-filter wrapping were added in this audit pass because those observable behaviors were implemented but previously unasserted.
 - [x] Gap closed: README now documents true background semantics for `echoz_location_async` and bodyless `header_only` subrequest behavior for `echozn`.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 FIXED (2026-07-12).** `$echoz_request_body` now checks `request_body`, `bufs`, and `temp_file` in lifetime order before joining in-memory buffers. Focused integration coverage evaluates the variable on a GET before any body read, asserts an empty result, and proves the worker remains available with a follow-up request. Remaining temp-file/subrequest/timer/redirect permutations are regression-depth work rather than an open null-dereference blocker.

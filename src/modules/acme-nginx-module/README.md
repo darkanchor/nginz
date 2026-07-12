@@ -220,6 +220,7 @@ const acme_challenge = extern struct {
 |-----------|--------|---------|---------|-------------|
 | `acme` | `on\|off` | `off` | http | Enable ACME certificate management |
 | `acme_server` | `<url>` | Let's Encrypt prod | http | ACME directory URL |
+| `acme_trusted_certificate` | `<file>` | system trust only | http | Additional CA bundle for private ACME authorities such as Pebble |
 | `acme_staging` | `on\|off` | `off` | http | Use Let's Encrypt staging |
 | `acme_email` | `<email>` | - | http | Account contact email |
 | `acme_storage` | `<path>` | `/etc/nginx/acme` | http | Storage directory |
@@ -511,5 +512,9 @@ ACME_SERVER=https://localhost:14000/dir bun test tests/acme/
 - [x] Bun integration coverage exists at `tests/acme/`.
 - [x] Gap recorded: the trigger-driven end-to-end mock ACME flow is now exercised through certificate storage; `tests/acme/` verifies account key creation, live challenge serving, repeated trigger safety, and persisted `fullchain.pem`/`privkey.pem` output.
 - [x] Gap recorded: the previously skipped certificate-storage Bun case was enabled in this audit pass after isolating ACME's worker-global state with a fresh nginx/mock restart inside that test.
-- [x] Gap recorded: README documents `acme_staging` and `acme_renew_before`, but the current exported command table only includes `acme`, `acme_server`, `acme_email`, `acme_storage`, and `acme_domain`.
+- [x] Gap recorded: README documents `acme_staging` and `acme_renew_before`, but the current exported command table does not implement those directives; `acme_trusted_certificate` is implemented for explicit private-PKI trust.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 TRANSPORT FIXED; S1 CAPACITY PROOF OPEN.** ACME upstreams now use system CA trust, SNI, certificate verification, and hostname validation. `acme_server` requires HTTPS by default; private authorities require an explicit `acme_trusted_certificate`. The live Pebble test proves that strict private-CA TLS path through HTTP-01 issuance and artifact storage; negative TLS cases remain a proof gap. The shared zone is cycle-refreshed and runtime session/challenge operations use the slab mutex, but fixed capacities (16 sessions/32 challenges) still need explicit 503/saturation telemetry and concurrent/reload tests.

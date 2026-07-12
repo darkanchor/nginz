@@ -97,6 +97,61 @@ const RedisError = error{
     OutOfMemory,
 };
 
+const REDIS_MAX_ARRAY_ITEMS: usize = 16;
+const REDIS_MAX_VALUE_SIZE: usize = 32 * 1024;
+const REDIS_MAX_JSON_SIZE: usize = 256 * 1024;
+
+const JsonWriter = struct {
+    bytes: []u8,
+    len: usize = 0,
+
+    fn append(self: *JsonWriter, value: []const u8) bool {
+        if (value.len > self.bytes.len - self.len) return false;
+        @memcpy(self.bytes[self.len..][0..value.len], value);
+        self.len += value.len;
+        return true;
+    }
+
+    fn appendByte(self: *JsonWriter, value: u8) bool {
+        if (self.len == self.bytes.len) return false;
+        self.bytes[self.len] = value;
+        self.len += 1;
+        return true;
+    }
+
+    fn appendEscaped(self: *JsonWriter, value: []const u8) bool {
+        const hex = "0123456789abcdef";
+        for (value) |c| {
+            switch (c) {
+                '"', '\\' => {
+                    if (!self.appendByte('\\') or !self.appendByte(c)) return false;
+                },
+                '\n' => if (!self.append("\\n")) return false,
+                '\r' => if (!self.append("\\r")) return false,
+                '\t' => if (!self.append("\\t")) return false,
+                else => {
+                    if (c < 0x20) {
+                        if (!self.append("\\u00") or
+                            !self.appendByte(hex[c >> 4]) or
+                            !self.appendByte(hex[c & 0x0f])) return false;
+                    } else if (!self.appendByte(c)) return false;
+                },
+            }
+        }
+        return true;
+    }
+};
+
+fn escapedJsonLen(value: []const u8) ?usize {
+    var total: usize = 0;
+    for (value) |c| {
+        const add: usize = if (c == '"' or c == '\\' or c == '\n' or c == '\r' or c == '\t') 2 else if (c < 0x20) 6 else 1;
+        if (add > REDIS_MAX_JSON_SIZE - total) return null;
+        total += add;
+    }
+    return total;
+}
+
 fn init_upstream_conf(cf: [*c]http.ngx_http_upstream_conf_t) void {
     cf.*.buffering = 0;
     cf.*.buffer_size = 8 * ngx_pagesize;
@@ -595,151 +650,78 @@ fn ngx_http_redis_upstream_create_request(
     return NGX_OK;
 }
 
-// Helper to escape string for JSON
-fn json_escape_string(json_buf: []u8, json_len: *usize, str: ngx_str_t) void {
-    const data_slice = core.slicify(u8, str.data, str.len);
-    for (data_slice) |c| {
-        if (json_len.* >= json_buf.len - 10) break;
-        switch (c) {
-            '"' => {
-                json_buf[json_len.*] = '\\';
-                json_len.* += 1;
-                json_buf[json_len.*] = '"';
-                json_len.* += 1;
-            },
-            '\\' => {
-                json_buf[json_len.*] = '\\';
-                json_len.* += 1;
-                json_buf[json_len.*] = '\\';
-                json_len.* += 1;
-            },
-            '\n' => {
-                json_buf[json_len.*] = '\\';
-                json_len.* += 1;
-                json_buf[json_len.*] = 'n';
-                json_len.* += 1;
-            },
-            '\r' => {
-                json_buf[json_len.*] = '\\';
-                json_len.* += 1;
-                json_buf[json_len.*] = 'r';
-                json_len.* += 1;
-            },
-            '\t' => {
-                json_buf[json_len.*] = '\\';
-                json_len.* += 1;
-                json_buf[json_len.*] = 't';
-                json_len.* += 1;
-            },
-            else => {
-                json_buf[json_len.*] = c;
-                json_len.* += 1;
-            },
-        }
-    }
-}
-
 // Build JSON response from Redis value
 fn build_json_response(rctx: [*c]redis_request_ctx, pool: [*c]ngx_pool_t) ?ngx_str_t {
-    var json_buf: [8192]u8 = undefined;
-    var json_len: usize = 0;
-
     if (rctx.*.data_len < 0) {
-        // Nil response
-        const null_json = "{\"value\":null}";
-        @memcpy(json_buf[0..null_json.len], null_json);
-        json_len = null_json.len;
-    } else if (rctx.*.data.len > 0) {
-        // Has data - check if integer command
-        const is_int_cmd = switch (rctx.*.command) {
-            .incr, .decr, .del, .expire, .exists, .ttl, .strlen, .hset, .hdel => true,
-            else => false,
-        };
-        if (is_int_cmd) {
-            // Return as integer
-            const prefix = "{\"value\":";
-            @memcpy(json_buf[json_len..][0..prefix.len], prefix);
-            json_len += prefix.len;
-            @memcpy(json_buf[json_len..][0..rctx.*.data.len], core.slicify(u8, rctx.*.data.data, rctx.*.data.len));
-            json_len += rctx.*.data.len;
-            json_buf[json_len] = '}';
-            json_len += 1;
-        } else {
-            // Return as string
-            const prefix = "{\"value\":\"";
-            @memcpy(json_buf[json_len..][0..prefix.len], prefix);
-            json_len += prefix.len;
-            json_escape_string(&json_buf, &json_len, rctx.*.data);
-            const suffix = "\"}";
-            @memcpy(json_buf[json_len..][0..suffix.len], suffix);
-            json_len += suffix.len;
-        }
-    } else {
-        // Empty string or OK response
-        if (rctx.*.command == .set or rctx.*.command == .ping or rctx.*.command == .hset) {
-            // SET/HSET/PING return OK
-            const ok_json = "{\"ok\":true}";
-            @memcpy(json_buf[0..ok_json.len], ok_json);
-            json_len = ok_json.len;
-        } else {
-            const empty_json = "{\"value\":\"\"}";
-            @memcpy(json_buf[0..empty_json.len], empty_json);
-            json_len = empty_json.len;
-        }
+        return ngx_string("{\"value\":null}");
     }
 
-    // Allocate in pool
-    if (core.castPtr(u8, core.ngx_pnalloc(pool, json_len))) |data| {
-        @memcpy(core.slicify(u8, data, json_len), json_buf[0..json_len]);
-        return ngx_str_t{ .data = data, .len = json_len };
+    if (rctx.*.data.len == 0) {
+        return if (rctx.*.command == .set or rctx.*.command == .ping or rctx.*.command == .hset)
+            ngx_string("{\"ok\":true}")
+        else
+            ngx_string("{\"value\":\"\"}");
     }
-    return null;
+
+    const value = core.slicify(u8, rctx.*.data.data, rctx.*.data.len);
+    const is_int_cmd = switch (rctx.*.command) {
+        .incr, .decr, .del, .expire, .exists, .ttl, .strlen, .hset, .hdel => true,
+        else => false,
+    };
+    if (is_int_cmd) _ = std.fmt.parseInt(i64, value, 10) catch return null;
+
+    const prefix = "{\"value\":";
+    const suffix = if (is_int_cmd) "}" else "\"}";
+    const escaped_len = if (is_int_cmd) value.len else escapedJsonLen(value) orelse return null;
+    const quote_len: usize = if (is_int_cmd) 0 else 1;
+    const total = prefix.len + quote_len + escaped_len + suffix.len;
+    if (total > REDIS_MAX_JSON_SIZE) return null;
+    const data = core.castPtr(u8, core.ngx_pnalloc(pool, total)) orelse return null;
+    var writer = JsonWriter{ .bytes = core.slicify(u8, data, total) };
+    if (!writer.append(prefix)) return null;
+    if (!is_int_cmd and !writer.appendByte('"')) return null;
+    if (is_int_cmd) {
+        if (!writer.append(value)) return null;
+    } else if (!writer.appendEscaped(value)) return null;
+    if (!writer.append(suffix) or writer.len != total) return null;
+    return .{ .data = data, .len = total };
 }
 
 // Build JSON array response from MGET results
 fn build_mget_json_response(values: [][2]ngx_str_t, count: usize, pool: [*c]ngx_pool_t) ?ngx_str_t {
-    var json_buf: [16384]u8 = undefined;
-    var json_len: usize = 0;
-
-    // {"values":[
     const prefix = "{\"values\":[";
-    @memcpy(json_buf[json_len..][0..prefix.len], prefix);
-    json_len += prefix.len;
-
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        if (i > 0) {
-            json_buf[json_len] = ',';
-            json_len += 1;
-        }
-
-        // values[i][0] indicates if nil (len=0 means nil), values[i][1] is the actual value
-        if (values[i][0].len == 0) {
-            // Nil
-            const null_str = "null";
-            @memcpy(json_buf[json_len..][0..null_str.len], null_str);
-            json_len += null_str.len;
-        } else {
-            // Has value
-            json_buf[json_len] = '"';
-            json_len += 1;
-            json_escape_string(&json_buf, &json_len, values[i][1]);
-            json_buf[json_len] = '"';
-            json_len += 1;
-        }
-    }
-
-    // ]}
     const suffix = "]}";
-    @memcpy(json_buf[json_len..][0..suffix.len], suffix);
-    json_len += suffix.len;
+    if (count > values.len or count > REDIS_MAX_ARRAY_ITEMS) return null;
 
-    // Allocate in pool
-    if (core.castPtr(u8, core.ngx_pnalloc(pool, json_len))) |data| {
-        @memcpy(core.slicify(u8, data, json_len), json_buf[0..json_len]);
-        return ngx_str_t{ .data = data, .len = json_len };
+    var total = prefix.len + suffix.len + if (count > 0) count - 1 else 0;
+    if (total > REDIS_MAX_JSON_SIZE) return null;
+    for (values[0..count]) |item| {
+        if (item[0].len == 0) {
+            total += 4;
+        } else {
+            const value = core.slicify(u8, item[1].data, item[1].len);
+            const escaped = escapedJsonLen(value) orelse return null;
+            if (escaped + 2 > REDIS_MAX_JSON_SIZE - total) return null;
+            total += escaped + 2;
+        }
     }
-    return null;
+    if (total > REDIS_MAX_JSON_SIZE) return null;
+
+    const data = core.castPtr(u8, core.ngx_pnalloc(pool, total)) orelse return null;
+    var writer = JsonWriter{ .bytes = core.slicify(u8, data, total) };
+    if (!writer.append(prefix)) return null;
+    for (values[0..count], 0..) |item, i| {
+        if (i > 0 and !writer.appendByte(',')) return null;
+        if (item[0].len == 0) {
+            if (!writer.append("null")) return null;
+        } else {
+            if (!writer.appendByte('"') or
+                !writer.appendEscaped(core.slicify(u8, item[1].data, item[1].len)) or
+                !writer.appendByte('"')) return null;
+        }
+    }
+    if (!writer.append(suffix) or writer.len != total) return null;
+    return .{ .data = data, .len = total };
 }
 
 // Parse RESP response - Redis doesn't use HTTP headers
@@ -753,9 +735,11 @@ fn ngx_http_redis_upstream_process_header(
     )) |rctx| {
         const u = r.*.upstream;
         const b = &u.*.buffer;
+        const received_len = @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
+        const received = core.slicify(u8, b.*.pos, received_len);
 
         // Need at least type byte + \r\n
-        if (b.*.last <= b.*.pos + 3) {
+        if (received.len < 3) {
             return NGX_AGAIN;
         }
 
@@ -764,58 +748,40 @@ fn ngx_http_redis_upstream_process_header(
         switch (type_byte) {
             '$' => {
                 // Bulk string: $<len>\r\n<data>\r\n
-                var p: [*c]u8 = b.*.pos + 1;
-                var is_negative = false;
+                const line_end = std.mem.indexOf(u8, received[1..], "\r\n") orelse return NGX_AGAIN;
+                const length_text = received[1 .. 1 + line_end];
+                const data_start_idx = 1 + line_end + 2;
 
-                if (p.* == '-') {
-                    is_negative = true;
-                    p += 1;
-                }
-
-                // Parse length
-                var len: isize = 0;
-                while (p < b.*.last and p.* != '\r') : (p += 1) {
-                    if (p.* >= '0' and p.* <= '9') {
-                        len = len * 10 + @as(isize, p.* - '0');
-                    } else {
-                        rctx.*.state = .resp_error;
-                        return NGX_ERROR;
-                    }
-                }
-
-                // Need \r\n after length
-                if (p + 1 >= b.*.last) {
-                    return NGX_AGAIN;
-                }
-
-                if (p.* != '\r' or (p + 1).* != '\n') {
-                    rctx.*.state = .resp_error;
-                    return NGX_ERROR;
-                }
-
-                if (is_negative) {
+                if (std.mem.eql(u8, length_text, "-1")) {
                     // Nil response ($-1\r\n)
                     rctx.*.data_len = -1;
                     rctx.*.data = ngx.string.ngx_null_str;
                     rctx.*.state = .done;
                     rctx.*.last_exists = 0;
                 } else {
-                    // Check if we have all data: len bytes + \r\n
-                    const data_start = p + 2; // skip \r\n
-                    const needed: usize = @intCast(len);
-                    if (data_start + needed + 2 > b.*.last) {
-                        return NGX_AGAIN;
+                    const needed = std.fmt.parseInt(usize, length_text, 10) catch {
+                        rctx.*.state = .resp_error;
+                        return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                    };
+                    if (needed > REDIS_MAX_VALUE_SIZE) {
+                        rctx.*.state = .resp_error;
+                        return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                    }
+                    if (data_start_idx > received.len or received.len - data_start_idx < needed + 2) return NGX_AGAIN;
+                    if (received[data_start_idx + needed] != '\r' or received[data_start_idx + needed + 1] != '\n') {
+                        rctx.*.state = .resp_error;
+                        return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
                     }
 
                     // Copy data to request pool
                     if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, needed))) |data_copy| {
-                        @memcpy(core.slicify(u8, data_copy, needed), core.slicify(u8, data_start, needed));
+                        @memcpy(core.slicify(u8, data_copy, needed), received[data_start_idx..][0..needed]);
                         rctx.*.data = ngx_str_t{ .data = data_copy, .len = needed };
                     } else {
-                        rctx.*.data = ngx.string.ngx_null_str;
+                        return NGX_ERROR;
                     }
 
-                    rctx.*.data_len = len;
+                    rctx.*.data_len = @intCast(needed);
                     rctx.*.state = .done;
                     rctx.*.last_exists = 1;
                 }
@@ -836,12 +802,13 @@ fn ngx_http_redis_upstream_process_header(
                     r.*.headers_out.content_type = ngx_str_t{ .len = 16, .data = @constCast("application/json") };
                     r.*.headers_out.content_type_len = 16;
                     r.*.headers_out.content_type_lowcase = null;
-                }
+                } else return NGX_ERROR;
 
                 return NGX_OK;
             },
             '-' => {
                 // Error response: -ERR message\r\n
+                if (std.mem.indexOf(u8, received[1..], "\r\n") == null) return NGX_AGAIN;
                 rctx.*.last_error = 1;
                 rctx.*.state = .resp_error;
                 rctx.*.data_len = -1;
@@ -867,6 +834,7 @@ fn ngx_http_redis_upstream_process_header(
             },
             '+' => {
                 // Simple string: +OK\r\n
+                if (std.mem.indexOf(u8, received[1..], "\r\n") == null) return NGX_AGAIN;
                 rctx.*.data_len = 0;
                 rctx.*.data = ngx.string.ngx_null_str;
                 rctx.*.state = .done;
@@ -883,23 +851,23 @@ fn ngx_http_redis_upstream_process_header(
                     r.*.headers_out.content_type = ngx_str_t{ .len = 16, .data = @constCast("application/json") };
                     r.*.headers_out.content_type_len = 16;
                     r.*.headers_out.content_type_lowcase = null;
-                }
+                } else return NGX_ERROR;
 
                 return NGX_OK;
             },
             ':' => {
                 // Integer: :1000\r\n - treat as string
-                var p: [*c]u8 = b.*.pos + 1;
-                while (p < b.*.last and p.* != '\r') : (p += 1) {}
-
-                if (p >= b.*.last) return NGX_AGAIN;
-
-                const int_len = core.ngz_len(b.*.pos + 1, p);
+                const int_len = std.mem.indexOf(u8, received[1..], "\r\n") orelse return NGX_AGAIN;
+                const int_text = received[1 .. 1 + int_len];
+                _ = std.fmt.parseInt(i64, int_text, 10) catch {
+                    rctx.*.state = .resp_error;
+                    return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                };
                 if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, int_len))) |data_copy| {
-                    @memcpy(core.slicify(u8, data_copy, int_len), core.slicify(u8, b.*.pos + 1, int_len));
+                    @memcpy(core.slicify(u8, data_copy, int_len), int_text);
                     rctx.*.data = ngx_str_t{ .data = data_copy, .len = int_len };
                 } else {
-                    rctx.*.data = ngx.string.ngx_null_str;
+                    return NGX_ERROR;
                 }
 
                 rctx.*.data_len = @intCast(int_len);
@@ -916,78 +884,64 @@ fn ngx_http_redis_upstream_process_header(
                     r.*.headers_out.content_type = ngx_str_t{ .len = 16, .data = @constCast("application/json") };
                     r.*.headers_out.content_type_len = 16;
                     r.*.headers_out.content_type_lowcase = null;
-                }
+                } else return NGX_ERROR;
 
                 return NGX_OK;
             },
             '*' => {
                 // Array response (MGET): *<count>\r\n<elements>
-                var p: [*c]u8 = b.*.pos + 1;
-
-                // Parse array count
-                var count: usize = 0;
-                while (p < b.*.last and p.* != '\r') : (p += 1) {
-                    if (p.* >= '0' and p.* <= '9') {
-                        count = count * 10 + @as(usize, p.* - '0');
-                    } else {
-                        rctx.*.state = .resp_error;
-                        return NGX_ERROR;
-                    }
-                }
-
-                if (p + 1 >= b.*.last) return NGX_AGAIN;
-                if (p.* != '\r' or (p + 1).* != '\n') {
+                const count_end = std.mem.indexOf(u8, received[1..], "\r\n") orelse return NGX_AGAIN;
+                const count = std.fmt.parseInt(usize, received[1 .. 1 + count_end], 10) catch {
                     rctx.*.state = .resp_error;
-                    return NGX_ERROR;
+                    return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                };
+                if (count > REDIS_MAX_ARRAY_ITEMS or count != rctx.*.mget_count) {
+                    rctx.*.state = .resp_error;
+                    return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
                 }
-                p += 2; // Skip \r\n
+                var pos: usize = 1 + count_end + 2;
 
                 // Parse each array element
-                var values: [16][2]ngx_str_t = undefined; // [is_present, value]
+                var values = std.mem.zeroes([REDIS_MAX_ARRAY_ITEMS][2]ngx_str_t); // [is_present, value]
                 var idx: usize = 0;
-                while (idx < count and idx < 16) : (idx += 1) {
-                    if (p >= b.*.last) return NGX_AGAIN;
+                while (idx < count) : (idx += 1) {
+                    if (pos >= received.len) return NGX_AGAIN;
+                    if (received[pos] == '$') {
+                        const elem_line_rel = std.mem.indexOf(u8, received[pos + 1 ..], "\r\n") orelse return NGX_AGAIN;
+                        const elem_text = received[pos + 1 .. pos + 1 + elem_line_rel];
+                        pos += 1 + elem_line_rel + 2;
 
-                    if (p.* == '$') {
-                        p += 1;
-                        var is_nil = false;
-                        if (p < b.*.last and p.* == '-') {
-                            is_nil = true;
-                            p += 1;
-                        }
-
-                        // Parse length
-                        var elem_len: usize = 0;
-                        while (p < b.*.last and p.* != '\r') : (p += 1) {
-                            if (p.* >= '0' and p.* <= '9') {
-                                elem_len = elem_len * 10 + @as(usize, p.* - '0');
-                            }
-                        }
-
-                        if (p + 1 >= b.*.last) return NGX_AGAIN;
-                        p += 2; // Skip \r\n
-
-                        if (is_nil) {
+                        if (std.mem.eql(u8, elem_text, "-1")) {
                             values[idx][0] = ngx.string.ngx_null_str; // nil marker
                             values[idx][1] = ngx.string.ngx_null_str;
                         } else {
-                            if (p + elem_len + 2 > b.*.last) return NGX_AGAIN;
+                            const elem_len = std.fmt.parseInt(usize, elem_text, 10) catch {
+                                rctx.*.state = .resp_error;
+                                return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                            };
+                            if (elem_len > REDIS_MAX_VALUE_SIZE) {
+                                rctx.*.state = .resp_error;
+                                return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                            }
+                            if (pos > received.len or received.len - pos < elem_len + 2) return NGX_AGAIN;
+                            if (received[pos + elem_len] != '\r' or received[pos + elem_len + 1] != '\n') {
+                                rctx.*.state = .resp_error;
+                                return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+                            }
 
                             // Copy value
                             if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, elem_len))) |val_copy| {
-                                @memcpy(core.slicify(u8, val_copy, elem_len), core.slicify(u8, p, elem_len));
+                                @memcpy(core.slicify(u8, val_copy, elem_len), received[pos..][0..elem_len]);
                                 values[idx][0] = ngx_str_t{ .data = @constCast("1"), .len = 1 }; // present marker
                                 values[idx][1] = ngx_str_t{ .data = val_copy, .len = elem_len };
                             } else {
-                                values[idx][0] = ngx.string.ngx_null_str;
-                                values[idx][1] = ngx.string.ngx_null_str;
+                                return NGX_ERROR;
                             }
-
-                            p += elem_len + 2; // Skip data + \r\n
+                            pos += elem_len + 2;
                         }
                     } else {
                         rctx.*.state = .resp_error;
-                        return NGX_ERROR;
+                        return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
                     }
                 }
 
@@ -1005,13 +959,13 @@ fn ngx_http_redis_upstream_process_header(
                     r.*.headers_out.content_type = ngx_str_t{ .len = 16, .data = @constCast("application/json") };
                     r.*.headers_out.content_type_len = 16;
                     r.*.headers_out.content_type_lowcase = null;
-                }
+                } else return NGX_ERROR;
 
                 return NGX_OK;
             },
             else => {
                 rctx.*.state = .resp_error;
-                return NGX_ERROR;
+                return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
             },
         }
     }
@@ -1578,4 +1532,21 @@ test "parse_host_port" {
     const r3 = parse_host_port(ngx_string("redis.local"));
     try expectEqual(r3.port, 6379);
     try expectEqual(r3.host.len, 11);
+}
+
+test "JSON writer preserves content and rejects overflow" {
+    const input = "quote\" slash\\ line\n\x01";
+    try expectEqual(@as(?usize, 28), escapedJsonLen(input));
+
+    var storage: [28]u8 = undefined;
+    var writer = JsonWriter{ .bytes = &storage };
+    try expect(writer.appendEscaped(input));
+    try expectEqual(storage.len, writer.len);
+    try expect(std.mem.eql(u8, &storage, "quote\\\" slash\\\\ line\\n\\u0001"));
+    try expect(!writer.appendByte('x'));
+}
+
+test "MGET JSON renderer rejects counts beyond its storage contract" {
+    var values = std.mem.zeroes([REDIS_MAX_ARRAY_ITEMS + 1][2]ngx_str_t);
+    try expect(build_mget_json_response(&values, values.len, core.nullptr(ngx_pool_t)) == null);
 }

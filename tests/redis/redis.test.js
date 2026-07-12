@@ -24,6 +24,7 @@ beforeAll(async () => {
   redisMock.setValue("get/mykey", "hello-world");
   redisMock.setValue("get/counter", "42");
   redisMock.setValue("get/json-data", '{"name":"test","count":123}');
+  redisMock.setValue("get/large-value", `start-${"x".repeat(12000)}-end`);
 
   await startNginz(`tests/${MODULE_NAME}/nginx.conf`, MODULE_NAME);
 });
@@ -79,6 +80,25 @@ describe("Redis GET Operations", () => {
 
     const body = await res.json();
     expect(body.value).toBe("42");
+  });
+
+  test("returns values larger than the old 8 KiB JSON scratch buffer", async () => {
+    const res = await fetch(`${TEST_URL}/get/large-value`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.value).toBe(`start-${"x".repeat(12000)}-end`);
+
+    const followup = await fetch(`${TEST_URL}/get/mykey`);
+    expect(followup.status).toBe(200);
+  });
+
+  test("rejects oversized RESP lengths without losing the worker", async () => {
+    redisMock.setRawResponse("GET", "get/oversized", "$999999999999999999999999\r\n");
+    const res = await fetch(`${TEST_URL}/get/oversized`);
+    expect(res.status).toBe(502);
+
+    const followup = await fetch(`${TEST_URL}/get/mykey`);
+    expect(followup.status).toBe(200);
   });
 
   test("escapes special characters in JSON string responses", async () => {

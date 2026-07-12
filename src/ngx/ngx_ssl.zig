@@ -26,6 +26,50 @@ pub const ngx_ssl_create = ngx.ngx_ssl_create;
 pub const ngx_ssl_client_session_cache = ngx.ngx_ssl_client_session_cache;
 pub const ngx_ssl_cleanup_ctx = ngx.ngx_ssl_cleanup_ctx;
 
+extern fn ngx_ssl_trusted_certificate(
+    cf: [*c]ngx.ngx_conf_t,
+    client_ssl: [*c]ngx_ssl_t,
+    cert: [*c]ngx_str_t,
+    depth: core.ngx_int_t,
+) core.ngx_int_t;
+extern fn SSL_CTX_set_default_verify_paths(ctx: ?*ngx.SSL_CTX) c_int;
+
+/// Initialize an nginx client TLS context that verifies both the certificate
+/// chain and hostname.  OpenSSL's platform default CA file/directory is used;
+/// callers can therefore use the same system trust policy as other clients.
+pub fn configure_verified_client(cf: [*c]ngx.ngx_conf_t, client_ssl: [*c]ngx_ssl_t) bool {
+    if (client_ssl.*.ctx != null) return true;
+    if (ngx_ssl_create(client_ssl, NGX_SSL_DEFAULT_PROTOCOLS, null) != core.NGX_OK) return false;
+
+    if (SSL_CTX_set_default_verify_paths(client_ssl.*.ctx) != 1) {
+        ngx_ssl_cleanup_ctx(client_ssl);
+        return false;
+    }
+
+    var no_extra_ca = string.ngx_null_str;
+    if (ngx_ssl_trusted_certificate(cf, client_ssl, &no_extra_ca, 100) != core.NGX_OK) {
+        ngx_ssl_cleanup_ctx(client_ssl);
+        return false;
+    }
+
+    const cln = core.ngx_pool_cleanup_add(cf.*.pool, 0) orelse {
+        ngx_ssl_cleanup_ctx(client_ssl);
+        return false;
+    };
+    cln.*.handler = ngx_ssl_cleanup_ctx;
+    cln.*.data = client_ssl;
+
+    if (ngx_ssl_client_session_cache(cf, client_ssl, 1) != core.NGX_OK) return false;
+    return true;
+}
+
+/// Add an explicit CA bundle on top of the platform trust roots.  Intended for
+/// private PKI and local integration authorities; verification stays enabled.
+pub fn add_trusted_certificate(cf: [*c]ngx.ngx_conf_t, client_ssl: [*c]ngx_ssl_t, certificate: *ngx_str_t) bool {
+    if (client_ssl.*.ctx == null or certificate.len == 0 or certificate.data == null) return false;
+    return ngx_ssl_trusted_certificate(cf, client_ssl, certificate, 100) == core.NGX_OK;
+}
+
 pub const RAND_bytes = ngx.RAND_bytes;
 pub const EVP_PKEY_free = ngx.EVP_PKEY_free;
 pub const EVP_PKEY_CTX_new = ngx.EVP_PKEY_CTX_new;

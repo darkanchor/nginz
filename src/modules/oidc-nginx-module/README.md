@@ -133,3 +133,7 @@ Still out of scope:
 - [OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)
 - [RFC 7517 - JSON Web Key](https://datatracker.ietf.org/doc/html/rfc7517)
 - [RFC 7519 - JSON Web Token](https://datatracker.ietf.org/doc/html/rfc7519)
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 TRANSPORT FIXED; S1 EVENTED FETCH/PROOF OPEN.** Token exchange and HTTPS discovery/JWKS fetching now use system CA roots, SNI, certificate verification, and hostname validation. Metadata responses are capped at 1 MiB, and plain HTTP is rejected unless `oidc_allow_insecure_http on` is explicitly configured for local testing. The 23-case focused flow remains green. The metadata fetcher still uses blocking sockets, and negative untrusted-CA/hostname/oversize integration cases plus state/nonce constant-time comparisons remain high-priority hardening work.

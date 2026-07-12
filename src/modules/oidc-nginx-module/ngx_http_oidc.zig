@@ -63,6 +63,22 @@ extern fn connect(fd: c_int, addr: ?*const std.posix.sockaddr, len: std.posix.so
 extern fn send(fd: c_int, buf: [*c]const u8, len: usize, flags: c_int) isize;
 extern fn recv(fd: c_int, buf: [*c]u8, len: usize, flags: c_int) isize;
 extern fn close(fd: c_int) c_int;
+const OpenSslCtx = opaque {};
+const OpenSslConn = opaque {};
+extern fn TLS_client_method() ?*const anyopaque;
+extern fn SSL_CTX_new(method: ?*const anyopaque) ?*OpenSslCtx;
+extern fn SSL_CTX_free(ctx: ?*OpenSslCtx) void;
+extern fn SSL_CTX_set_default_verify_paths(ctx: ?*OpenSslCtx) c_int;
+extern fn SSL_CTX_set_verify(ctx: ?*OpenSslCtx, mode: c_int, callback: ?*anyopaque) void;
+extern fn SSL_new(ctx: ?*OpenSslCtx) ?*OpenSslConn;
+extern fn SSL_free(conn: ?*OpenSslConn) void;
+extern fn SSL_set_fd(conn: ?*OpenSslConn, fd: c_int) c_int;
+extern fn SSL_ctrl(conn: ?*OpenSslConn, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
+extern fn SSL_set1_host(conn: ?*OpenSslConn, name: [*:0]const u8) c_int;
+extern fn SSL_connect(conn: ?*OpenSslConn) c_int;
+extern fn SSL_get_verify_result(conn: ?*const OpenSslConn) c_long;
+extern fn SSL_write(conn: ?*OpenSslConn, data: *const anyopaque, len: c_int) c_int;
+extern fn SSL_read(conn: ?*OpenSslConn, data: *anyopaque, len: c_int) c_int;
 const CFile = opaque {};
 extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*CFile;
 extern fn fread(ptr: ?*anyopaque, size: usize, nmemb: usize, stream: ?*CFile) usize;
@@ -80,6 +96,11 @@ const MAX_JWKS_KEYS: usize = 16;
 const DISCOVERY_CACHE_TTL_SEC: i64 = 300;
 const JWKS_CACHE_TTL_SEC: i64 = 300;
 const CLAIM_TIME_SKEW_SEC: i64 = 30;
+const MAX_METADATA_RESPONSE_SIZE: usize = 1024 * 1024;
+const SSL_VERIFY_PEER_C: c_int = 1;
+const SSL_CTRL_SET_TLSEXT_HOSTNAME_C: c_int = 55;
+const TLSEXT_NAMETYPE_HOST_NAME_C: c_long = 0;
+const X509_V_OK_C: c_long = 0;
 
 // Headers to pass through from upstream
 const oidc_pass_headers = [_]ngx_str_t{
@@ -104,6 +125,65 @@ fn oidcLastError() []const u8 {
     return oidc_last_error_buf[0..oidc_last_error_len];
 }
 
+fn extractHttpResponseBody(response: []const u8) ?[]u8 {
+    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse {
+        setOidcLastError("missing response header terminator");
+        return null;
+    };
+    const status_end = std.mem.indexOf(u8, response, "\r\n") orelse {
+        setOidcLastError("missing status line terminator");
+        return null;
+    };
+    const status_line = response[0..status_end];
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 200") and !std.mem.startsWith(u8, status_line, "HTTP/1.0 200")) {
+        setOidcLastError("non-200 response");
+        return null;
+    }
+    return std.heap.c_allocator.dupe(u8, response[header_end + 4 ..]) catch null;
+}
+
+fn fetchHttpsBody(fd: c_int, host: []const u8, request: []const u8) ?[]u8 {
+    const ctx = SSL_CTX_new(TLS_client_method()) orelse return null;
+    defer SSL_CTX_free(ctx);
+    if (SSL_CTX_set_default_verify_paths(ctx) != 1) return null;
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER_C, null);
+
+    const conn = SSL_new(ctx) orelse return null;
+    defer SSL_free(conn);
+    if (SSL_set_fd(conn, fd) != 1) return null;
+
+    const host_z = std.heap.c_allocator.dupeZ(u8, host) catch return null;
+    defer std.heap.c_allocator.free(host_z);
+    if (SSL_ctrl(conn, SSL_CTRL_SET_TLSEXT_HOSTNAME_C, TLSEXT_NAMETYPE_HOST_NAME_C, host_z.ptr) != 1) return null;
+    if (SSL_set1_host(conn, host_z.ptr) != 1) return null;
+    if (SSL_connect(conn) != 1 or SSL_get_verify_result(conn) != X509_V_OK_C) {
+        setOidcLastError("TLS certificate verification failed");
+        return null;
+    }
+
+    var sent: usize = 0;
+    while (sent < request.len) {
+        const chunk_len: c_int = @intCast(@min(request.len - sent, @as(usize, std.math.maxInt(c_int))));
+        const wrote = SSL_write(conn, request.ptr + sent, chunk_len);
+        if (wrote <= 0) return null;
+        sent += @intCast(wrote);
+    }
+
+    var response = std.ArrayList(u8).initCapacity(std.heap.c_allocator, 4096) catch return null;
+    defer response.deinit(std.heap.c_allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = SSL_read(conn, &chunk, chunk.len);
+        if (n <= 0) break;
+        if (response.items.len + @as(usize, @intCast(n)) > MAX_METADATA_RESPONSE_SIZE) {
+            setOidcLastError("metadata response too large");
+            return null;
+        }
+        response.appendSlice(std.heap.c_allocator, chunk[0..@intCast(n)]) catch return null;
+    }
+    return extractHttpResponseBody(response.items);
+}
+
 const oidc_jwks_key = extern struct {
     kid: ngx_str_t,
     n: ngx_str_t,
@@ -121,6 +201,7 @@ const oidc_loc_conf = extern struct {
     cookie_name: ngx_str_t,
     cookie_secret: ngx_str_t, // 32-byte hex key for AES-256-GCM
     use_pkce: ngx_flag_t,
+    allow_insecure_http: ngx_flag_t,
 
     // Derived from discovery or config
     issuer: ngx_str_t,
@@ -443,7 +524,6 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
     }
 
     const parsed_host = get_host(ngx_str_t{ .len = url.len, .data = @constCast(url.ptr) });
-    if (parsed_host.ssl) return null;
 
     const host_slice = core.slicify(u8, parsed_host.host.data, parsed_host.host.len);
     const path_slice = core.slicify(u8, parsed_host.path.data, parsed_host.path.len);
@@ -490,6 +570,8 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
     const request = std.fmt.allocPrint(std.heap.c_allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\nConnection: close\r\n\r\n", .{ path_slice, host_slice }) catch return null;
     defer std.heap.c_allocator.free(request);
 
+    if (parsed_host.ssl) return fetchHttpsBody(fd, host_slice, request);
+
     var sent: usize = 0;
     while (sent < request.len) {
         const wrote = send(fd, request.ptr + sent, request.len - sent, 0);
@@ -511,24 +593,19 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
             return null;
         }
         if (n == 0) break;
+        if (response.items.len + @as(usize, @intCast(n)) > MAX_METADATA_RESPONSE_SIZE) {
+            setOidcLastError("metadata response too large");
+            return null;
+        }
         response.appendSlice(std.heap.c_allocator, chunk[0..@intCast(n)]) catch return null;
     }
+    return extractHttpResponseBody(response.items);
+}
 
-    const header_end = std.mem.indexOf(u8, response.items, "\r\n\r\n") orelse {
-        setOidcLastError("missing response header terminator");
-        return null;
-    };
-    const status_end = std.mem.indexOf(u8, response.items, "\r\n") orelse {
-        setOidcLastError("missing status line terminator");
-        return null;
-    };
-    const status_line = response.items[0..status_end];
-    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 200") and !std.mem.startsWith(u8, status_line, "HTTP/1.0 200")) {
-        setOidcLastError("non-200 response");
-        return null;
-    }
-
-    return std.heap.c_allocator.dupe(u8, response.items[header_end + 4 ..]) catch null;
+fn endpointTransportAllowed(value: []const u8, allow_insecure_http: bool) bool {
+    if (std.mem.indexOf(u8, value, "://") == null) return true; // local metadata/JWKS file
+    if (std.mem.startsWith(u8, value, "https://")) return true;
+    return allow_insecure_http and std.mem.startsWith(u8, value, "http://");
 }
 
 fn loadDiscoveryMetadata(lccf: *oidc_loc_conf, force_refresh: bool) bool {
@@ -547,6 +624,10 @@ fn loadDiscoveryMetadata(lccf: *oidc_loc_conf, force_refresh: bool) bool {
     }
 
     const discovery_url = core.slicify(u8, lccf.discovery_url.data, lccf.discovery_url.len);
+    if (!endpointTransportAllowed(discovery_url, lccf.allow_insecure_http == 1)) {
+        setOidcLastError("insecure discovery transport is disabled");
+        return false;
+    }
     const body = fetchUrlBody(discovery_url) orelse return false;
     defer std.heap.c_allocator.free(body);
 
@@ -569,6 +650,14 @@ fn loadDiscoveryMetadata(lccf: *oidc_loc_conf, force_refresh: bool) bool {
         parsed.value.jwks_uri.len == 0)
     {
         setOidcLastError("discovery missing required fields");
+        return false;
+    }
+
+    if (!endpointTransportAllowed(parsed.value.authorization_endpoint, lccf.allow_insecure_http == 1) or
+        !endpointTransportAllowed(parsed.value.token_endpoint, lccf.allow_insecure_http == 1) or
+        !endpointTransportAllowed(parsed.value.jwks_uri, lccf.allow_insecure_http == 1))
+    {
+        setOidcLastError("insecure OIDC metadata endpoint is disabled");
         return false;
     }
 
@@ -1841,13 +1930,22 @@ fn createSessionFromClaims(r: [*c]ngx_http_request_t, lccf: [*c]oidc_loc_conf, r
 fn init_upstream_conf(ups: [*c]http.ngx_http_upstream_conf_t) void {
     ups.*.buffering = 0;
     ups.*.buffer_size = 32 * ngx_pagesize;
-    ups.*.ssl_verify = 0;
+    ups.*.ssl_verify = 1;
+    ups.*.ssl_server_name = 1;
+    ups.*.ssl_session_reuse = 1;
     ups.*.connect_timeout = 60000;
     ups.*.send_timeout = 60000;
     ups.*.read_timeout = 60000;
     ups.*.module = ngx_string("ngx_http_oidc_module");
     ups.*.hide_headers = conf.NGX_CONF_UNSET_PTR;
     ups.*.pass_headers = conf.NGX_CONF_UNSET_PTR;
+}
+
+fn ensure_upstream_tls(cf: [*c]ngx_conf_t, ups: [*c]http.ngx_http_upstream_conf_t) bool {
+    if (ups.*.ssl == core.nullptr(ssl.ngx_ssl_t)) {
+        ups.*.ssl = core.ngz_pcalloc_c(ssl.ngx_ssl_t, cf.*.pool) orelse return false;
+    }
+    return ssl.configure_verified_client(cf, ups.*.ssl);
 }
 
 fn create_token_upstream(r: [*c]ngx_http_request_t, rctx: [*c]oidc_request_ctx) !ngx_int_t {
@@ -2212,6 +2310,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     if (core.ngz_pcalloc_c(oidc_loc_conf, cf.*.pool)) |p| {
         p.*.enabled = conf.NGX_CONF_UNSET;
         p.*.use_pkce = conf.NGX_CONF_UNSET;
+        p.*.allow_insecure_http = conf.NGX_CONF_UNSET;
         p.*.discovery_url = ngx_null_str;
         p.*.client_id = ngx_null_str;
         p.*.client_secret = ngx_null_str;
@@ -2248,6 +2347,9 @@ fn merge_loc_conf(
 
     if (c.*.use_pkce == conf.NGX_CONF_UNSET) {
         c.*.use_pkce = if (prev.*.use_pkce == conf.NGX_CONF_UNSET) 1 else prev.*.use_pkce;
+    }
+    if (c.*.allow_insecure_http == conf.NGX_CONF_UNSET) {
+        c.*.allow_insecure_http = if (prev.*.allow_insecure_http == conf.NGX_CONF_UNSET) 0 else prev.*.allow_insecure_http;
     }
 
     if (c.*.discovery_url.len == 0 and prev.*.discovery_url.len > 0) {
@@ -2302,6 +2404,11 @@ fn merge_loc_conf(
     ) != NGX_OK) {
         return conf.NGX_CONF_ERROR;
     }
+
+    if (c.*.ups.ssl == core.nullptr(ssl.ngx_ssl_t) and prev.*.ups.ssl != core.nullptr(ssl.ngx_ssl_t)) {
+        c.*.ups.ssl = prev.*.ups.ssl;
+    }
+    if (!ensure_upstream_tls(cf, &c.*.ups)) return conf.NGX_CONF_ERROR;
 
     return conf.NGX_CONF_OK;
 }
@@ -2430,6 +2537,14 @@ export const ngx_http_oidc_commands = [_]ngx_command_t{
         .set = conf.ngx_conf_set_flag_slot,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = @offsetOf(oidc_loc_conf, "use_pkce"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("oidc_allow_insecure_http"),
+        .type = conf.NGX_HTTP_MAIN_CONF | conf.NGX_HTTP_SRV_CONF | conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_FLAG,
+        .set = conf.ngx_conf_set_flag_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(oidc_loc_conf, "allow_insecure_http"),
         .post = null,
     },
     ngx_command_t{

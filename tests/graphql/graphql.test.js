@@ -230,6 +230,15 @@ describe("graphql module", () => {
   });
 
   describe("request handling", () => {
+    test("rejects a request body above the configured module limit", async () => {
+      const res = await fetch(`${TEST_URL}/graphql`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: `{ ${"field ".repeat(128)} }` }),
+      });
+      expect(res.status).toBe(413);
+    });
+
     test("passes through GET requests without validation", async () => {
       const res = await fetch(`${TEST_URL}/graphql?query={user{name}}`);
       // GET requests should pass through (GraphQL validation is for POST only)
@@ -296,6 +305,25 @@ describe("graphql module", () => {
         }),
       });
       expect(res.status).toBe(200);
+    });
+
+    test("handles block strings without counting braces or introspection text", async () => {
+      const res = await fetch(`${TEST_URL}/graphql`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: '{ search(term: """{ __schema }""") { name } }' }),
+      });
+      expect(res.status).toBe(200);
+    });
+
+    test("rejects fragment syntax that the depth policy cannot safely expand", async () => {
+      const res = await fetch(`${TEST_URL}/graphql`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "query { user { ...UserFields } } fragment UserFields on User { name }" }),
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).errors[0].message).toContain("Fragments are unsupported");
     });
 
     test("rejects query with extra closing brace", async () => {

@@ -34,7 +34,6 @@ const cjson = ngx.cjson;
 
 extern var ngx_http_core_module: ngx_module_t;
 extern var ngx_http_upstream_module: ngx_module_t;
-extern var ngx_http_worker_events_default_zone: [*c]core.ngx_shm_zone_t;
 extern var ngx_worker: ngx_uint_t;
 
 extern fn upstream_balancer_ensure_hook(
@@ -53,8 +52,7 @@ extern fn upstream_balancer_register_peer_source(
     vtable: ?*const PeerSourceVTable,
 ) callconv(.c) ngx_int_t;
 
-extern fn ngx_http_worker_events_publish_internal(
-    zone: [*c]core.ngx_shm_zone_t,
+extern fn ngx_http_worker_events_publish_default(
     channel_str: ngx_str_t,
     type_str: ngx_str_t,
     payload_str: ngx_str_t,
@@ -332,8 +330,6 @@ fn publish_snapshot_restored_event(channel: ngx_str_t, target: ngx_str_t, source
 }
 
 fn publish_snapshot_event_type(event_type: ngx_str_t, channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, generation: u64, peer_count: usize) void {
-    const zone = ngx_http_worker_events_default_zone;
-    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
     if (channel.len == 0 or channel.data == null) return;
     const source_slice = if (source.len == 0 or source.data == null)
         "static"
@@ -347,12 +343,10 @@ fn publish_snapshot_event_type(event_type: ngx_str_t, channel: ngx_str_t, target
         .{ core.slicify(u8, target.data, target.len), source_slice, generation, peer_count },
     ) catch return;
     const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
-    _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
 }
 
 fn publish_peer_drain_event(channel: ngx_str_t, target: ngx_str_t, event_type: ngx_str_t, address: []const u8, drain_count: u32, generation: u64) void {
-    const zone = ngx_http_worker_events_default_zone;
-    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
     if (channel.len == 0 or channel.data == null) return;
 
     var payload_buf: [256]u8 = undefined;
@@ -362,12 +356,10 @@ fn publish_peer_drain_event(channel: ngx_str_t, target: ngx_str_t, event_type: n
         .{ core.slicify(u8, target.data, target.len), address, drain_count, generation },
     ) catch return;
     const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
-    _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
 }
 
 fn publish_refresh_failed_event(channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, error_code: u32) void {
-    const zone = ngx_http_worker_events_default_zone;
-    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
     if (channel.len == 0 or channel.data == null) return;
 
     const event_type = ngx_string("refresh_failed");
@@ -383,7 +375,7 @@ fn publish_refresh_failed_event(channel: ngx_str_t, target: ngx_str_t, source: n
         .{ core.slicify(u8, target.data, target.len), source_slice, error_code },
     ) catch return;
     const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
-    _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
 }
 
 fn record_refresh_failure(ducf: [*c]DynamicUpstreamsSrvConf, lccf: [*c]dynamic_upstreams_loc_conf, code: u32) void {
@@ -725,8 +717,12 @@ fn merge_srv_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
 
 // ── Drain contract ────────────────────────────────────────────────────────────
 
-fn peer_is_marked_draining(store: *UpstreamStore, addr: []const u8) bool {
-    if (@atomicLoad(u32, &store.drain_count, .acquire) == 0) return false;
+fn peer_is_marked_draining(ducf: [*c]DynamicUpstreamsSrvConf, store: *UpstreamStore, addr: []const u8) bool {
+    const shpool = get_shpool(ducf.*.zone) orelse return false;
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
+
+    if (store.drain_count == 0) return false;
     const count: usize = @min(store.drain_count, MAX_DRAIN_PEERS);
     var j: usize = 0;
     while (j < count) : (j += 1) {
@@ -751,7 +747,7 @@ export fn ngz_du_is_peer_draining_in_upstream(
     if (store_cptr == core.nullptr(UpstreamStore)) return 0;
     const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
     const addr = core.slicify(u8, addr_data, addr_len);
-    return if (peer_is_marked_draining(store, addr)) 1 else 0;
+    return if (peer_is_marked_draining(ducf, store, addr)) 1 else 0;
 }
 
 // Backward-compatible global helper retained for any non-balancer callers.
@@ -764,7 +760,7 @@ export fn ngz_du_is_peer_draining(addr_data: [*c]u8, addr_len: usize) callconv(.
         const store_cptr = ducf.*.store;
         if (store_cptr == core.nullptr(UpstreamStore)) continue;
         const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
-        if (peer_is_marked_draining(store, addr)) return 1;
+        if (peer_is_marked_draining(ducf, store, addr)) return 1;
     }
     return 0;
 }
@@ -2290,7 +2286,7 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     }
     const store: *UpstreamStore = @alignCast(@ptrCast(store_cptr));
 
-    if (is_drain and !peer_exists_in_current_generation_or_static(uscf, store, addr)) {
+    if (is_drain and !peer_exists_in_current_generation_or_static(ducf, uscf, store, addr)) {
         record_store_error(ducf, DU_ERROR_INVALID_PEER);
         _ = send_json_response(r, http.NGX_HTTP_NOT_FOUND,
             ngx_string("{\"module\":\"dynamic_upstreams\",\"error\":\"peer address not present in current upstream\"}"));
@@ -2384,12 +2380,19 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
 }
 
 fn peer_exists_in_current_generation_or_static(
+    ducf: [*c]DynamicUpstreamsSrvConf,
     uscf: [*c]ngx_http_upstream_srv_conf_t,
     store: *UpstreamStore,
     addr: []const u8,
 ) bool {
-    const active_int = @atomicLoad(usize, @as(*const usize, @ptrCast(&store.active)), .acquire);
-    if (active_int != 0) {
+    // Every active-snapshot traversal participates in the same pin/refcount
+    // protocol as balancer requests, so concurrent activation cannot retire
+    // and free the graph while the drain handler walks it.
+    if (pin_active_snapshot_for_store(store)) |active_int| {
+        defer {
+            const ctx: ?*anyopaque = @ptrCast(@alignCast(ducf));
+            du_release_generation(ctx, core.nullptr(ngx_http_upstream_rr_peers_t), active_int);
+        }
         const snap: *Snapshot = @ptrFromInt(active_int);
         var p = snap.peers.*.peer;
         while (p != core.nullptr(ngx_http_upstream_rr_peer_t)) : (p = p.*.next) {

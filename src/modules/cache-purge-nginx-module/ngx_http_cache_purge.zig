@@ -32,9 +32,7 @@ const ngx_null_str = string.ngx_null_str;
 const CJSON = cjson.CJSON;
 
 extern var ngx_http_core_module: ngx_module_t;
-extern var ngx_http_worker_events_default_zone: [*c]core.ngx_shm_zone_t;
-extern fn ngx_http_worker_events_publish_internal(
-    zone: [*c]core.ngx_shm_zone_t,
+extern fn ngx_http_worker_events_publish_default(
     channel_str: ngx_str_t,
     type_str: ngx_str_t,
     payload_str: ngx_str_t,
@@ -66,6 +64,7 @@ const cache_tags_store = extern struct {
 };
 
 var ngx_http_cache_purge_tags_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_shm_zone_t);
+var cache_purge_api_enabled: bool = false;
 
 fn get_tags_store() ?[*c]cache_tags_store {
     const zone = ngx_http_cache_purge_tags_zone;
@@ -440,8 +439,6 @@ fn send_single_target_response(
 }
 
 fn publish_purge_event(channel: ngx_str_t, target: []const u8, purged: usize, mode: MatchMode) void {
-    const zone = ngx_http_worker_events_default_zone;
-    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
     if (channel.len == 0 or channel.data == null) return;
 
     const event_type = ngx_string("purged");
@@ -462,7 +459,7 @@ fn publish_purge_event(channel: ngx_str_t, target: []const u8, purged: usize, mo
         .len = @intCast(@intFromPtr(w) - @intFromPtr(&payload_buf)),
         .data = @ptrCast(&payload_buf),
     };
-    _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
 }
 
 fn publish_purge_summary_event(
@@ -472,8 +469,6 @@ fn publish_purge_summary_event(
     missing: usize,
     mode: MatchMode,
 ) void {
-    const zone = ngx_http_worker_events_default_zone;
-    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
     if (channel.len == 0 or channel.data == null) return;
 
     const event_type = ngx_string("purge_batch");
@@ -496,7 +491,7 @@ fn publish_purge_summary_event(
         .len = @intCast(@intFromPtr(w) - @intFromPtr(&payload_buf)),
         .data = @ptrCast(&payload_buf),
     };
-    _ = ngx_http_worker_events_publish_internal(zone, channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
 }
 
 // ── Response helper ───────────────────────────────────────────────────────────
@@ -833,6 +828,7 @@ fn ngx_conf_set_cache_purge_api(
     _ = cmd;
     if (core.castPtr(cache_purge_loc_conf, loc)) |lccf| {
         lccf.*.api_enabled = 1;
+        cache_purge_api_enabled = true;
         const clcf = core.castPtr(
             http.ngx_http_core_loc_conf_t,
             conf.ngx_http_conf_get_module_loc_conf(cf, &ngx_http_core_module),
@@ -1016,20 +1012,27 @@ fn postconfiguration_impl(cf: [*c]ngx_conf_t) ngx_int_t {
         .name = "ngx_http_cache_tags_filter_module",
         .linkage = .weak,
     });
-    if (cache_tags_tag == null) return NGX_OK;
+    if (cache_tags_tag == null) return if (cache_purge_api_enabled) NGX_ERROR else NGX_OK;
 
     var zone_name = ngx_string("cache_tags_zone");
     const zone = shm.ngx_shared_memory_add(cf, &zone_name, CACHE_TAGS_ZONE_SIZE, cache_tags_tag);
-    if (zone == core.nullptr(core.ngx_shm_zone_t)) return NGX_OK;
+    if (zone == core.nullptr(core.ngx_shm_zone_t)) return if (cache_purge_api_enabled) NGX_ERROR else NGX_OK;
     if (zone.*.init == null) zone.*.init = zone_init_noop;
     ngx_http_cache_purge_tags_zone = zone;
+    return NGX_OK;
+}
+
+fn preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
+    _ = cf;
+    cache_purge_api_enabled = false;
+    ngx_http_cache_purge_tags_zone = core.nullptr(core.ngx_shm_zone_t);
     return NGX_OK;
 }
 
 // ── Module exports ────────────────────────────────────────────────────────────
 
 export const ngx_http_cache_purge_module_ctx = ngx_http_module_t{
-    .preconfiguration = null,
+    .preconfiguration = preconfiguration,
     .postconfiguration = postconfiguration,
     .create_main_conf = null,
     .init_main_conf = null,

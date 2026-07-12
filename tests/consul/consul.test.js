@@ -30,6 +30,13 @@ describe("consul module", () => {
       { id: "cache-1", address: "10.0.0.5", port: 6379, tags: ["redis"] },
     ]);
 
+    consulMock.addService("large-service", Array.from({ length: 80 }, (_, i) => ({
+      id: `instance-${i}-\"quoted\"`,
+      address: `10.0.1.${(i % 250) + 1}`,
+      port: 7000 + i,
+      tags: ["large", `tag-${i}-\\escaped`],
+    })));
+
     // Set some KV data
     consulMock.setKV("config/app/timeout", "30");
     consulMock.setKV("config/app/retries", "3");
@@ -90,6 +97,18 @@ describe("consul module", () => {
       expect(body.services.length).toBe(1);
       expect(body.services[0].address).toBe("10.0.0.1");
       expect(body.services[0].port).toBe(8080);
+    });
+
+    test("renders responses larger than the old 8 KiB scratch buffer safely", async () => {
+      const res = await fetch(`${TEST_URL}/services/large-service`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.services).toHaveLength(80);
+      expect(body.services[0].id).toBe('instance-0-"quoted"');
+      expect(body.services[0].tags[1]).toBe("tag-0-\\escaped");
+
+      const followup = await fetch(`${TEST_URL}/services/api-service`);
+      expect(followup.status).toBe(200);
     });
 
     test("applies configured tag filter and forwards dc/token query metadata", async () => {

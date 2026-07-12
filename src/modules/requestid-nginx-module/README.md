@@ -121,3 +121,7 @@ Generated IDs follow RFC 4122 UUID version 4:
 - [x] Bun integration coverage exists at `tests/requestid/`.
 - [x] Bun integration coverage now verifies custom header names, upstream proxy forwarding via `$ngz_request_id`, case-insensitive incoming header matching, and internal-only tracking with `request_id_response off`.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S1 FIXED.** UUID generation now propagates entropy failure instead of formatting uninitialized bytes. Incoming IDs are accepted only when 1–128 bytes of visible non-space ASCII; invalid values are discarded and replaced with a checked UUID. Unit bounds/control-character coverage and the focused request-ID suite are green, including oversized/whitespace regeneration.

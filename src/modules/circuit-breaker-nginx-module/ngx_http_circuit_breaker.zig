@@ -139,11 +139,8 @@ fn initCircuitKey(cf: [*c]ngx_conf_t, lccf: *circuit_breaker_loc_conf) [*c]u8 {
     return conf.NGX_CONF_OK;
 }
 
-fn getCircuitStats(lccf: *circuit_breaker_loc_conf) ?[*c]SharedCircuitStats {
-    const store = getCircuitStore() orelse return null;
-    const key = core.slicify(u8, lccf.*.circuit_key.data, lccf.*.circuit_key.len);
-
-    for (&store[0].entries) |*entry| {
+fn findOrCreateCircuit(store: *circuit_store, key: []const u8) ?*SharedCircuitStats {
+    for (&store.entries) |*entry| {
         const entry_key: []const u8 = @ptrCast(entry.key[0..entry.key_len]);
         if (entry.key_len == key.len and std.mem.eql(u8, entry_key, key)) {
             return &entry.stats;
@@ -151,10 +148,10 @@ fn getCircuitStats(lccf: *circuit_breaker_loc_conf) ?[*c]SharedCircuitStats {
     }
 
     if (store.*.circuit_count >= MAX_CIRCUITS) {
-        return &store[0].entries[0].stats;
+        return null;
     }
 
-    for (&store[0].entries) |*entry| {
+    for (&store.entries) |*entry| {
         if (entry.key_len == 0) {
             entry.* = std.mem.zeroes(CircuitEntry);
             const copy_len = @min(key.len, MAX_CIRCUIT_KEY_LEN);
@@ -166,7 +163,14 @@ fn getCircuitStats(lccf: *circuit_breaker_loc_conf) ?[*c]SharedCircuitStats {
         }
     }
 
-    return &store[0].entries[0].stats;
+    return null;
+}
+
+fn getCircuitStats(lccf: *circuit_breaker_loc_conf) ?[*c]SharedCircuitStats {
+    const store_ptr = getCircuitStore() orelse return null;
+    const store = core.castPtr(circuit_store, store_ptr) orelse return null;
+    const key = core.slicify(u8, lccf.*.circuit_key.data, lccf.*.circuit_key.len);
+    return findOrCreateCircuit(store, key);
 }
 
 // Get current time in milliseconds
@@ -257,11 +261,13 @@ fn ngx_http_circuit_breaker_access_handler(r: [*c]ngx_http_request_t) callconv(.
         return NGX_DECLINED;
     }
 
-    const shpool = getCircuitShpool() orelse return NGX_DECLINED;
+    const shpool = getCircuitShpool() orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
     shm.ngx_shmtx_lock(&shpool.*.mutex);
     defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
 
-    const stats = getCircuitStats(lccf) orelse return NGX_DECLINED;
+    // Saturation or missing shared state must fail closed.  Failing open here
+    // silently removes the protection precisely when its state is unavailable.
+    const stats = getCircuitStats(lccf) orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
 
     // Check for timeout transition
     checkTimeout(stats, lccf.*.timeout_ms);
@@ -569,3 +575,19 @@ export var ngx_http_circuit_breaker_module = ngx.module.make_module(
 const expectEqual = std.testing.expectEqual;
 
 test "circuit_breaker module" {}
+
+test "capacity exhaustion never aliases an existing circuit" {
+    var store: circuit_store = std.mem.zeroes(circuit_store);
+    var key_buf: [32]u8 = undefined;
+
+    for (0..MAX_CIRCUITS) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "circuit-{d}", .{i});
+        const stats = findOrCreateCircuit(&store, key) orelse return error.TestUnexpectedResult;
+        stats.failure_count = @intCast(i + 1);
+    }
+
+    const first_before = store.entries[0].stats.failure_count;
+    try std.testing.expect(findOrCreateCircuit(&store, "overflow-circuit") == null);
+    try std.testing.expectEqual(first_before, store.entries[0].stats.failure_count);
+    try std.testing.expectEqual(@as(ngx_uint_t, MAX_CIRCUITS), store.circuit_count);
+}

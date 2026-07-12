@@ -117,3 +117,7 @@ server {
 - [x] Circuit state is now stored in an nginx shared-memory zone keyed by configured location identity instead of per-worker globals.
 - [x] Bun integration coverage now runs with `worker_processes 2` and verifies that an open circuit is enforced across workers.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 FIXED; S1 RECOVERY CONTROL OPEN.** Capacity exhaustion now returns no entry instead of aliasing entry zero, and protected requests fail closed with 503 when circuit state cannot be allocated. A 64+1 unit regression proves the first circuit remains unchanged, while the focused 16-case integration suite remains green. S1 follow-ups are saturation telemetry/configurable capacity, strict malformed directive rejection, and a bounded number of half-open probes to prevent a recovery stampede.

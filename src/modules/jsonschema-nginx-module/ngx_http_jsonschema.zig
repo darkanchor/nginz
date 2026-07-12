@@ -37,7 +37,19 @@ const jsonschema_loc_conf = extern struct {
     enabled: ngx_flag_t,
     schema: ngx_str_t, // inline schema JSON string
     schema_json: [*c]cjson.cJSON,
+    body_max_size: usize,
 };
+
+const DEFAULT_BODY_MAX_SIZE: usize = 1024 * 1024;
+const NGX_HTTP_REQUEST_ENTITY_TOO_LARGE: ngx_int_t = 413;
+
+fn isJsonContentType(content_type: ngx_str_t) bool {
+    if (content_type.len == 0 or content_type.data == null) return false;
+    var media_type: []const u8 = core.slicify(u8, content_type.data, content_type.len);
+    if (std.mem.indexOfScalar(u8, media_type, ';')) |semi| media_type = media_type[0..semi];
+    media_type = std.mem.trim(u8, media_type, " \t");
+    return std.ascii.eqlIgnoreCase(media_type, "application/json");
+}
 
 // Request context for tracking validation state
 const jsonschema_ctx = extern struct {
@@ -55,6 +67,60 @@ const ValidationResult = struct {
 
 // Maximum recursion depth to prevent stack overflow
 const MAX_VALIDATION_DEPTH = 100;
+
+fn validateSchemaDefinition(schema: [*c]cjson.cJSON, depth: usize) bool {
+    if (schema == core.nullptr(cjson.cJSON) or cjson.cJSON_IsObject(schema) != 1 or depth > MAX_VALIDATION_DEPTH) return false;
+
+    var it = CJSON.Iterator.init(schema);
+    while (it.next()) |keyword| {
+        if (keyword.*.string == core.nullptr(u8)) return false;
+        const name = std.mem.span(keyword.*.string);
+
+        if (std.mem.eql(u8, name, "type")) {
+            const value = CJSON.stringValue(keyword) orelse return false;
+            const type_name = core.slicify(u8, value.data, value.len);
+            if (!std.mem.eql(u8, type_name, "string") and
+                !std.mem.eql(u8, type_name, "number") and
+                !std.mem.eql(u8, type_name, "integer") and
+                !std.mem.eql(u8, type_name, "boolean") and
+                !std.mem.eql(u8, type_name, "object") and
+                !std.mem.eql(u8, type_name, "array") and
+                !std.mem.eql(u8, type_name, "null")) return false;
+            continue;
+        }
+
+        if (std.mem.eql(u8, name, "required")) {
+            if (cjson.cJSON_IsArray(keyword) != 1) return false;
+            var required_it = CJSON.Iterator.init(keyword);
+            while (required_it.next()) |entry| _ = CJSON.stringValue(entry) orelse return false;
+            continue;
+        }
+
+        if (std.mem.eql(u8, name, "properties")) {
+            if (cjson.cJSON_IsObject(keyword) != 1) return false;
+            var properties_it = CJSON.Iterator.init(keyword);
+            while (properties_it.next()) |property_schema| {
+                if (!validateSchemaDefinition(property_schema, depth + 1)) return false;
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, name, "minLength") or std.mem.eql(u8, name, "maxLength")) {
+            const limit = CJSON.intValue(keyword) orelse return false;
+            if (limit < 0) return false;
+            continue;
+        }
+
+        if (std.mem.eql(u8, name, "minimum") or std.mem.eql(u8, name, "maximum")) {
+            _ = CJSON.floatValue(keyword) orelse return false;
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
 
 // Validate JSON value against schema
 fn validateValue(
@@ -206,12 +272,12 @@ fn validateValue(
 }
 
 // Send error response
-fn sendErrorResponse(r: [*c]ngx_http_request_t, message: []const u8) ngx_int_t {
+fn sendErrorResponseStatus(r: [*c]ngx_http_request_t, message: []const u8, status: ngx_uint_t) ngx_int_t {
     // Set content type
     const content_type = ngx_string("application/json");
     r.*.headers_out.content_type = content_type;
     r.*.headers_out.content_type_len = content_type.len;
-    r.*.headers_out.status = 400;
+    r.*.headers_out.status = @intCast(status);
 
     // Build error response
     const error_template = "{\"error\":\"validation_failed\",\"message\":\"";
@@ -252,6 +318,10 @@ fn sendErrorResponse(r: [*c]ngx_http_request_t, message: []const u8) ngx_int_t {
     return http.ngx_http_output_filter(r, &out);
 }
 
+fn sendErrorResponse(r: [*c]ngx_http_request_t, message: []const u8) ngx_int_t {
+    return sendErrorResponseStatus(r, message, 400);
+}
+
 // Read request body and validate
 export fn ngx_http_jsonschema_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     const rctx = core.castPtr(jsonschema_ctx, r.*.ctx[ngx_http_jsonschema_module.ctx_index]) orelse {
@@ -259,6 +329,12 @@ export fn ngx_http_jsonschema_body_handler(r: [*c]ngx_http_request_t) callconv(.
         return;
     };
     rctx.*.waiting_body = 0;
+
+    if (r.*.request_body != null and r.*.request_body.*.temp_file != null) {
+        _ = sendErrorResponseStatus(r, "request body requires file buffering", NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+        http.ngx_http_finalize_request(r, NGX_DONE);
+        return;
+    }
 
     // Check if request body exists
     if (r.*.request_body == null or r.*.request_body.*.bufs == null) {
@@ -273,8 +349,20 @@ export fn ngx_http_jsonschema_body_handler(r: [*c]ngx_http_request_t) callconv(.
     var chain = r.*.request_body.*.bufs;
     while (chain != null) : (chain = chain.*.next) {
         if (chain.*.buf != null) {
-            const b = chain.*.buf;
-            body_len += @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
+            const chunk_len_off = buf.ngx_buf_size(chain.*.buf);
+            if (chunk_len_off < 0) {
+                http.ngx_http_finalize_request(r, NGX_ERROR);
+                return;
+            }
+            body_len = std.math.add(usize, body_len, @as(usize, @intCast(chunk_len_off))) catch {
+                http.ngx_http_finalize_request(r, NGX_ERROR);
+                return;
+            };
+            if (body_len > rctx.*.lccf.*.body_max_size) {
+                _ = sendErrorResponseStatus(r, "request body exceeds jsonschema_body_max_size", NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+                http.ngx_http_finalize_request(r, NGX_DONE);
+                return;
+            }
         }
     }
 
@@ -355,9 +443,7 @@ export fn ngx_http_jsonschema_access_handler(r: [*c]ngx_http_request_t) callconv
 
     // Check content-type is JSON
     if (r.*.headers_in.content_type != null) {
-        const ct = r.*.headers_in.content_type.*.value;
-        const ct_slice = core.slicify(u8, ct.data, ct.len);
-        if (std.mem.indexOf(u8, ct_slice, "application/json") == null) {
+        if (!isJsonContentType(r.*.headers_in.content_type.*.value)) {
             return NGX_DECLINED;
         }
     } else {
@@ -372,6 +458,9 @@ export fn ngx_http_jsonschema_access_handler(r: [*c]ngx_http_request_t) callconv
     if (rctx.*.done == 1) {
         return NGX_DECLINED;
     }
+    if (r.*.headers_in.content_length_n > @as(core.off_t, @intCast(lccf.*.body_max_size))) {
+        return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+    }
     rctx.*.waiting_body = 1;
     rctx.*.lccf = lccf;
     r.*.flags1.discard_body = false;
@@ -385,6 +474,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     if (core.ngz_pcalloc_c(jsonschema_loc_conf, cf.*.pool)) |p| {
         p.*.enabled = conf.NGX_CONF_UNSET;
         p.*.schema = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
+        p.*.body_max_size = conf.NGX_CONF_UNSET_SIZE;
         return p;
     }
     return null;
@@ -406,6 +496,9 @@ fn merge_loc_conf(
     if (c.*.schema.len == 0 and prev.*.schema.len > 0) {
         c.*.schema = prev.*.schema;
     }
+    if (c.*.body_max_size == conf.NGX_CONF_UNSET_SIZE) {
+        c.*.body_max_size = if (prev.*.body_max_size == conf.NGX_CONF_UNSET_SIZE) DEFAULT_BODY_MAX_SIZE else prev.*.body_max_size;
+    }
 
     return conf.NGX_CONF_OK;
 }
@@ -425,6 +518,10 @@ fn ngx_conf_set_schema(
             lccf.*.schema_json = cj.decode(lccf.*.schema) catch {
                 return conf.NGX_CONF_ERROR;
             };
+            if (!validateSchemaDefinition(lccf.*.schema_json, 0)) {
+                log.ngz_log_error(log.NGX_LOG_EMERG, cf.*.log, 0, "jsonschema contains unsupported or malformed vocabulary", .{});
+                return conf.NGX_CONF_ERROR;
+            }
         }
     }
     return conf.NGX_CONF_OK;
@@ -464,6 +561,14 @@ export const ngx_http_jsonschema_commands = [_]ngx_command_t{
         .set = ngx_conf_set_schema,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("jsonschema_body_max_size"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_size_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(jsonschema_loc_conf, "body_max_size"),
         .post = null,
     },
     conf.ngx_null_command,

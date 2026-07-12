@@ -1,7 +1,28 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { startNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 
 const MODULE = "jsonschema";
+
+function testSchemaConfig(schema) {
+  const runtime = mkdtempSync(join(tmpdir(), "nginz-jsonschema-config-"));
+  const config = join(runtime, "nginx.conf");
+  mkdirSync(join(runtime, "logs"), { recursive: true });
+  writeFileSync(config, `daemon off; error_log stderr notice; pid logs/nginx.pid;
+events { worker_connections 16; }
+http { server { listen 8899; location / { jsonschema '${schema}'; echozn ok; } } }
+`);
+  try {
+    return spawnSync("./zig-out/bin/nginz", ["-t", "-p", runtime, "-c", config], {
+      cwd: process.cwd(), encoding: "utf8",
+    });
+  } finally {
+    rmSync(runtime, { recursive: true, force: true });
+  }
+}
 
 describe("jsonschema module", () => {
   beforeAll(async () => {
@@ -94,6 +115,15 @@ describe("jsonschema module", () => {
   });
 
   describe("invalid JSON validation", () => {
+    test("rejects a request body above the configured module limit", async () => {
+      const res = await fetch(`${TEST_URL}/api/users`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "x".repeat(160), email: "john@example.com" }),
+      });
+      expect(res.status).toBe(413);
+    });
+
     test("rejects invalid JSON syntax with 400", async () => {
       const res = await fetch(`${TEST_URL}/api/users`, {
         method: "POST",
@@ -173,6 +203,15 @@ describe("jsonschema module", () => {
   });
 
   describe("content type handling", () => {
+    test("does not mistake JSON-like media types for JSON", async () => {
+      const res = await fetch(`${TEST_URL}/api/users`, {
+        method: "POST",
+        headers: { "Content-Type": "application/jsonp" },
+        body: "not json",
+      });
+      expect(res.status).toBe(200);
+    });
+
     test("skips validation for non-JSON content type", async () => {
       const res = await fetch(`${TEST_URL}/api/users`, {
         method: "POST",
@@ -198,6 +237,24 @@ describe("jsonschema module", () => {
         body: "",
       });
       expect(res.status).toBe(200);
+    });
+  });
+
+  describe("schema vocabulary validation", () => {
+    test("rejects unsupported schema keywords at configuration time", () => {
+      const result = testSchemaConfig('{"type":"string","pattern":"^safe$"}');
+      const output = `${result.stderr}${result.stdout}`;
+      expect(output).toContain("configuration file");
+      expect(output).toContain("test failed");
+      expect(output).toContain("unsupported or malformed vocabulary");
+    });
+
+    test("rejects malformed supported keywords at configuration time", () => {
+      const result = testSchemaConfig('{"type":"object","required":"name"}');
+      const output = `${result.stderr}${result.stdout}`;
+      expect(output).toContain("configuration file");
+      expect(output).toContain("test failed");
+      expect(output).toContain("unsupported or malformed vocabulary");
     });
   });
 });

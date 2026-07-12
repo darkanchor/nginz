@@ -184,3 +184,7 @@ http {
 
 - [nginx njs documentation](https://nginx.org/en/docs/njs/)
 - [njs reference](https://nginx.org/en/docs/njs/reference.html)
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 INTEGRATION REGRESSION CLEARED; CONTINUE SOAKING.** After the Redis protocol hardening and pgrest pool-ownership changes, the formerly failing `combo-subrequest.test.js` passes all 17 cases and a `--rerun-each 10` soak passes 170/170 with single INCR execution and no connection resets. This establishes a reproducible green composition baseline, though the earlier failure was not reduced to one definitive root cause. Preserve logs on future failure and retain reload, shared-dict, timer, subrequest, fetch, and QuickJS cases as release gates.

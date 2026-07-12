@@ -109,6 +109,17 @@ describe("echoz module", () => {
       expect(body).toContain("body received:");
       expect(body).toContain("test body content");
     });
+
+    test("request-body variable is empty when no body was read", async () => {
+      const res = await fetch(`${TEST_URL}/body-variable-without-read`);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("");
+
+      // Prove the worker remains available after evaluating the variable.
+      const followup = await fetch(`${TEST_URL}/echo`);
+      expect(followup.status).toBe(200);
+      expect(await followup.text()).toBe("hello world\n");
+    });
   });
 
   describe("echoz_location_async directive", () => {

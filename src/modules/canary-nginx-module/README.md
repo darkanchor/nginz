@@ -126,3 +126,7 @@ canary_percentage 50;  # 50/50 split
 - [x] Bun integration coverage exists at `tests/canary/`.
 - [x] Bun integration coverage now verifies 0% and 100% percentage boundaries, header-mismatch percentage fallback, and repeated `$ngz_canary` reads staying stable within a single request.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S1 FIXED.** Entropy acquisition is checked and fails predictably to the stable route with an error log. Invalid or out-of-range percentages now fail configuration instead of becoming zero or 100, and explicit `percentage_set` state lets a child `0%` override inherit correctly. The focused 15-case routing suite and a zero-inheritance unit proof are green.

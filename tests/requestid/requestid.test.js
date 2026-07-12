@@ -110,6 +110,17 @@ describe("requestid module", () => {
       expect(res.headers.get("X-Correlation-ID")).toBe(incomingId);
       expect(res.headers.get("X-Request-ID")).toBeNull();
     });
+
+    test("rejects oversized or whitespace-bearing incoming IDs and regenerates", async () => {
+      for (const incomingId of ["x".repeat(129), "not a safe id"]) {
+        const res = await fetch(`${TEST_URL}/return-test`, {
+          headers: { "X-Request-ID": incomingId },
+        });
+        const responseId = res.headers.get("X-Request-ID");
+        expect(responseId).not.toBe(incomingId);
+        expect(responseId).toMatch(UUID4_PATTERN);
+      }
+    });
   });
 
   describe("proxy pass", () => {

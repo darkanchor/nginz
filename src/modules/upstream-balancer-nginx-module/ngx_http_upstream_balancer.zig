@@ -379,6 +379,12 @@ fn releaseDynamicPeerGraph(ctx: *BalancerRequestCtx) void {
     ctx.dynamic_active = 0;
 }
 
+fn cleanupDynamicPeerGraph(data: ?*anyopaque) callconv(.c) void {
+    const raw = data orelse return;
+    const ctx: *BalancerRequestCtx = @ptrCast(@alignCast(raw));
+    releaseDynamicPeerGraph(ctx);
+}
+
 fn bindDynamicPeerSource(
     r: [*c]ngx_http_request_t,
     bcf: *BalancerSrvConf,
@@ -393,12 +399,24 @@ fn bindDynamicPeerSource(
     const peers = get_fn(bcf.peer_source_ctx, r, &generation);
     if (peers == null) return core.NGX_OK;
 
+    // get_active_peers returns a pinned generation.  Release it on every
+    // initialization failure before ownership is transferred to the request
+    // context; request-pool cleanup handles all later exits.
+    var transferred = false;
+    defer if (!transferred and generation != 0) {
+        if (vtable.release_generation) |raw_release| {
+            const release_fn: PeerSourceReleaseGenerationFn = @ptrCast(@alignCast(raw_release));
+            release_fn(bcf.peer_source_ctx, peers, generation);
+        }
+    };
+
     const rrp = core.castPtr(ngx_http_upstream_rr_peer_data_t, ctx.original_data) orelse return core.NGX_ERROR;
     const total_peers = totalPeerCount(peers);
     const tried_words = triedWordCount(total_peers);
     const tried_mem = core.castPtr(usize, core.ngx_pcalloc(r.*.pool, tried_words * @sizeOf(usize))) orelse return core.NGX_ERROR;
 
     applyDynamicPeerGraph(ctx, rrp, peers, tried_mem, generation, bcf.peer_source_ctx, @constCast(@ptrCast(vtable.release_generation)));
+    transferred = true;
     incrementMetric(.runtime_peer_source_requests_total);
     return core.NGX_OK;
 }
@@ -638,6 +656,10 @@ export fn upstream_balancer_init_peer(
     ctx.dynamic_source_ctx = null;
     ctx.dynamic_release_generation = null;
     ctx.dynamic_active = 0;
+
+    const cleanup = core.ngx_pool_cleanup_add(r.*.pool, 0) orelse return core.NGX_ERROR;
+    cleanup.*.handler = cleanupDynamicPeerGraph;
+    cleanup.*.data = ctx;
 
     r.*.ctx[ngx_http_upstream_balancer_module.ctx_index] = ctx;
 
@@ -1242,6 +1264,23 @@ test "dynamic peer graph can be pinned and released once per request ctx" {
 
     releaseDynamicPeerGraph(&ctx);
     try std.testing.expectEqual(@as(usize, 1), test_release_generation_calls);
+}
+
+test "request cleanup is an idempotent generation release backstop" {
+    test_release_generation_calls = 0;
+    test_release_generation_value = 0;
+    var ctx: BalancerRequestCtx = std.mem.zeroes(BalancerRequestCtx);
+    ctx.dynamic_peers = @ptrFromInt(@alignOf(ngx_http_upstream_rr_peers_t));
+    ctx.dynamic_generation = 91;
+    ctx.dynamic_release_generation = @constCast(@ptrCast(&testReleaseGeneration));
+    ctx.dynamic_active = 1;
+
+    cleanupDynamicPeerGraph(&ctx);
+    cleanupDynamicPeerGraph(&ctx);
+
+    try std.testing.expectEqual(@as(usize, 1), test_release_generation_calls);
+    try std.testing.expectEqual(@as(u64, 91), test_release_generation_value);
+    try std.testing.expectEqual(@as(core.ngx_flag_t, 0), ctx.dynamic_active);
 }
 
 test "peer source draining helper fail-opens without callback" {

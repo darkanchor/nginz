@@ -31,6 +31,7 @@ extern var ngx_http_core_module: ngx_module_t;
 const transform_loc_conf = extern struct {
     enabled: ngx_flag_t,
     response_path: ngx_str_t, // JSON path like "$.data.items"
+    response_max_size: usize,
 };
 
 // Request context for buffering response
@@ -39,7 +40,19 @@ const transform_ctx = extern struct {
     buffer_len: usize,
     buffer_cap: usize,
     done: ngx_flag_t,
+    rejected: ngx_flag_t,
+    saw_flush: ngx_flag_t,
 };
+
+const DEFAULT_RESPONSE_MAX_SIZE: usize = 1024 * 1024;
+
+fn isJsonContentType(content_type: ngx_str_t) bool {
+    if (content_type.len == 0 or content_type.data == null) return false;
+    var media_type: []const u8 = core.slicify(u8, content_type.data, content_type.len);
+    if (std.mem.indexOfScalar(u8, media_type, ';')) |semi| media_type = media_type[0..semi];
+    media_type = std.mem.trim(u8, media_type, " \t");
+    return std.ascii.eqlIgnoreCase(media_type, "application/json");
+}
 
 fn encodeJsonString(value: ngx_str_t, pool: [*c]core.ngx_pool_t) ?ngx_str_t {
     const slice = core.slicify(u8, value.data, value.len);
@@ -110,13 +123,15 @@ fn extractJsonPath(json_str: ngx_str_t, path: []const u8, pool: [*c]core.ngx_poo
 }
 
 // Append data to context buffer
-fn appendToBuffer(ctx: [*c]transform_ctx, data: []const u8, pool: [*c]core.ngx_pool_t) bool {
-    const new_len = ctx.*.buffer_len + data.len;
+fn appendToBuffer(ctx: [*c]transform_ctx, data: []const u8, max_size: usize, pool: [*c]core.ngx_pool_t) bool {
+    const new_len = std.math.add(usize, ctx.*.buffer_len, data.len) catch return false;
+    if (new_len > max_size) return false;
 
     // Grow buffer if needed
     if (new_len > ctx.*.buffer_cap) {
-        const new_cap = if (ctx.*.buffer_cap == 0) 4096 else ctx.*.buffer_cap * 2;
-        const final_cap = if (new_cap < new_len) new_len else new_cap;
+        const doubled = std.math.mul(usize, ctx.*.buffer_cap, 2) catch max_size;
+        const new_cap = if (ctx.*.buffer_cap == 0) @min(4096, max_size) else @min(doubled, max_size);
+        const final_cap = @max(new_cap, new_len);
 
         const new_buf = core.castPtr(u8, core.ngx_pnalloc(pool, final_cap)) orelse return false;
 
@@ -132,6 +147,42 @@ fn appendToBuffer(ctx: [*c]transform_ctx, data: []const u8, pool: [*c]core.ngx_p
     @memcpy(core.slicify(u8, ctx.*.buffer + ctx.*.buffer_len, data.len), data);
     ctx.*.buffer_len = new_len;
     return true;
+}
+
+fn consumeBuffer(b: [*c]ngx_buf_t) void {
+    if (buf.ngx_buf_in_memory(b)) b.*.pos = b.*.last;
+    if (b.*.flags.in_file) b.*.file_pos = b.*.file_last;
+}
+
+fn appendInputBuffer(ctx: [*c]transform_ctx, b: [*c]ngx_buf_t, max_size: usize, pool: [*c]core.ngx_pool_t) bool {
+    const chunk_len_off = buf.ngx_buf_size(b);
+    if (chunk_len_off < 0) return false;
+    const chunk_len: usize = @intCast(chunk_len_off);
+    if (chunk_len == 0) return true;
+
+    if (buf.ngx_buf_in_memory(b)) {
+        return appendToBuffer(ctx, core.slicify(u8, b.*.pos, chunk_len), max_size, pool);
+    }
+
+    if (b.*.flags.in_file and b.*.file != null) {
+        const new_len = std.math.add(usize, ctx.*.buffer_len, chunk_len) catch return false;
+        if (new_len > max_size) return false;
+        const scratch = core.castPtr(u8, core.ngx_pnalloc(pool, chunk_len)) orelse return false;
+        const read_len = ngx.file.ngx_read_file(b.*.file, scratch, chunk_len, b.*.file_pos);
+        if (read_len == NGX_ERROR or @as(usize, @intCast(read_len)) != chunk_len) return false;
+        return appendToBuffer(ctx, core.slicify(u8, scratch, chunk_len), max_size, pool);
+    }
+
+    return false;
+}
+
+fn sendEmptyLastBuffer(r: [*c]ngx_http_request_t) ngx_int_t {
+    const out_buf = core.castPtr(ngx_buf_t, core.ngx_pcalloc(r.*.pool, @sizeOf(ngx_buf_t))) orelse return NGX_ERROR;
+    out_buf.*.flags.last_buf = (r == r.*.main);
+    out_buf.*.flags.last_in_chain = true;
+    var out_chain = ngx_chain_t{ .buf = out_buf, .next = null };
+    if (ngx_http_transform_next_body_filter) |next| return next(r, &out_chain);
+    return NGX_OK;
 }
 
 // Body filter - buffers and transforms response
@@ -158,12 +209,9 @@ export fn ngx_http_transform_body_filter(r: [*c]ngx_http_request_t, in: [*c]ngx_
     }
 
     // Skip non-JSON responses
-    if (r.*.headers_out.content_type.len > 0) {
-        const ct = core.slicify(u8, r.*.headers_out.content_type.data, r.*.headers_out.content_type.len);
-        if (std.mem.indexOf(u8, ct, "application/json") == null) {
-            if (ngx_http_transform_next_body_filter) |next| return next(r, in);
-            return NGX_OK;
-        }
+    if (!isJsonContentType(r.*.headers_out.content_type)) {
+        if (ngx_http_transform_next_body_filter) |next| return next(r, in);
+        return NGX_OK;
     }
 
     const ctx = http.ngz_http_get_module_ctx(transform_ctx, r, &ngx_http_transform_filter_module) catch {
@@ -176,6 +224,20 @@ export fn ngx_http_transform_body_filter(r: [*c]ngx_http_request_t, in: [*c]ngx_
         return NGX_OK;
     }
 
+    if (ctx.*.rejected == 1) {
+        var rejected_chain = in;
+        var rejected_last = false;
+        while (rejected_chain != null) : (rejected_chain = rejected_chain.*.next) {
+            if (rejected_chain.*.buf == null) continue;
+            const b = rejected_chain.*.buf;
+            if (b.*.flags.last_buf) rejected_last = true;
+            consumeBuffer(b);
+        }
+        if (!rejected_last) return NGX_OK;
+        ctx.*.done = 1;
+        return sendEmptyLastBuffer(r);
+    }
+
     // Buffer incoming data
     var cl = in;
     var is_last = false;
@@ -183,19 +245,17 @@ export fn ngx_http_transform_body_filter(r: [*c]ngx_http_request_t, in: [*c]ngx_
         const b = cl.*.buf;
         if (b == null) continue;
 
-        const pos = @intFromPtr(b.*.pos);
-        const last = @intFromPtr(b.*.last);
-        if (last > pos) {
-            const data = core.slicify(u8, b.*.pos, last - pos);
-            if (!appendToBuffer(ctx, data, r.*.pool)) {
+        if (buf.ngx_buf_size(b) > 0) {
+            if (!appendInputBuffer(ctx, b, lccf.*.response_max_size, r.*.pool)) {
                 return NGX_ERROR;
             }
         }
 
+        if (b.*.flags.flush) ctx.*.saw_flush = 1;
         if (b.*.flags.last_buf) {
             is_last = true;
-            break;
         }
+        consumeBuffer(b);
     }
 
     // If not done buffering, return OK (don't pass to next filter yet)
@@ -220,6 +280,7 @@ export fn ngx_http_transform_body_filter(r: [*c]ngx_http_request_t, in: [*c]ngx_
     out_buf.*.flags.memory = true;
     out_buf.*.flags.last_buf = (r == r.*.main);
     out_buf.*.flags.last_in_chain = true;
+    out_buf.*.flags.flush = ctx.*.saw_flush == 1;
 
     var out_chain: ngx_chain_t = undefined;
     out_chain.buf = out_buf;
@@ -249,16 +310,24 @@ export fn ngx_http_transform_header_filter(r: [*c]ngx_http_request_t) callconv(.
     };
 
     // If transform is enabled, clear content-length (we'll set it after transform)
-    if (lccf.*.enabled == 1 and lccf.*.response_path.len > 0) {
-        // Check if JSON
-        if (r.*.headers_out.content_type.len > 0) {
-            const ct = core.slicify(u8, r.*.headers_out.content_type.data, r.*.headers_out.content_type.len);
-            if (std.mem.indexOf(u8, ct, "application/json") != null) {
-                r.*.headers_out.content_length_n = -1;
-                if (r.*.headers_out.content_length != null) {
-                    r.*.headers_out.content_length.*.hash = 0;
-                    r.*.headers_out.content_length = null;
-                }
+    if (lccf.*.enabled == 1 and lccf.*.response_path.len > 0 and isJsonContentType(r.*.headers_out.content_type)) {
+        const ctx = http.ngz_http_get_module_ctx(transform_ctx, r, &ngx_http_transform_filter_module) catch return NGX_ERROR;
+        if (r.*.headers_out.content_length_n < 0 or
+            r.*.headers_out.content_length_n > @as(core.off_t, @intCast(lccf.*.response_max_size)))
+        {
+            ctx.*.rejected = 1;
+            r.*.headers_out.status = http.NGX_HTTP_BAD_GATEWAY;
+            r.*.headers_out.status_line = ngx_str_t{ .len = 0, .data = null };
+            r.*.headers_out.content_length_n = 0;
+            if (r.*.headers_out.content_length != null) {
+                r.*.headers_out.content_length.*.hash = 0;
+                r.*.headers_out.content_length = null;
+            }
+        } else {
+            r.*.headers_out.content_length_n = -1;
+            if (r.*.headers_out.content_length != null) {
+                r.*.headers_out.content_length.*.hash = 0;
+                r.*.headers_out.content_length = null;
             }
         }
     }
@@ -271,6 +340,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     if (core.ngz_pcalloc_c(transform_loc_conf, cf.*.pool)) |p| {
         p.*.enabled = 0;
         p.*.response_path = ngx_str_t{ .len = 0, .data = null };
+        p.*.response_max_size = conf.NGX_CONF_UNSET_SIZE;
         return p;
     }
     return null;
@@ -287,6 +357,12 @@ fn merge_loc_conf(
 
     if (c.*.enabled == 0) c.*.enabled = prev.*.enabled;
     if (c.*.response_path.len == 0) c.*.response_path = prev.*.response_path;
+    if (c.*.response_max_size == conf.NGX_CONF_UNSET_SIZE) {
+        c.*.response_max_size = if (prev.*.response_max_size == conf.NGX_CONF_UNSET_SIZE)
+            DEFAULT_RESPONSE_MAX_SIZE
+        else
+            prev.*.response_max_size;
+    }
 
     return conf.NGX_CONF_OK;
 }
@@ -339,6 +415,14 @@ export const ngx_http_transform_commands = [_]ngx_command_t{
         .set = ngx_conf_set_transform,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("transform_response_max_size"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_size_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(transform_loc_conf, "response_max_size"),
         .post = null,
     },
     conf.ngx_null_command,

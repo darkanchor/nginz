@@ -28,6 +28,7 @@ const NList = ngx.list.NList;
 
 // UUID4 length: 8-4-4-4-12 = 36 characters
 const UUID4_LEN: usize = 36;
+const MAX_ACCEPTED_REQUEST_ID_LEN: usize = 128;
 
 // Default header name
 const default_header_name: ngx_str_t = ngx_string("X-Request-ID");
@@ -51,10 +52,10 @@ const hex_chars = "0123456789abcdef";
 // Generate UUID4 and write to buffer
 // UUID4 format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
 // where x is random hex and y is 8, 9, a, or b
-fn generate_uuid4(buf: [*]u8) void {
+fn generate_uuid4(buf: [*]u8) bool {
     // Use Zig's crypto random for high-quality randomness
     var random_bytes: [16]u8 = undefined;
-    _ = std.c.getrandom(&random_bytes, random_bytes.len, 0);
+    if (std.c.getrandom(&random_bytes, random_bytes.len, 0) != random_bytes.len) return false;
 
     // Set version (4) in byte 6 (bits 4-7)
     random_bytes[6] = (random_bytes[6] & 0x0f) | 0x40;
@@ -73,6 +74,15 @@ fn generate_uuid4(buf: [*]u8) void {
         buf[pos + 1] = hex_chars[random_bytes[i] & 0x0f];
         pos += 2;
     }
+    return true;
+}
+
+fn valid_incoming_request_id(value: ngx_str_t) bool {
+    if (value.len == 0 or value.len > MAX_ACCEPTED_REQUEST_ID_LEN or value.data == null) return false;
+    for (core.slicify(u8, value.data, value.len)) |c| {
+        if (c < 0x21 or c > 0x7e) return false;
+    }
+    return true;
 }
 
 // Find incoming X-Request-ID header (or custom header name)
@@ -113,7 +123,7 @@ fn get_or_create_request_id(r: [*c]ngx_http_request_t, lccf: [*c]requestid_loc_c
     }
 
     // First, check for incoming header
-    if (find_request_id_header(r, lccf.*.header_name)) |incoming_id| {
+    if (find_request_id_header(r, lccf.*.header_name)) |incoming_id| if (valid_incoming_request_id(incoming_id)) {
         // Copy incoming ID to pool
         if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, incoming_id.len))) |buf| {
             core.ngz_memcpy(buf, incoming_id.data, incoming_id.len);
@@ -122,11 +132,15 @@ fn get_or_create_request_id(r: [*c]ngx_http_request_t, lccf: [*c]requestid_loc_c
             return ctx.*.request_id;
         }
         return null;
-    }
+    };
 
     // Generate new UUID4
     if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, UUID4_LEN))) |buf| {
-        generate_uuid4(buf);
+        if (!generate_uuid4(buf)) {
+            ngx.log.ngz_log_error(ngx.log.NGX_LOG_ERR, r.*.connection.*.log, 0,
+                "requestid: entropy acquisition failed", .{});
+            return null;
+        }
         ctx.*.request_id = ngx_str_t{ .len = UUID4_LEN, .data = buf };
         ctx.*.id_set = 1;
         return ctx.*.request_id;
@@ -381,7 +395,7 @@ const expect = std.testing.expect;
 
 test "uuid4 generation" {
     var buf: [UUID4_LEN]u8 = undefined;
-    generate_uuid4(&buf);
+    try expect(generate_uuid4(&buf));
 
     // Check format: 8-4-4-4-12
     try expectEqual(buf[8], '-');
@@ -397,4 +411,15 @@ test "uuid4 generation" {
 }
 
 test "requestid module" {
+}
+
+test "incoming request ids are bounded and visible ASCII" {
+    const valid = ngx_string("trace-123_ABC");
+    try expect(valid_incoming_request_id(valid));
+    const empty = ngx_string("");
+    try expect(!valid_incoming_request_id(empty));
+    var control = [_]u8{ 'a', '\n', 'b' };
+    try expect(!valid_incoming_request_id(.{ .data = &control, .len = control.len }));
+    var oversized = [_]u8{'x'} ** (MAX_ACCEPTED_REQUEST_ID_LEN + 1);
+    try expect(!valid_incoming_request_id(.{ .data = &oversized, .len = oversized.len }));
 }

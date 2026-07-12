@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { startNginz, stopNginz, cleanupRuntime as cleanupHarnessRuntime, TEST_URL } from "../harness.js";
 
@@ -11,7 +11,9 @@ const PEBBLE_CONTAINER = `nginz-acme-pebble-${Date.now()}`;
 const CHALLTESTSRV_CONTAINER = `nginz-acme-challtestsrv-${Date.now()}`;
 const PEBBLE_CONFIG_HOST = join(process.cwd(), "tests", MODULE, "pebble-config.json");
 const PEBBLE_CONFIG = "/test/pebble-config.json";
+const PEBBLE_CA_HOST = join(process.cwd(), "tests", MODULE, "pebble.minica.pem");
 const STORAGE_DIR = join(process.cwd(), "tests", MODULE, "runtime", "acme");
+const ERROR_LOG = join(process.cwd(), "tests", MODULE, "runtime", "logs", "error.log");
 
 function runResult(command, options = {}) {
   const result = Bun.spawnSync(command, {
@@ -113,6 +115,7 @@ function startPebble() {
     "127.0.0.1:8053"
   );
   assertContainerRunning(PEBBLE_CONTAINER);
+  docker("cp", `${PEBBLE_CONTAINER}:/test/certs/pebble.minica.pem`, PEBBLE_CA_HOST);
 }
 
 function stopContainer(name) {
@@ -129,7 +132,8 @@ function triggerAcmeFlow() {
     try {
       return JSON.parse(body);
     } catch {
-      throw new Error(`Failed to parse ACME trigger response as JSON. Status=${res.status}. Raw response:\n${body}`);
+      const nginxLog = existsSync(ERROR_LOG) ? readFileSync(ERROR_LOG, "utf8") : "<error log unavailable>";
+      throw new Error(`Failed to parse ACME trigger response as JSON. Status=${res.status}. Raw response:\n${body}\nnginx error log:\n${nginxLog}`);
     }
   });
 }
@@ -225,6 +229,7 @@ describe("acme module live Pebble integration", () => {
     await stopNginz();
     stopContainer(PEBBLE_CONTAINER);
     stopContainer(CHALLTESTSRV_CONTAINER);
+    try { unlinkSync(PEBBLE_CA_HOST); } catch {}
     cleanupHarnessRuntime(MODULE);
   }, 30000);
 

@@ -543,3 +543,7 @@ Add operator-visible incremental control without abandoning the immutable whole-
 - Add tests for `PATCH add` and `PATCH remove` proving the API compiles to a new generation and preserves last-good semantics on validation failure.
 - Add multi-worker tests proving all workers agree on the drained/active peer set after activation.
 - Add sticky-affinity regression coverage with `upstream-balancer` proving unchanged peers keep their relative ordering after partial mutation.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 CONCURRENT LIFETIME FIXED; STRESS PROOF OPEN.** Drain validation now pins the active snapshot for the complete traversal and releases it through the existing refcount protocol. All drain-table readers take the slab mutex used by drain/undrain mutation, eliminating races with whole-entry swaps. Paired balancer request cleanup prevents abandoned generation pins. The focused 58-case suite is green on isolated rerun (one preceding run had a non-reproduced validation-request reset); sustained PUT/PATCH/drain/traffic, reload, client-abort, and slab-pressure stress remains the acceptance proof.

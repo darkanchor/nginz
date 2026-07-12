@@ -119,6 +119,7 @@ const waf_ban_entry = extern struct {
     count: u16,
     strikes: u16,
     score: u16,
+    policy_scope: u64,
     first_seen: ngx_uint_t,
     last_seen: ngx_uint_t,
     ban_until: ngx_uint_t,
@@ -1234,11 +1235,36 @@ fn snapshotBanEntry(entry: *waf_ban_entry) void {
     std.mem.doNotOptimizeAway(snapshot);
 }
 
-fn assignBanEntryIp(entry: *waf_ban_entry, ip: []const u8) void {
+fn hashPolicyBytes(hash: *u64, bytes: []const u8) void {
+    for (bytes) |byte| {
+        hash.* ^= byte;
+        hash.* *%= 1099511628211;
+    }
+}
+
+fn policyScope(lccf: *waf_loc_conf) u64 {
+    var hash: u64 = 14695981039346656037;
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.enabled));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.mode));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.sqli_enabled));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.xss_enabled));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.check_body));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.ban_threshold));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.ban_window));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.ban_duration));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.score_threshold));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.score_decay_window));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.rule_count));
+    if (lccf.rules_file.data != null) hashPolicyBytes(&hash, core.slicify(u8, lccf.rules_file.data, lccf.rules_file.len));
+    return hash;
+}
+
+fn assignBanEntry(entry: *waf_ban_entry, ip: []const u8, scope: u64) void {
     resetBanEntry(entry);
     const copy_len: usize = @min(ip.len, WAF_BAN_MAX_IP_LEN);
     @memcpy(entry.ip[0..copy_len], ip[0..copy_len]);
     entry.ip_len = @intCast(copy_len);
+    entry.policy_scope = scope;
 }
 
 fn computeBanDuration(lccf: *waf_loc_conf, strikes: u16) ngx_uint_t {
@@ -1291,11 +1317,11 @@ fn applyOffenseToEntry(entry: *waf_ban_entry, now: ngx_uint_t, lccf: *waf_loc_co
     }
 }
 
-fn findBanEntry(store: [*c]waf_ban_store, ip: []const u8) ?[*c]waf_ban_entry {
+fn findBanEntry(store: [*c]waf_ban_store, ip: []const u8, scope: u64) ?[*c]waf_ban_entry {
     for (0..store.*.entries_count) |i| {
         const entry: [*c]waf_ban_entry = store.*.entries + i;
         const entry_ip: []const u8 = @ptrCast(entry[0].ip[0..entry[0].ip_len]);
-        if (entry[0].ip_len == ip.len and std.mem.eql(u8, entry_ip, ip)) {
+        if (entry[0].policy_scope == scope and entry[0].ip_len == ip.len and std.mem.eql(u8, entry_ip, ip)) {
             return entry;
         }
     }
@@ -1304,7 +1330,8 @@ fn findBanEntry(store: [*c]waf_ban_store, ip: []const u8) ?[*c]waf_ban_entry {
 
 fn getOrCreateBanEntry(shpool: [*c]core.ngx_slab_pool_t, store: [*c]waf_ban_store, ip: []const u8, lccf: *waf_loc_conf) ?[*c]waf_ban_entry {
     const now = nowSeconds();
-    if (findBanEntry(store, ip)) |entry| {
+    const scope = policyScope(lccf);
+    if (findBanEntry(store, ip, scope)) |entry| {
         decayBanEntry(entry, now, lccf);
         return entry;
     }
@@ -1313,7 +1340,7 @@ fn getOrCreateBanEntry(shpool: [*c]core.ngx_slab_pool_t, store: [*c]waf_ban_stor
         const entry: [*c]waf_ban_entry = store.*.entries + store.*.entries_count;
         const entry_ref: *waf_ban_entry = @ptrCast(@alignCast(entry));
         store.*.entries_count += 1;
-        assignBanEntryIp(entry_ref, ip);
+        assignBanEntry(entry_ref, ip, scope);
         return entry;
     }
 
@@ -1323,7 +1350,7 @@ fn getOrCreateBanEntry(shpool: [*c]core.ngx_slab_pool_t, store: [*c]waf_ban_stor
         const entry_ref: *waf_ban_entry = @ptrCast(@alignCast(entry));
         decayBanEntry(entry_ref, now, lccf);
         if (entry[0].ban_until == 0 and entry[0].count == 0 and entry[0].strikes == 0) {
-            assignBanEntryIp(entry_ref, ip);
+            assignBanEntry(entry_ref, ip, scope);
             return entry;
         }
 
@@ -1334,7 +1361,7 @@ fn getOrCreateBanEntry(shpool: [*c]core.ngx_slab_pool_t, store: [*c]waf_ban_stor
 
     _ = shpool;
     if (candidate) |entry| {
-        assignBanEntryIp(entry, ip);
+        assignBanEntry(entry, ip, scope);
         return entry;
     }
 
@@ -1358,7 +1385,7 @@ fn isClientBanned(r: [*c]ngx_http_request_t, lccf: *waf_loc_conf) bool {
 
     const store = if (getBanStoreFromZone(zone)) |existing| existing else ensureBanStore(zone, shpool.?) orelse return false;
 
-    if (findBanEntry(store, ip)) |entry| {
+    if (findBanEntry(store, ip, policyScope(lccf))) |entry| {
         const now = nowSeconds();
         decayBanEntry(entry, now, lccf);
         snapshotBanEntry(entry);
@@ -2050,14 +2077,13 @@ fn finalizeBlockedRequest(r: [*c]ngx_http_request_t, rctx: *waf_ctx, rule_type: 
     }
     rctx.*.done = 1;
     rctx.*.finalized = 1;
-
-    if (rctx.*.waiting_body == 1) {
-        if (r.*.header_in != null) {
-            r.*.header_in.*.pos = r.*.header_in.*.last;
-        }
-        r.*.flags1.keepalive = false;
-        r.*.flags1.lingering_close = true;
-    }
+    const blocked_after_body = rctx.*.waiting_body == 1;
+    rctx.*.waiting_body = 0;
+    // Body-phase denials do not continue to a content handler.  Advertise a
+    // normal connection close so a client pool cannot reuse body-buffer state,
+    // but do not force nginx's lingering-close path: that path can race the
+    // next pooled fetch and surface as ECONNRESET.
+    if (blocked_after_body) r.*.flags1.keepalive = false;
 
     const rc = sendBlockedResponse(r, rule_type, status);
     http.ngx_http_finalize_request(r, rc);
@@ -2842,7 +2868,7 @@ fn ngx_http_waf_score_variable(
                     if (core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr)) |shpool| {
                         shm.ngx_shmtx_lock(&shpool.*.mutex);
                         if (getBanStore()) |store| {
-                            if (findBanEntry(store, ip)) |entry| {
+                            if (findBanEntry(store, ip, policyScope(lccf))) |entry| {
                                 score = entry.*.score;
                             }
                         }

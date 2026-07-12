@@ -4,6 +4,12 @@ import {
   createVerify,
 } from "node:crypto";
 
+let nonceSequence = 0;
+function nextNonce(prefix) {
+  nonceSequence += 1;
+  return `${prefix}${nonceSequence}`;
+}
+
 export function signWechatpayMessage(body, { timestamp, nonce, privateKey }) {
   const signer = createSign("RSA-SHA256");
   signer.update(`${timestamp}\n${nonce}\n${body}\n`);
@@ -14,7 +20,7 @@ export function signWechatpayMessage(body, { timestamp, nonce, privateKey }) {
 export function buildWechatpayHeaders(body, {
   privateKey,
   timestamp = String(Math.floor(Date.now() / 1000)),
-  nonce = "testnonce1234567890",
+  nonce = nextNonce("testnonce"),
   serial,
   requestId = "req-123456",
   signature,
@@ -35,7 +41,7 @@ export function signedUpstreamResponse(body, {
   serial,
   status = 200,
   timestamp = String(Math.floor(Date.now() / 1000)),
-  nonce = "upstreamnonce123456",
+  nonce = nextNonce("upstreamnonce"),
   requestId = "upstream-req-1",
   signature,
   extraHeaders = {},

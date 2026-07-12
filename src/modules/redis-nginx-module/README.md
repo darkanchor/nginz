@@ -336,3 +336,7 @@ bun test tests/redis/redis.container.test.js
 - [x] Gap recorded: this audit pass added Bun guardrails for JSON string escaping, invalid `INCR`/`EXPIRE` protocol errors, MGET query parsing with extra parameters, and the 16-key MGET limit.
 - [x] Variable integration coverage now verifies `$redis_last_exists`, `$redis_last_error`, and `$redis_connection_state`, plus safe `$redis_last_value` hit semantics, across hit/miss/error/failure paths.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 FIXED; S1 STREAMING FOLLOW-UP (2026-07-12).** RESP bulk/array/integer parsing now uses checked slice arithmetic, overflow-safe numeric parsing, exact CRLF validation, a 32 KiB value limit, an exact 16-item MGET contract, and `NGX_HTTP_UPSTREAM_INVALID_HEADER` for controlled 502 responses. JSON rendering computes escaped size and writes to bounded request-pool storage up to 256 KiB; it no longer truncates fixed stack buffers. Focused coverage returns a 12 KiB value, rejects an overflowing RESP length, and proves the worker survives. Incremental responses beyond nginx's configured upstream buffer remain S1 streaming work.

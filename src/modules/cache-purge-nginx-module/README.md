@@ -388,3 +388,7 @@ A useful mental model is:
 - `worker-events`: may later help fan out purge notifications, but it is not the core of purge correctness
 
 That architecture is sound. The risky part is the shared metadata design between tagging and purging.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S1 DEPENDENCY LIFETIME FIXED; EVENT ACKNOWLEDGEMENT OPEN.** Cycle preconfiguration clears the cache-tags descriptor and API-enable state, and an enabled purge API now fails configuration when the canonical cache-tags owner/zone cannot be bound. Worker-events publication no longer sees a last-created/stale descriptor: the compatibility path fails on ambiguous multi-zone topology. The focused 39-case suite is green. Explicit named event-zone binding and surfacing publication failure in the purge response remain, as does the distinction between metadata deletion and physical nginx cache invalidation.

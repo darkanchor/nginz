@@ -553,15 +553,22 @@ export fn ngx_http_echoz_request_body_variable(
     data: core.uintptr_t,
 ) callconv(.c) ngx_int_t {
     _ = data;
-    const b0 = r.*.request_body == core.nullptr(http.ngx_http_request_body_t);
-    const b1 = r.*.request_body.*.bufs == core.nullptr(buf.ngx_chain_t);
-    const b2 = r.*.request_body.*.temp_file != core.nullptr(file.ngx_temp_file_t);
     v.*.flags.not_found = true;
-    if (b0 or b1 or b2) {
+
+    const request_body = r.*.request_body;
+    if (request_body == core.nullptr(http.ngx_http_request_body_t)) {
+        return NGX_OK;
+    }
+    if (request_body.*.bufs == core.nullptr(buf.ngx_chain_t)) {
+        return NGX_OK;
+    }
+    // ngz_chain_content only joins in-memory buffers.  A temp-file-backed
+    // request body must not be exposed as a partial value.
+    if (request_body.*.temp_file != core.nullptr(file.ngx_temp_file_t)) {
         return NGX_OK;
     }
     const body = buf.ngz_chain_content(
-        r.*.request_body.*.bufs,
+        request_body.*.bufs,
         r.*.pool,
     ) catch return NGX_ERROR;
     if (body.len > 0) {

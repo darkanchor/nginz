@@ -216,3 +216,7 @@ request body, decrypts and appends plaintxt for the location's content handler, 
 - [x] Bun integration coverage now exists under `tests/wechatpay/` for proxy signing/verification, access-phase verification, and OAEP encrypt/decrypt flows.
 - [x] Gap recorded: this audit pass fixed real upstream/body lifecycle bugs that the new Bun suite exposed, including premature finalize-on-`NGX_DONE` handling and incorrect upstream body buffering/copying.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 TRANSPORT/AUTHENTICITY FIXED; S1 CAPACITY OPEN.** HTTPS upstreams use system CA trust, SNI, certificate verification, and hostname validation; plain HTTP requires explicit `wechatpay_allow_insecure_http on`. Signed requests and upstream responses outside a ±300-second window are rejected. Successfully verified nonces enter a 1,024-entry shared-memory replay window, and a two-worker parallel regression proves twelve reuses are rejected after the first acceptance. Configurable replay capacity/telemetry and request/upstream body-size limits remain S1 work.

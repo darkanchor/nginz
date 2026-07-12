@@ -152,6 +152,7 @@ const PgPoolConn = extern struct {
     fd: c_int, // Socket file descriptor for event registration
     ngx_conn: ?*core.ngx_connection_t, // nginx connection wrapper
     request_ctx: ?*PgRequestCtx, // active request bound to this pooled connection
+    owner: ?*anyopaque, // *PgConnPool; avoids returning a connection to another backend
 };
 
 /// Connection pool for an upstream
@@ -174,12 +175,13 @@ const PgConnPool = struct {
             c.fd = -1;
             c.ngx_conn = null;
             c.request_ctx = null;
+            c.owner = self;
         }
     }
 
     /// Find a free connection slot
     pub fn getFreeSlot(self: *PgConnPool) ?*PgPoolConn {
-        for (&self.connections) |*c| {
+        for (self.connections[0..self.max_connections]) |*c| {
             if (c.state == .free) {
                 return c;
             }
@@ -189,7 +191,7 @@ const PgConnPool = struct {
 
     /// Find an idle connection ready for use
     pub fn getIdleConn(self: *PgConnPool) ?*PgPoolConn {
-        for (&self.connections) |*c| {
+        for (self.connections[0..self.max_connections]) |*c| {
             if (c.state == .idle and c.conn != null) {
                 return c;
             }
@@ -235,11 +237,16 @@ fn discard_pool_conn(pool_conn: *PgPoolConn) void {
         ngx_conn.*.data = null;
         pool_conn.ngx_conn = null;
     }
-    g_conn_pool.releaseConn(pool_conn);
+    pool_owner(pool_conn).releaseConn(pool_conn);
+}
+
+fn pool_owner(pool_conn: *PgPoolConn) *PgConnPool {
+    return @ptrCast(@alignCast(pool_conn.owner.?));
 }
 
 fn pool_slot_index(pool_conn: *PgPoolConn) usize {
-    return @intCast((@intFromPtr(pool_conn) - @intFromPtr(&g_conn_pool.connections[0])) / @sizeOf(PgPoolConn));
+    const owner = pool_owner(pool_conn);
+    return @intCast((@intFromPtr(pool_conn) - @intFromPtr(&owner.connections[0])) / @sizeOf(PgPoolConn));
 }
 
 /// Per-request context for PostgreSQL operations
@@ -357,45 +364,29 @@ fn dump_pooled_timeout(ctx: *PgRequestCtx) void {
         .{ ctx.*.trace_req_seq, ctx.*.trace_finalize_calls, ctx.*.trace_release_calls });
 }
 
-fn ensure_pool_conninfo(conninfo: []const u8, max_conn: usize) bool {
-    if (!g_pool_initialized) {
-        g_conn_pool.init();
-        g_pool_initialized = true;
-    }
+const MAX_BACKEND_POOLS: usize = 16;
+var g_conn_pools: [MAX_BACKEND_POOLS]PgConnPool = undefined;
+var g_conn_pool_count: usize = 0;
 
-    if (max_conn > 0 and max_conn <= POOL_MAX_CONNECTIONS) {
-        g_conn_pool.max_connections = max_conn;
-    }
+fn get_or_create_pool(conninfo: []const u8, max_conn: usize) ?*PgConnPool {
+    if (conninfo.len == 0 or conninfo.len >= 512 or max_conn == 0 or max_conn > POOL_MAX_CONNECTIONS) return null;
 
-    if (!g_conn_pool.initialized) {
-        if (conninfo.len == 0 or conninfo.len >= g_conn_pool.conninfo.len) return false;
-        @memcpy(g_conn_pool.conninfo[0..conninfo.len], conninfo);
-        g_conn_pool.conninfo[conninfo.len] = 0;
-        g_conn_pool.conninfo_len = conninfo.len;
-        g_conn_pool.initialized = true;
-        return true;
+    for (g_conn_pools[0..g_conn_pool_count]) |*pool| {
+        if (pool.max_connections == max_conn and pool.conninfo_len == conninfo.len and
+            std.mem.eql(u8, pool.conninfo[0..conninfo.len], conninfo)) return pool;
     }
+    if (g_conn_pool_count >= MAX_BACKEND_POOLS) return null;
 
-    if (g_conn_pool.conninfo_len == conninfo.len and std.mem.eql(u8, g_conn_pool.conninfo[0..conninfo.len], conninfo)) {
-        return true;
-    }
-
-    // Different conninfo: only switch if no open connections remain.
-    // (active_count covers both idle and busy connections.)
-    if (g_conn_pool.active_count != 0 or conninfo.len == 0 or conninfo.len >= g_conn_pool.conninfo.len) {
-        return false;
-    }
-
-    @memcpy(g_conn_pool.conninfo[0..conninfo.len], conninfo);
-    g_conn_pool.conninfo[conninfo.len] = 0;
-    g_conn_pool.conninfo_len = conninfo.len;
-    g_conn_pool.initialized = true;
-    return true;
+    const pool = &g_conn_pools[g_conn_pool_count];
+    pool.init();
+    pool.max_connections = max_conn;
+    @memcpy(pool.conninfo[0..conninfo.len], conninfo);
+    pool.conninfo[conninfo.len] = 0;
+    pool.conninfo_len = conninfo.len;
+    pool.initialized = true;
+    g_conn_pool_count += 1;
+    return pool;
 }
-
-/// Global connection pool (one per upstream)
-var g_conn_pool: PgConnPool = undefined;
-var g_pool_initialized: bool = false;
 
 /// Maximum size for JSON result buffer
 const MAX_JSON_SIZE = 65536;
@@ -1600,7 +1591,7 @@ fn release_pooled_ctx(ctx: *PgRequestCtx, failed: bool) void {
         if (failed) {
             pool_conn.state = .conn_error;
         }
-        g_conn_pool.releaseConn(pool_conn);
+        pool_owner(pool_conn).releaseConn(pool_conn);
         ctx.*.pool_conn = null;
     }
 }
@@ -1944,9 +1935,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         @intCast(loc_conf.*.pool_size)
     else
         POOL_MAX_CONNECTIONS;
-    if (!ensure_pool_conninfo(conninfo, max_conn)) {
-        return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
+    const conn_pool = get_or_create_pool(conninfo, max_conn) orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
 
     g_pgrest_trace_seq += 1;
     ctx.*.trace_req_seq = g_pgrest_trace_seq;
@@ -1961,7 +1950,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
     ctx.*.trace_last_event_len = 0;
     trace_pool_event(ctx, null, "request-start");
 
-    while (g_conn_pool.getIdleConn()) |pool_conn| {
+    while (conn_pool.getIdleConn()) |pool_conn| {
         trace_pool_event(ctx, pool_conn, "idle-found");
         if (!is_pool_conn_reusable(pool_conn)) {
             trace_pool_event(ctx, pool_conn, "idle-reject");
@@ -1977,7 +1966,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         if (!start_pooled_query(ctx, pool_conn)) {
             pool_conn.request_ctx = null;
             pool_conn.state = .conn_error;
-            g_conn_pool.releaseConn(pool_conn);
+            conn_pool.releaseConn(pool_conn);
             ctx.*.pool_conn = null;
             return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
@@ -1989,9 +1978,9 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         return core.NGX_DONE;
     }
 
-    const pool_conn = g_conn_pool.getFreeSlot() orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
+    const pool_conn = conn_pool.getFreeSlot() orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
     trace_pool_event(ctx, pool_conn, "free-slot");
-    const conn = pgConnectStart(&g_conn_pool.conninfo);
+    const conn = pgConnectStart(&conn_pool.conninfo);
     if (conn == null) return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
     if (pgStatus(conn) == pq.CONNECTION_BAD) {
         const message_ptr = pgErrorMessage(conn);
@@ -2023,7 +2012,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
     pool_conn.fd = fd;
     pool_conn.ngx_conn = ngx_conn;
     pool_conn.request_ctx = ctx;
-    g_conn_pool.active_count += 1;
+    conn_pool.active_count += 1;
     ctx.*.pool_conn = pool_conn;
 
     ngx_conn.*.data = pool_conn;
@@ -8298,22 +8287,6 @@ fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_
         return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
     };
 
-    // Initialize pool with connection string if not already done
-    if (!g_pool_initialized) {
-        g_conn_pool.init();
-        g_pool_initialized = true;
-    }
-
-    if (!g_conn_pool.initialized) {
-        const conninfo = core.slicify(u8, loc_conf.*.conninfo.data, loc_conf.*.conninfo.len);
-        if (conninfo.len > 0 and conninfo.len < g_conn_pool.conninfo.len) {
-            @memcpy(g_conn_pool.conninfo[0..conninfo.len], conninfo);
-            g_conn_pool.conninfo[conninfo.len] = 0;
-            g_conn_pool.conninfo_len = conninfo.len;
-            g_conn_pool.initialized = true;
-        }
-    }
-
     const opts = parse_request_options(r);
     if (opts.response_format == .unsupported) {
         return send_not_acceptable(r, "{\"message\":\"None of these media types are available\"}");
@@ -9299,8 +9272,9 @@ fn cleanup_pool_conn(pool_conn: *PgPoolConn) void {
     }
     pool_conn.state = .free;
     pool_conn.fd = -1;
-    if (g_conn_pool.active_count > 0) {
-        g_conn_pool.active_count -= 1;
+    const owner = pool_owner(pool_conn);
+    if (owner.active_count > 0) {
+        owner.active_count -= 1;
     }
 }
 
@@ -9485,29 +9459,21 @@ test "build_where_clause_from_args supports json path filters" {
     try expectEqualStrings("to_jsonb(json_data)->>'blood_type' = 'A-' AND to_jsonb(json_data)->'age' > 20", buf_out[0..result.len]);
 }
 
-test "ensure_pool_conninfo applies max_conn and rejects different conninfo while active" {
-    // Reset global state for test isolation
-    g_pool_initialized = false;
-    g_conn_pool.init();
-    g_pool_initialized = true;
-
+test "backend pool registry isolates connection strings and pool limits" {
+    g_conn_pool_count = 0;
     const ci = "host=localhost dbname=test";
-    try expect(ensure_pool_conninfo(ci, 4));
-    try expectEqual(@as(usize, 4), g_conn_pool.max_connections);
+    const first = get_or_create_pool(ci, 4) orelse return error.TestUnexpectedResult;
+    const same = get_or_create_pool(ci, 4) orelse return error.TestUnexpectedResult;
+    const other_backend = get_or_create_pool("host=other dbname=other", 4) orelse return error.TestUnexpectedResult;
+    const other_limit = get_or_create_pool(ci, 8) orelse return error.TestUnexpectedResult;
 
-    // Same conninfo accepted again
-    try expect(ensure_pool_conninfo(ci, 4));
-
-    // Simulate active connection
-    g_conn_pool.active_count = 1;
-    try expect(!ensure_pool_conninfo("host=other dbname=other", 4));
-
-    // No connections: different conninfo is accepted
-    g_conn_pool.active_count = 0;
-    const ci2 = "host=other dbname=other";
-    try expect(ensure_pool_conninfo(ci2, 8));
-    try expectEqual(@as(usize, 8), g_conn_pool.max_connections);
-    try expectEqualStrings(ci2, g_conn_pool.conninfo[0..g_conn_pool.conninfo_len]);
+    try expect(first == same);
+    try expect(first != other_backend);
+    try expect(first != other_limit);
+    try expectEqual(@as(usize, 3), g_conn_pool_count);
+    try expectEqual(@as(usize, 4), first.max_connections);
+    try expectEqual(@as(usize, 8), other_limit.max_connections);
+    try expectEqualStrings(ci, first.conninfo[0..first.conninfo_len]);
 }
 
 test "ngx_conf_set_pgrest_pool_size rejects values outside 1..POOL_MAX_CONNECTIONS" {

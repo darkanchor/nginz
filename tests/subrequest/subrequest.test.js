@@ -1,8 +1,7 @@
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, afterAll } from "bun:test";
 import { readFileSync } from "fs";
 import { join } from "path";
 import {
-  ensureBuild,
   startNginz,
   stopNginz,
   cleanupRuntime,
@@ -27,6 +26,7 @@ let redisMock;
 let pgMock;
 let consulMock;
 let httpMock;
+let fixturePromise;
 
 async function waitFor(check, timeoutMs = 1000, intervalMs = 20) {
   const deadline = Date.now() + timeoutMs;
@@ -37,9 +37,7 @@ async function waitFor(check, timeoutMs = 1000, intervalMs = 20) {
   expect(check()).toBe(true);
 }
 
-beforeAll(async () => {
-  ensureBuild();
-
+async function startSubrequestFixture() {
   redisMock = createRedisMock(MOCK_PORTS.REDIS);
   redisMock.setValue("_redis/get/session-token", "active");
 
@@ -78,7 +76,15 @@ beforeAll(async () => {
   });
 
   await startNginz("tests/subrequest/nginx.conf", MODULE);
-}, 30000);
+}
+
+function subrequestTest(name, fn, timeout = 30000) {
+  test(name, async () => {
+    fixturePromise ??= startSubrequestFixture();
+    await fixturePromise;
+    await fn();
+  }, timeout);
+}
 
 afterAll(async () => {
   await stopNginz();
@@ -91,80 +97,80 @@ afterAll(async () => {
 
 describe("upstream modules as native auth_request subrequest targets", () => {
 
-  test("redis GET subrequest via auth_request completes and allows main request", async () => {
+  subrequestTest("redis GET subrequest via auth_request completes and allows main request", async () => {
     const res = await fetch(`${TEST_URL}/redis-gate`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("redis-granted");
   });
 
-  test("pgrest GET subrequest via auth_request completes and allows main request", async () => {
+  subrequestTest("pgrest GET subrequest via auth_request completes and allows main request", async () => {
     const res = await fetch(`${TEST_URL}/pg-gate`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("pg-granted");
   });
 
-  test("consul KV subrequest via auth_request completes and allows main request", async () => {
+  subrequestTest("consul KV subrequest via auth_request completes and allows main request", async () => {
     const res = await fetch(`${TEST_URL}/consul-kv-gate`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("consul-granted");
   });
 
-  test("consul services subrequest via auth_request completes and allows main request", async () => {
+  subrequestTest("consul services subrequest via auth_request completes and allows main request", async () => {
     const res = await fetch(`${TEST_URL}/consul-svc-gate`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("consul-svc-granted");
   });
 
-  test("consul catalog subrequest via auth_request completes and allows main request", async () => {
+  subrequestTest("consul catalog subrequest via auth_request completes and allows main request", async () => {
     const res = await fetch(`${TEST_URL}/consul-catalog-gate`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("consul-catalog-granted");
   });
 
-  test("wechatpay proxy subrequest with signed upstream response allows main request", async () => {
+  subrequestTest("wechatpay proxy subrequest with signed upstream response allows main request", async () => {
     const res = await fetch(`${TEST_URL}/wechatpay-gate`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("wechatpay-granted");
   });
 
-  test("wechatpay proxy subrequest with upstream 4xx response denies main request", async () => {
+  subrequestTest("wechatpay proxy subrequest with upstream 4xx response denies main request", async () => {
     const res = await fetch(`${TEST_URL}/wechatpay-deny-gate`);
     expect(res.status).toBe(401);
   });
 });
 
 describe("upstream modules under SSI subrequests", () => {
-  test("redis GET subrequest via SSI returns upstream body", async () => {
+  subrequestTest("redis GET subrequest via SSI returns upstream body", async () => {
     const res = await fetch(`${TEST_URL}/ssi/redis`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("active");
   });
 
-  test("pgrest GET subrequest via SSI returns upstream body", async () => {
+  subrequestTest("pgrest GET subrequest via SSI returns upstream body", async () => {
     const res = await fetch(`${TEST_URL}/ssi/pgrest`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("read");
   });
 
-  test("consul KV subrequest via SSI returns upstream body", async () => {
+  subrequestTest("consul KV subrequest via SSI returns upstream body", async () => {
     const res = await fetch(`${TEST_URL}/ssi/consul-kv`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("enabled");
   });
 
-  test("consul services subrequest via SSI returns upstream body", async () => {
+  subrequestTest("consul services subrequest via SSI returns upstream body", async () => {
     const res = await fetch(`${TEST_URL}/ssi/consul-services`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("api-svc-1");
   });
 
-  test("consul catalog subrequest via SSI returns upstream body", async () => {
+  subrequestTest("consul catalog subrequest via SSI returns upstream body", async () => {
     const res = await fetch(`${TEST_URL}/ssi/consul-catalog`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("api-service");
   });
 
-  test("wechatpay proxy subrequest via SSI returns verified upstream body", async () => {
+  subrequestTest("wechatpay proxy subrequest via SSI returns verified upstream body", async () => {
     const res = await fetch(`${TEST_URL}/ssi/wechatpay`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('"result":"ok"');
@@ -172,7 +178,7 @@ describe("upstream modules under SSI subrequests", () => {
 });
 
 describe("upstream modules under mirror subrequests", () => {
-  test("redis mirror subrequest executes in background", async () => {
+  subrequestTest("redis mirror subrequest executes in background", async () => {
     for (let i = 0; i < 3; i++) {
       const res = await fetch(`${TEST_URL}/mirror/redis`);
       expect(res.status).toBe(200);
@@ -180,7 +186,7 @@ describe("upstream modules under mirror subrequests", () => {
     }
   });
 
-  test("pgrest mirror subrequest executes in background", async () => {
+  subrequestTest("pgrest mirror subrequest executes in background", async () => {
     for (let i = 0; i < 3; i++) {
       const res = await fetch(`${TEST_URL}/mirror/pgrest`);
       expect(res.status).toBe(200);
@@ -188,7 +194,7 @@ describe("upstream modules under mirror subrequests", () => {
     }
   });
 
-  test("consul KV mirror subrequest executes in background", async () => {
+  subrequestTest("consul KV mirror subrequest executes in background", async () => {
     consulMock.clearLog();
 
     const res = await fetch(`${TEST_URL}/mirror/consul-kv`);
@@ -200,7 +206,7 @@ describe("upstream modules under mirror subrequests", () => {
     );
   });
 
-  test("consul catalog mirror subrequest executes in background", async () => {
+  subrequestTest("consul catalog mirror subrequest executes in background", async () => {
     consulMock.clearLog();
 
     const res = await fetch(`${TEST_URL}/mirror/consul-catalog`);
@@ -212,7 +218,7 @@ describe("upstream modules under mirror subrequests", () => {
     );
   });
 
-  test("wechatpay mirror subrequest executes in background", async () => {
+  subrequestTest("wechatpay mirror subrequest executes in background", async () => {
     httpMock.clearLog();
 
     const res = await fetch(`${TEST_URL}/mirror/wechatpay`);

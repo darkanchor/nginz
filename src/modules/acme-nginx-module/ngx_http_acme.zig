@@ -1772,7 +1772,9 @@ pub const AcmeHttpRequest = struct {
 
 pub const acme_main_conf = extern struct {
     enabled: ngx_flag_t,
+    allow_insecure_http: ngx_flag_t,
     directory_url: ngx_str_t,
+    trusted_certificate: ngx_str_t,
     account_email: ngx_str_t,
     storage_path: ngx_str_t,
     renew_before_days: ngx_uint_t,
@@ -1904,7 +1906,9 @@ fn ngx_http_acme_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) cal
 fn init_upstream_conf(ups: [*c]http.ngx_http_upstream_conf_t) void {
     ups.*.buffering = 0;
     ups.*.buffer_size = 32 * ngx_pagesize;
-    ups.*.ssl_verify = 0;
+    ups.*.ssl_verify = 1;
+    ups.*.ssl_server_name = 1;
+    ups.*.ssl_session_reuse = 1;
     ups.*.connect_timeout = 60000;
     ups.*.send_timeout = 60000;
     ups.*.read_timeout = 60000;
@@ -2192,6 +2196,7 @@ fn load_domain_key_if_present(storage: *AcmeStorage, domain: []const u8) !?AcmeD
 fn create_main_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     const p = core.ngz_pcalloc_c(acme_main_conf, cf.*.pool) orelse return null;
     p.*.enabled = conf.NGX_CONF_UNSET;
+    p.*.allow_insecure_http = conf.NGX_CONF_UNSET;
     p.*.renew_before_days = conf.NGX_CONF_UNSET_UINT;
     init_upstream_conf(&p.*.ups);
     return p;
@@ -2203,6 +2208,7 @@ fn init_main_conf(cf: [*c]ngx_conf_t, c: ?*anyopaque) callconv(.c) [*c]u8 {
     if (mcf.*.enabled == conf.NGX_CONF_UNSET) {
         mcf.*.enabled = 0;
     }
+    if (mcf.*.allow_insecure_http == conf.NGX_CONF_UNSET) mcf.*.allow_insecure_http = 0;
 
     if (mcf.*.renew_before_days == conf.NGX_CONF_UNSET_UINT) {
         mcf.*.renew_before_days = 30;
@@ -2211,6 +2217,13 @@ fn init_main_conf(cf: [*c]ngx_conf_t, c: ?*anyopaque) callconv(.c) [*c]u8 {
     // Default ACME server (Let's Encrypt production)
     if (mcf.*.directory_url.len == 0) {
         mcf.*.directory_url = ngx_string("https://acme-v02.api.letsencrypt.org/directory");
+    }
+    const directory_url = core.slicify(u8, mcf.*.directory_url.data, mcf.*.directory_url.len);
+    if (!std.mem.startsWith(u8, directory_url, "https://") and
+        !(mcf.*.allow_insecure_http == 1 and std.mem.startsWith(u8, directory_url, "http://")))
+    {
+        ngx.log.ngz_log_error(ngx.log.NGX_LOG_EMERG, cf.*.log, 0, "acme_server must use https unless acme_allow_insecure_http is on", .{});
+        return conf.NGX_CONF_ERROR;
     }
 
     // Default storage path
@@ -2223,21 +2236,11 @@ fn init_main_conf(cf: [*c]ngx_conf_t, c: ?*anyopaque) callconv(.c) [*c]u8 {
         mcf.*.ups.ssl = ups_ssl;
     }
 
-    if (mcf.*.ups.ssl.*.ctx == null) {
-        if (ssl.ngx_ssl_create(mcf.*.ups.ssl, ssl.NGX_SSL_DEFAULT_PROTOCOLS, null) != NGX_OK) {
-            return conf.NGX_CONF_ERROR;
-        }
-
-        const cln = core.ngx_pool_cleanup_add(cf.*.pool, 0) orelse {
-            ssl.ngx_ssl_cleanup_ctx(mcf.*.ups.ssl);
-            return conf.NGX_CONF_ERROR;
-        };
-        cln.*.handler = ssl.ngx_ssl_cleanup_ctx;
-        cln.*.data = mcf.*.ups.ssl;
-
-        if (ssl.ngx_ssl_client_session_cache(cf, mcf.*.ups.ssl, @intCast(mcf.*.ups.ssl_session_reuse)) != NGX_OK) {
-            return conf.NGX_CONF_ERROR;
-        }
+    if (!ssl.configure_verified_client(cf, mcf.*.ups.ssl)) return conf.NGX_CONF_ERROR;
+    if (mcf.*.trusted_certificate.len > 0 and
+        !ssl.add_trusted_certificate(cf, mcf.*.ups.ssl, &mcf.*.trusted_certificate))
+    {
+        return conf.NGX_CONF_ERROR;
     }
 
     return conf.NGX_CONF_OK;
@@ -3271,6 +3274,22 @@ export const ngx_http_acme_commands = [_]ngx_command_t{
         .set = conf.ngx_conf_set_str_slot,
         .conf = conf.NGX_HTTP_MAIN_CONF_OFFSET,
         .offset = @offsetOf(acme_main_conf, "directory_url"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("acme_allow_insecure_http"),
+        .type = conf.NGX_HTTP_MAIN_CONF | conf.NGX_CONF_FLAG,
+        .set = conf.ngx_conf_set_flag_slot,
+        .conf = conf.NGX_HTTP_MAIN_CONF_OFFSET,
+        .offset = @offsetOf(acme_main_conf, "allow_insecure_http"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("acme_trusted_certificate"),
+        .type = conf.NGX_HTTP_MAIN_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_MAIN_CONF_OFFSET,
+        .offset = @offsetOf(acme_main_conf, "trusted_certificate"),
         .post = null,
     },
     ngx_command_t{

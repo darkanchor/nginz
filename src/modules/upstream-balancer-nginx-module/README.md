@@ -482,3 +482,7 @@ Reduce avoidable sticky remapping when `dynamic-upstreams` starts applying parti
 - [x] Cookie issuance, rotation, and status metrics are documented and test-backed.
 - [x] Runtime peer-source handoff is documented as the balancer-side contract for future mutation.
 - [x] Design Rationale section explains the hard parts: callback ownership, retry handling, generation problem, healthcheck wiring.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 GENERATION LIFETIME FIXED; STRESS PROOF OPEN.** Every request now registers an idempotent pool-cleanup backstop before binding a dynamic generation, while the normal `free_peer` path retains eager release. Initialization failures after `get_active_peers` release the pin before returning. Unit coverage proves cleanup double-invocation releases exactly once, and the focused 29-case balancer suite remains green. No-peer/client-abort/reload/slab-pressure stress coverage is still required before declaring the combined dynamic peer subsystem fully proven.

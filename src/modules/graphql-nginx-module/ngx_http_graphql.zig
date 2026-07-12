@@ -38,7 +38,11 @@ const graphql_loc_conf = extern struct {
     enabled: ngx_flag_t,
     max_depth: ngx_uint_t,
     allow_introspection: ngx_flag_t,
+    body_max_size: usize,
 };
+
+const DEFAULT_BODY_MAX_SIZE: usize = 1024 * 1024;
+const NGX_HTTP_REQUEST_ENTITY_TOO_LARGE: ngx_int_t = 413;
 
 // Request context for tracking validation state
 const graphql_ctx = extern struct {
@@ -62,6 +66,7 @@ fn parseGraphQL(query: []const u8) ParseResult {
     var max_depth: u32 = 0;
     var has_introspection = false;
     var in_string = false;
+    var in_block_string = false;
     var in_comment = false;
     var i: usize = 0;
 
@@ -76,10 +81,25 @@ fn parseGraphQL(query: []const u8) ParseResult {
             continue;
         }
 
-        // Handle strings (skip content inside quotes)
+        if (in_block_string) {
+            if (c == '"' and i + 2 < query.len and query[i + 1] == '"' and query[i + 2] == '"') {
+                in_block_string = false;
+                i += 2;
+            }
+            continue;
+        }
+
+        // Handle strings (skip content inside quotes). A quote is escaped only
+        // when preceded by an odd-length run of backslashes.
         if (in_string) {
-            if (c == '"' and (i == 0 or query[i - 1] != '\\')) {
-                in_string = false;
+            if (c == '"') {
+                var slash_count: usize = 0;
+                var j = i;
+                while (j > 0 and query[j - 1] == '\\') {
+                    slash_count += 1;
+                    j -= 1;
+                }
+                if (slash_count % 2 == 0) in_string = false;
             }
             continue;
         }
@@ -90,9 +110,23 @@ fn parseGraphQL(query: []const u8) ParseResult {
             continue;
         }
 
-        // Start of string
+        if (c == '.' and i + 2 < query.len and query[i + 1] == '.' and query[i + 2] == '.') {
+            return ParseResult{
+                .max_depth = max_depth,
+                .has_introspection = has_introspection,
+                .is_valid = false,
+                .error_message = "Fragments are unsupported by the depth policy",
+            };
+        }
+
+        // Start of block or regular string
         if (c == '"') {
-            in_string = true;
+            if (i + 2 < query.len and query[i + 1] == '"' and query[i + 2] == '"') {
+                in_block_string = true;
+                i += 2;
+            } else {
+                in_string = true;
+            }
             continue;
         }
 
@@ -134,7 +168,7 @@ fn parseGraphQL(query: []const u8) ParseResult {
     }
 
     // Check for unclosed string first (may affect brace counting)
-    if (in_string) {
+    if (in_string or in_block_string) {
         return ParseResult{
             .max_depth = max_depth,
             .has_introspection = has_introspection,
@@ -162,12 +196,12 @@ fn parseGraphQL(query: []const u8) ParseResult {
 }
 
 // Send GraphQL-formatted error response
-fn sendGraphQLError(r: [*c]ngx_http_request_t, message: []const u8) ngx_int_t {
+fn sendGraphQLErrorStatus(r: [*c]ngx_http_request_t, message: []const u8, status: ngx_uint_t) ngx_int_t {
     // Set content type
     const content_type = ngx_string("application/json");
     r.*.headers_out.content_type = content_type;
     r.*.headers_out.content_type_len = content_type.len;
-    r.*.headers_out.status = 400;
+    r.*.headers_out.status = @intCast(status);
 
     // Build GraphQL error response: {"errors":[{"message":"..."}]}
     const prefix = "{\"errors\":[{\"message\":\"";
@@ -208,6 +242,10 @@ fn sendGraphQLError(r: [*c]ngx_http_request_t, message: []const u8) ngx_int_t {
     return http.ngx_http_output_filter(r, &out);
 }
 
+fn sendGraphQLError(r: [*c]ngx_http_request_t, message: []const u8) ngx_int_t {
+    return sendGraphQLErrorStatus(r, message, 400);
+}
+
 // Read request body and validate GraphQL query
 export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     const rctx = core.castPtr(graphql_ctx, r.*.ctx[ngx_http_graphql_module.ctx_index]) orelse {
@@ -217,6 +255,12 @@ export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     rctx.*.waiting_body = 0;
 
     const lccf = rctx.*.lccf;
+
+    if (r.*.request_body != null and r.*.request_body.*.temp_file != null) {
+        _ = sendGraphQLErrorStatus(r, "Request body requires file buffering", NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+        http.ngx_http_finalize_request(r, NGX_DONE);
+        return;
+    }
 
     // Check if request body exists
     if (r.*.request_body == null or r.*.request_body.*.bufs == null) {
@@ -231,8 +275,20 @@ export fn ngx_http_graphql_body_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     var chain = r.*.request_body.*.bufs;
     while (chain != null) : (chain = chain.*.next) {
         if (chain.*.buf != null) {
-            const b = chain.*.buf;
-            body_len += @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
+            const chunk_len_off = buf.ngx_buf_size(chain.*.buf);
+            if (chunk_len_off < 0) {
+                http.ngx_http_finalize_request(r, NGX_ERROR);
+                return;
+            }
+            body_len = std.math.add(usize, body_len, @as(usize, @intCast(chunk_len_off))) catch {
+                http.ngx_http_finalize_request(r, NGX_ERROR);
+                return;
+            };
+            if (body_len > lccf.*.body_max_size) {
+                _ = sendGraphQLErrorStatus(r, "Request body exceeds graphql_body_max_size", NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+                http.ngx_http_finalize_request(r, NGX_DONE);
+                return;
+            }
         }
     }
 
@@ -362,6 +418,10 @@ export fn ngx_http_graphql_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_i
         return NGX_DECLINED;
     }
 
+    if (r.*.headers_in.content_length_n > @as(core.off_t, @intCast(lccf.*.body_max_size))) {
+        return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+    }
+
     rctx.*.waiting_body = 1;
     rctx.*.lccf = lccf;
     r.*.flags1.discard_body = false;
@@ -377,6 +437,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.enabled = conf.NGX_CONF_UNSET;
         p.*.max_depth = conf.NGX_CONF_UNSET_UINT;
         p.*.allow_introspection = conf.NGX_CONF_UNSET;
+        p.*.body_max_size = conf.NGX_CONF_UNSET_SIZE;
         return p;
     }
     return null;
@@ -401,6 +462,10 @@ fn merge_loc_conf(
 
     if (c.*.allow_introspection == conf.NGX_CONF_UNSET) {
         c.*.allow_introspection = if (prev.*.allow_introspection == conf.NGX_CONF_UNSET) 1 else prev.*.allow_introspection;
+    }
+
+    if (c.*.body_max_size == conf.NGX_CONF_UNSET_SIZE) {
+        c.*.body_max_size = if (prev.*.body_max_size == conf.NGX_CONF_UNSET_SIZE) DEFAULT_BODY_MAX_SIZE else prev.*.body_max_size;
     }
 
     return conf.NGX_CONF_OK;
@@ -456,6 +521,14 @@ export const ngx_http_graphql_commands = [_]ngx_command_t{
         .set = conf.ngx_conf_set_flag_slot,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = @offsetOf(graphql_loc_conf, "allow_introspection"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("graphql_body_max_size"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_size_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(graphql_loc_conf, "body_max_size"),
         .post = null,
     },
     conf.ngx_null_command,

@@ -350,6 +350,34 @@ describe("wechatpay module", () => {
       expect(res.status).toBe(401);
     });
 
+    test("rejects a correctly signed request outside the freshness window", async () => {
+      const body = JSON.stringify({ event: "payment.succeeded", id: "evt-stale" });
+      const headers = buildWechatpayHeaders(body, {
+        timestamp: String(Math.floor(Date.now() / 1000) - 301),
+      });
+
+      const res = await fetch(`${TEST_URL}/notify`, {
+        method: "POST",
+        headers,
+        body,
+      });
+
+      expect(res.status).toBe(401);
+    });
+
+    test("rejects replay of a previously accepted signed nonce", async () => {
+      const body = JSON.stringify({ event: "payment.succeeded", id: "evt-replay" });
+      const headers = buildWechatpayHeaders(body, { nonce: "one-time-replay-nonce" });
+
+      const first = await fetch(`${TEST_URL}/notify`, { method: "POST", headers, body });
+      expect(first.status).toBe(200);
+      const replayHeaders = { ...headers, Connection: "close" };
+      const replays = await Promise.all(Array.from({ length: 12 }, () =>
+        fetch(`${TEST_URL}/notify`, { method: "POST", headers: replayHeaders, body })
+      ));
+      for (const replay of replays) expect(replay.status).toBe(401);
+    });
+
     test("decrypts AES-GCM resource bodies during access verification", async () => {
       const plaintext = JSON.stringify({ order_id: "order-123", amount: 88 });
       const resource = encryptWechatpayResource(plaintext, {

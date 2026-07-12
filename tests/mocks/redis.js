@@ -9,6 +9,7 @@ export class RedisMock {
     this.server = null;
     this.store = new Map();
     this.ttls = new Map();
+    this.rawResponses = new Map();
   }
 
   start() {
@@ -32,6 +33,7 @@ export class RedisMock {
     }
     this.store.clear();
     this.ttls.clear();
+    this.rawResponses.clear();
   }
 
   handleData(socket, data) {
@@ -73,6 +75,8 @@ export class RedisMock {
     if (args.length === 0) return "+OK\r\n";
 
     const cmd = args[0].toUpperCase();
+    const override = this.rawResponses.get(`${cmd}:${args[1] ?? ""}`);
+    if (override !== undefined) return override;
 
     switch (cmd) {
       case "PING":
@@ -315,6 +319,10 @@ export class RedisMock {
       default:
         return `-ERR unknown command '${cmd}'\r\n`;
     }
+  }
+
+  setRawResponse(command, firstArg, response) {
+    this.rawResponses.set(`${command.toUpperCase()}:${firstArg}`, response);
   }
 
   checkExpired(key) {

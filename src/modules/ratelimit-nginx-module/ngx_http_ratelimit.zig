@@ -147,10 +147,9 @@ fn ngx_http_ratelimit_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque
     return NGX_OK;
 }
 
-fn getOrCreateEntry(store: *ratelimit_store, key_hash: u64, current_time: i64) *RateLimitEntry {
+fn getOrCreateEntry(store: *ratelimit_store, key_hash: u64, current_time: i64) ?*RateLimitEntry {
     var empty_entry: ?*RateLimitEntry = null;
     var reusable_entry: ?*RateLimitEntry = null;
-    var oldest_entry: ?*RateLimitEntry = null;
 
     for (&store.entries) |*entry| {
         if (entry.key_hash == 0) {
@@ -159,10 +158,11 @@ fn getOrCreateEntry(store: *ratelimit_store, key_hash: u64, current_time: i64) *
         }
         if (entry.key_hash == key_hash) return entry;
         if (entry.window_start < current_time and reusable_entry == null) reusable_entry = entry;
-        if (oldest_entry == null or entry.last_used < oldest_entry.?.last_used) oldest_entry = entry;
     }
 
-    const entry = empty_entry orelse reusable_entry orelse oldest_entry orelse unreachable;
+    // Never evict a live window: that resets another client's enforcement
+    // budget.  Saturation is conservatively denied until an entry expires.
+    const entry = empty_entry orelse reusable_entry orelse return null;
     if (entry.key_hash == 0) store.entry_count += 1;
     entry.* = .{
         .key_hash = key_hash,
@@ -176,7 +176,7 @@ fn getOrCreateEntry(store: *ratelimit_store, key_hash: u64, current_time: i64) *
 // Check rate limit and return true if allowed
 fn checkRateLimit(store: *ratelimit_store, key_hash: u64, rate: ngx_uint_t, burst: ngx_uint_t, cost: ngx_uint_t) bool {
     const current_time = getCurrentTimeSec();
-    const entry = getOrCreateEntry(store, key_hash, current_time);
+    const entry = getOrCreateEntry(store, key_hash, current_time) orelse return false;
 
     // Check if window has expired (1 second window)
     if (current_time > entry.window_start) {
@@ -712,4 +712,16 @@ export var ngx_http_ratelimit_module = ngx.module.make_module(
 const expectEqual = std.testing.expectEqual;
 
 test "ratelimit module" {
+}
+
+test "full live table rejects a new key without evicting enforcement state" {
+    var store: ratelimit_store = std.mem.zeroes(ratelimit_store);
+    const now: i64 = 100;
+    for (&store.entries, 0..) |*entry, i| {
+        entry.* = .{ .key_hash = i + 1, .count = 1, .window_start = now, .last_used = now };
+    }
+    store.entry_count = MAX_ENTRIES;
+    const first_before = store.entries[0];
+    try std.testing.expect(getOrCreateEntry(&store, MAX_ENTRIES + 10, now) == null);
+    try std.testing.expectEqualDeep(first_before, store.entries[0]);
 }

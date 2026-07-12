@@ -76,6 +76,88 @@ const ConsulError = error{
     UpstreamCreateFailed,
     OutOfMemory,
     ParseError,
+    RequestTooLarge,
+};
+
+const CONSUL_REQUEST_MAX: usize = 16 * 1024;
+const CONSUL_RENDER_MAX: usize = 64 * 1024;
+
+const BoundedWriter = struct {
+    bytes: []u8,
+    len: usize = 0,
+
+    fn append(self: *BoundedWriter, value: []const u8) bool {
+        if (value.len > self.bytes.len - self.len) return false;
+        @memcpy(self.bytes[self.len..][0..value.len], value);
+        self.len += value.len;
+        return true;
+    }
+
+    fn appendByte(self: *BoundedWriter, value: u8) bool {
+        if (self.len == self.bytes.len) return false;
+        self.bytes[self.len] = value;
+        self.len += 1;
+        return true;
+    }
+
+    fn appendDecimal(self: *BoundedWriter, value: usize) bool {
+        var tmp: [20]u8 = undefined;
+        const n = write_decimal(&tmp, value);
+        return self.append(tmp[0..n]);
+    }
+
+    fn appendJsonString(self: *BoundedWriter, value: []const u8) bool {
+        if (!self.appendByte('"')) return false;
+        for (value) |c| {
+            switch (c) {
+                '"', '\\' => {
+                    if (!self.appendByte('\\') or !self.appendByte(c)) return false;
+                },
+                '\n' => if (!self.append("\\n")) return false,
+                '\r' => if (!self.append("\\r")) return false,
+                '\t' => if (!self.append("\\t")) return false,
+                else => {
+                    if (c < 0x20) {
+                        const hex = "0123456789abcdef";
+                        if (!self.append("\\u00") or
+                            !self.appendByte(hex[c >> 4]) or
+                            !self.appendByte(hex[c & 0x0f])) return false;
+                    } else if (!self.appendByte(c)) return false;
+                },
+            }
+        }
+        return self.appendByte('"');
+    }
+
+    fn appendUrlComponent(self: *BoundedWriter, value: []const u8) bool {
+        const hex = "0123456789ABCDEF";
+        for (value) |c| {
+            const unreserved = std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
+            if (unreserved) {
+                if (!self.appendByte(c)) return false;
+            } else {
+                if (!self.appendByte('%') or
+                    !self.appendByte(hex[c >> 4]) or
+                    !self.appendByte(hex[c & 0x0f])) return false;
+            }
+        }
+        return true;
+    }
+
+    fn appendUrlPath(self: *BoundedWriter, value: []const u8) bool {
+        const hex = "0123456789ABCDEF";
+        for (value) |c| {
+            const allowed = std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~' or c == '/';
+            if (allowed) {
+                if (!self.appendByte(c)) return false;
+            } else {
+                if (!self.appendByte('%') or
+                    !self.appendByte(hex[c >> 4]) or
+                    !self.appendByte(hex[c & 0x0f])) return false;
+            }
+        }
+        return true;
+    }
 };
 
 fn init_upstream_conf(cf: [*c]http.ngx_http_upstream_conf_t) void {
@@ -142,29 +224,37 @@ fn merge_loc_conf(
     return conf.NGX_CONF_OK;
 }
 
-// Parse host:port from consul directive
-fn parse_host_port(arg: ngx_str_t) struct { host: ngx_str_t, port: u16 } {
+const ParsedHostPort = struct { host: ngx_str_t, port: u16 };
+
+// Parse host[:port], including bracketed IPv6 literals. Invalid and partial
+// ports are rejected at configuration time rather than silently defaulted.
+fn parse_host_port(arg: ngx_str_t) ?ParsedHostPort {
+    if (arg.len == 0 or arg.data == null) return null;
+    const value = core.slicify(u8, arg.data, arg.len);
     var host = arg;
     var port: u16 = 8500;
 
-    var i: usize = 0;
-    while (i < arg.len) : (i += 1) {
-        if (arg.data[i] == ':') {
-            host.len = i;
-            var p: u16 = 0;
-            var j: usize = i + 1;
-            while (j < arg.len) : (j += 1) {
-                if (arg.data[j] >= '0' and arg.data[j] <= '9') {
-                    p = p * 10 + @as(u16, arg.data[j] - '0');
-                } else {
-                    break;
-                }
-            }
-            if (p > 0) port = p;
-            break;
+    if (value[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, value, ']') orelse return null;
+        if (close == 1) return null;
+        host = .{ .data = arg.data + 1, .len = close - 1 };
+        if (close + 1 < value.len) {
+            if (value[close + 1] != ':' or close + 2 == value.len) return null;
+            port = std.fmt.parseInt(u16, value[close + 2 ..], 10) catch return null;
+            if (port == 0) return null;
         }
+        return .{ .host = host, .port = port };
     }
 
+    const first_colon = std.mem.indexOfScalar(u8, value, ':');
+    const last_colon = std.mem.lastIndexOfScalar(u8, value, ':');
+    if (first_colon != null and first_colon.? == last_colon.?) {
+        const colon = first_colon.?;
+        if (colon == 0 or colon + 1 == value.len) return null;
+        port = std.fmt.parseInt(u16, value[colon + 1 ..], 10) catch return null;
+        if (port == 0) return null;
+        host.len = colon;
+    }
     return .{ .host = host, .port = port };
 }
 
@@ -239,125 +329,57 @@ fn append_json_string(out_buf: []u8, out_len: *usize, value: []const u8) bool {
 
 // Build HTTP GET request for Consul API
 fn build_consul_request(rctx: [*c]consul_request_ctx, pool: [*c]ngx_pool_t) !ngx_str_t {
-    var path_buf: [512]u8 = undefined;
-    var path_len: usize = 0;
-
     const lccf = rctx.*.lccf;
+    const raw = core.castPtr(u8, core.ngx_pnalloc(pool, CONSUL_REQUEST_MAX)) orelse return ConsulError.OutOfMemory;
+    var writer = BoundedWriter{ .bytes = core.slicify(u8, raw, CONSUL_REQUEST_MAX) };
+
+    if (!writer.append("GET ")) return ConsulError.RequestTooLarge;
 
     switch (rctx.*.query_type) {
         .services => {
-            // /v1/health/service/<name>?passing=true
-            const prefix = "/v1/health/service/";
-            @memcpy(path_buf[path_len..][0..prefix.len], prefix);
-            path_len += prefix.len;
-
-            // Service name
-            const svc_name = rctx.*.service_name;
-            @memcpy(path_buf[path_len..][0..svc_name.len], core.slicify(u8, svc_name.data, svc_name.len));
-            path_len += svc_name.len;
-
-            // Query params
+            if (!writer.append("/v1/health/service/") or
+                !writer.appendUrlComponent(core.slicify(u8, rctx.*.service_name.data, rctx.*.service_name.len)))
+                return ConsulError.RequestTooLarge;
+            var has_query = false;
             if (lccf.*.passing_only == 1) {
-                const passing = "?passing=true";
-                @memcpy(path_buf[path_len..][0..passing.len], passing);
-                path_len += passing.len;
+                if (!writer.append("?passing=true")) return ConsulError.RequestTooLarge;
+                has_query = true;
             }
-
-            // Add tag filter if specified
             if (lccf.*.tag.len > 0) {
-                const tag_param = if (lccf.*.passing_only == 1) "&tag=" else "?tag=";
-                @memcpy(path_buf[path_len..][0..tag_param.len], tag_param);
-                path_len += tag_param.len;
-                @memcpy(path_buf[path_len..][0..lccf.*.tag.len], core.slicify(u8, lccf.*.tag.data, lccf.*.tag.len));
-                path_len += lccf.*.tag.len;
+                if (!writer.append(if (has_query) "&tag=" else "?tag=") or
+                    !writer.appendUrlComponent(core.slicify(u8, lccf.*.tag.data, lccf.*.tag.len)))
+                    return ConsulError.RequestTooLarge;
+                has_query = true;
             }
-
-            // Add datacenter if specified
             if (lccf.*.dc.len > 0) {
-                const dc_param = if (lccf.*.passing_only == 1 or lccf.*.tag.len > 0) "&dc=" else "?dc=";
-                @memcpy(path_buf[path_len..][0..dc_param.len], dc_param);
-                path_len += dc_param.len;
-                @memcpy(path_buf[path_len..][0..lccf.*.dc.len], core.slicify(u8, lccf.*.dc.data, lccf.*.dc.len));
-                path_len += lccf.*.dc.len;
+                if (!writer.append(if (has_query) "&dc=" else "?dc=") or
+                    !writer.appendUrlComponent(core.slicify(u8, lccf.*.dc.data, lccf.*.dc.len)))
+                    return ConsulError.RequestTooLarge;
             }
         },
         .kv => {
-            // /v1/kv/<key>
-            const prefix = "/v1/kv/";
-            @memcpy(path_buf[path_len..][0..prefix.len], prefix);
-            path_len += prefix.len;
-
-            const key = rctx.*.kv_key;
-            @memcpy(path_buf[path_len..][0..key.len], core.slicify(u8, key.data, key.len));
-            path_len += key.len;
+            if (!writer.append("/v1/kv/") or
+                !writer.appendUrlPath(core.slicify(u8, rctx.*.kv_key.data, rctx.*.kv_key.len)))
+                return ConsulError.RequestTooLarge;
         },
-        .catalog => {
-            // /v1/catalog/services
-            const path = "/v1/catalog/services";
-            @memcpy(path_buf[path_len..][0..path.len], path);
-            path_len += path.len;
-        },
+        .catalog => if (!writer.append("/v1/catalog/services")) return ConsulError.RequestTooLarge,
     }
 
-    // Build HTTP request
-    // GET <path> HTTP/1.1\r\nHost: <host>\r\nConnection: close\r\n[X-Consul-Token: <token>\r\n]\r\n
-    const max_size = 512 + path_len + lccf.*.host.len + lccf.*.token.len;
-    if (core.castPtr(u8, core.ngx_pnalloc(pool, max_size))) |data| {
-        var pos: usize = 0;
-
-        // Request line
-        const get = "GET ";
-        @memcpy(data[pos..][0..get.len], get);
-        pos += get.len;
-
-        @memcpy(data[pos..][0..path_len], path_buf[0..path_len]);
-        pos += path_len;
-
-        const http_ver = " HTTP/1.1\r\n";
-        @memcpy(data[pos..][0..http_ver.len], http_ver);
-        pos += http_ver.len;
-
-        // Host header
-        const host_header = "Host: ";
-        @memcpy(data[pos..][0..host_header.len], host_header);
-        pos += host_header.len;
-
-        @memcpy(data[pos..][0..lccf.*.host.len], core.slicify(u8, lccf.*.host.data, lccf.*.host.len));
-        pos += lccf.*.host.len;
-
-        data[pos] = '\r';
-        pos += 1;
-        data[pos] = '\n';
-        pos += 1;
-
-        // Connection header
-        const conn = "Connection: keep-alive\r\n";
-        @memcpy(data[pos..][0..conn.len], conn);
-        pos += conn.len;
-
-        // Token header if present
-        if (lccf.*.token.len > 0) {
-            const token_header = "X-Consul-Token: ";
-            @memcpy(data[pos..][0..token_header.len], token_header);
-            pos += token_header.len;
-            @memcpy(data[pos..][0..lccf.*.token.len], core.slicify(u8, lccf.*.token.data, lccf.*.token.len));
-            pos += lccf.*.token.len;
-            data[pos] = '\r';
-            pos += 1;
-            data[pos] = '\n';
-            pos += 1;
-        }
-
-        // End of headers
-        data[pos] = '\r';
-        pos += 1;
-        data[pos] = '\n';
-        pos += 1;
-
-        return ngx_str_t{ .data = data, .len = pos };
+    const host = core.slicify(u8, lccf.*.host.data, lccf.*.host.len);
+    if (std.mem.indexOfAny(u8, host, "\r\n") != null) return ConsulError.ParseError;
+    if (!writer.append(" HTTP/1.1\r\nHost: ") or !writer.append(host)) return ConsulError.RequestTooLarge;
+    if (lccf.*.port != 80) {
+        if (!writer.appendByte(':') or !writer.appendDecimal(lccf.*.port)) return ConsulError.RequestTooLarge;
     }
-
-    return ConsulError.OutOfMemory;
+    if (!writer.append("\r\nConnection: close\r\n")) return ConsulError.RequestTooLarge;
+    if (lccf.*.token.len > 0) {
+        const token = core.slicify(u8, lccf.*.token.data, lccf.*.token.len);
+        if (std.mem.indexOfAny(u8, token, "\r\n") != null) return ConsulError.ParseError;
+        if (!writer.append("X-Consul-Token: ") or !writer.append(token) or !writer.append("\r\n"))
+            return ConsulError.RequestTooLarge;
+    }
+    if (!writer.append("\r\n")) return ConsulError.RequestTooLarge;
+    return .{ .data = raw, .len = writer.len };
 }
 
 ////////////////////////////  CONSUL UPSTREAM  //////////////////////////////////////////////////
@@ -401,125 +423,76 @@ fn ngx_http_consul_upstream_create_request(
 // Parse Consul service response and build simplified JSON
 fn build_services_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t, healthy_count: *ngx_uint_t) ?ngx_str_t {
     var cj = CJSON.init(pool);
-
     const parsed = cj.decode(json_data) catch return null;
+    defer cj.free(parsed);
 
-    // Response is array of service entries
-    // Build simplified response: {"services":[{"id":"..","address":"..","port":..,"tags":[]},...]}
-    var out_buf: [8192]u8 = undefined;
-    var out_len: usize = 0;
-
-    const prefix = "{\"services\":[";
-    @memcpy(out_buf[out_len..][0..prefix.len], prefix);
-    out_len += prefix.len;
+    const out = core.castPtr(u8, core.ngx_pnalloc(pool, CONSUL_RENDER_MAX)) orelse return null;
+    var writer = BoundedWriter{ .bytes = core.slicify(u8, out, CONSUL_RENDER_MAX) };
+    if (!writer.append("{\"services\":[")) return null;
 
     var it = CJSON.Iterator.init(parsed);
     var first = true;
     healthy_count.* = 0;
     while (it.next()) |entry| {
-        // Each entry has "Service" object with ID, Address, Port, Tags
         const svc = cjson.cJSON_GetObjectItem(entry, "Service");
         if (svc == core.nullptr(cjson.cJSON)) continue;
 
         healthy_count.* += 1;
-        if (!first) {
-            out_buf[out_len] = ',';
-            out_len += 1;
-        }
+        if (!first and !writer.appendByte(',')) return null;
         first = false;
+        if (!writer.appendByte('{')) return null;
+        var has_field = false;
 
-        out_buf[out_len] = '{';
-        out_len += 1;
-
-        // ID
         const id_node = cjson.cJSON_GetObjectItem(svc, "ID");
         if (id_node != core.nullptr(cjson.cJSON)) {
             if (CJSON.stringValue(id_node)) |id_str| {
-                const id_prefix = "\"id\":\"";
-                @memcpy(out_buf[out_len..][0..id_prefix.len], id_prefix);
-                out_len += id_prefix.len;
-                const id_len = @min(id_str.len, 128);
-                @memcpy(out_buf[out_len..][0..id_len], core.slicify(u8, id_str.data, id_len));
-                out_len += id_len;
-                out_buf[out_len] = '"';
-                out_len += 1;
-                out_buf[out_len] = ',';
-                out_len += 1;
+                if (!writer.append("\"id\":") or
+                    !writer.appendJsonString(core.slicify(u8, id_str.data, id_str.len))) return null;
+                has_field = true;
             }
         }
 
-        // Address
         const addr_node = cjson.cJSON_GetObjectItem(svc, "Address");
         if (addr_node != core.nullptr(cjson.cJSON)) {
             if (CJSON.stringValue(addr_node)) |addr_str| {
-                const addr_prefix = "\"address\":\"";
-                @memcpy(out_buf[out_len..][0..addr_prefix.len], addr_prefix);
-                out_len += addr_prefix.len;
-                const addr_len = @min(addr_str.len, 64);
-                @memcpy(out_buf[out_len..][0..addr_len], core.slicify(u8, addr_str.data, addr_len));
-                out_len += addr_len;
-                out_buf[out_len] = '"';
-                out_len += 1;
-                out_buf[out_len] = ',';
-                out_len += 1;
+                if (has_field and !writer.appendByte(',')) return null;
+                if (!writer.append("\"address\":") or
+                    !writer.appendJsonString(core.slicify(u8, addr_str.data, addr_str.len))) return null;
+                has_field = true;
             }
         }
 
-        // Port
         const port_node = cjson.cJSON_GetObjectItem(svc, "Port");
         if (port_node != core.nullptr(cjson.cJSON)) {
             if (CJSON.intValue(port_node)) |port_val| {
-                const port_prefix = "\"port\":";
-                @memcpy(out_buf[out_len..][0..port_prefix.len], port_prefix);
-                out_len += port_prefix.len;
-                out_len += write_decimal(out_buf[out_len..], @intCast(port_val));
+                if (port_val < 0) return null;
+                if (has_field and !writer.appendByte(',')) return null;
+                if (!writer.append("\"port\":") or !writer.appendDecimal(@intCast(port_val))) return null;
+                has_field = true;
             }
         }
 
-        // Tags array
         const tags_node = cjson.cJSON_GetObjectItem(svc, "Tags");
         if (tags_node != core.nullptr(cjson.cJSON) and cjson.cJSON_IsArray(tags_node) == 1) {
-            const tags_prefix = ",\"tags\":[";
-            @memcpy(out_buf[out_len..][0..tags_prefix.len], tags_prefix);
-            out_len += tags_prefix.len;
+            if (has_field and !writer.appendByte(',')) return null;
+            if (!writer.append("\"tags\":[")) return null;
 
             var tag_it = CJSON.Iterator.init(tags_node);
             var first_tag = true;
             while (tag_it.next()) |tag| {
                 if (CJSON.stringValue(tag)) |tag_str| {
-                    if (!first_tag) {
-                        out_buf[out_len] = ',';
-                        out_len += 1;
-                    }
+                    if (!first_tag and !writer.appendByte(',')) return null;
                     first_tag = false;
-                    out_buf[out_len] = '"';
-                    out_len += 1;
-                    const tag_len = @min(tag_str.len, 64);
-                    @memcpy(out_buf[out_len..][0..tag_len], core.slicify(u8, tag_str.data, tag_len));
-                    out_len += tag_len;
-                    out_buf[out_len] = '"';
-                    out_len += 1;
+                    if (!writer.appendJsonString(core.slicify(u8, tag_str.data, tag_str.len))) return null;
                 }
             }
-
-            out_buf[out_len] = ']';
-            out_len += 1;
+            if (!writer.appendByte(']')) return null;
         }
-
-        out_buf[out_len] = '}';
-        out_len += 1;
+        if (!writer.appendByte('}')) return null;
     }
 
-    const suffix = "]}";
-    @memcpy(out_buf[out_len..][0..suffix.len], suffix);
-    out_len += suffix.len;
-
-    // Allocate in pool
-    if (core.castPtr(u8, core.ngx_pnalloc(pool, out_len))) |data| {
-        @memcpy(core.slicify(u8, data, out_len), out_buf[0..out_len]);
-        return ngx_str_t{ .data = data, .len = out_len };
-    }
-    return null;
+    if (!writer.append("]}")) return null;
+    return .{ .data = out, .len = writer.len };
 }
 
 // Parse Consul KV response and build JSON
@@ -527,6 +500,7 @@ fn build_kv_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t, rctx: [*c]consu
     var cj = CJSON.init(pool);
 
     const parsed = cj.decode(json_data) catch return null;
+    defer cj.free(parsed);
 
     // Response is array with single object containing "Value" (base64 encoded)
     var out_buf: [4096]u8 = undefined;
@@ -591,53 +565,53 @@ fn build_kv_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t, rctx: [*c]consu
 // Build catalog response
 fn build_catalog_response(json_data: ngx_str_t, pool: [*c]ngx_pool_t) ?ngx_str_t {
     var cj = CJSON.init(pool);
-
     const parsed = cj.decode(json_data) catch return null;
+    defer cj.free(parsed);
 
-    // Response is object with service names as keys
-    var out_buf: [4096]u8 = undefined;
-    var out_len: usize = 0;
-
-    const prefix = "{\"services\":[";
-    @memcpy(out_buf[out_len..][0..prefix.len], prefix);
-    out_len += prefix.len;
+    const out = core.castPtr(u8, core.ngx_pnalloc(pool, CONSUL_RENDER_MAX)) orelse return null;
+    var writer = BoundedWriter{ .bytes = core.slicify(u8, out, CONSUL_RENDER_MAX) };
+    if (!writer.append("{\"services\":[")) return null;
 
     var it = CJSON.Iterator.init(parsed);
     var first = true;
     while (it.next()) |entry| {
         if (entry.*.string != core.nullptr(u8)) {
-            if (!first) {
-                out_buf[out_len] = ',';
-                out_len += 1;
-            }
+            if (!first and !writer.appendByte(',')) return null;
             first = false;
-
-            out_buf[out_len] = '"';
-            out_len += 1;
-
-            // Get service name from key
             var name_len: usize = 0;
             var p = entry.*.string;
-            while (p.* != 0 and name_len < 128) : (name_len += 1) {
-                p += 1;
-            }
-            @memcpy(out_buf[out_len..][0..name_len], core.slicify(u8, entry.*.string, name_len));
-            out_len += name_len;
-
-            out_buf[out_len] = '"';
-            out_len += 1;
+            while (p.* != 0) : (name_len += 1) p += 1;
+            if (!writer.appendJsonString(core.slicify(u8, entry.*.string, name_len))) return null;
         }
     }
 
-    const suffix = "]}";
-    @memcpy(out_buf[out_len..][0..suffix.len], suffix);
-    out_len += suffix.len;
+    if (!writer.append("]}")) return null;
+    return .{ .data = out, .len = writer.len };
+}
 
-    if (core.castPtr(u8, core.ngx_pnalloc(pool, out_len))) |data| {
-        @memcpy(core.slicify(u8, data, out_len), out_buf[0..out_len]);
-        return ngx_str_t{ .data = data, .len = out_len };
+fn parse_content_length(headers: []const u8) ?usize {
+    var result: ?usize = null;
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next(); // status line
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            // The current adapter deliberately accepts only bounded,
+            // Content-Length-framed responses. Never parse a partial chunked
+            // payload as if it were a complete JSON document.
+            return null;
+        }
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            const parsed = std.fmt.parseInt(usize, value, 10) catch return null;
+            if (parsed > CONSUL_RENDER_MAX) return null;
+            if (result != null and result.? != parsed) return null;
+            result = parsed;
+        }
     }
-    return null;
+    return result;
 }
 
 // Parse HTTP response from Consul
@@ -650,34 +624,22 @@ fn ngx_http_consul_upstream_process_header(
     )) |rctx| {
         const u = r.*.upstream;
         const b = &u.*.buffer;
+        const received_len = @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
+        const received = core.slicify(u8, b.*.pos, received_len);
+        const header_end = std.mem.indexOf(u8, received, "\r\n\r\n") orelse return NGX_AGAIN;
+        const status_line_end = std.mem.indexOf(u8, received[0..header_end], "\r\n") orelse return NGX_ERROR;
+        const status_line = received[0..status_line_end];
+        const first_space = std.mem.indexOfScalar(u8, status_line, ' ') orelse return NGX_ERROR;
+        if (first_space + 4 > status_line.len) return NGX_ERROR;
+        const status: ngx_uint_t = std.fmt.parseInt(ngx_uint_t, status_line[first_space + 1 .. first_space + 4], 10) catch return NGX_ERROR;
+        if (status < 100 or status > 599) return NGX_ERROR;
 
-        // Find HTTP status line and headers
-        var p: [*c]u8 = b.*.pos;
-        var status: ngx_uint_t = 0;
-        var body_start: [*c]u8 = core.nullptr(u8);
-
-        // Parse status line: HTTP/1.1 200 OK\r\n
-        while (p < b.*.last) : (p += 1) {
-            if (p.* == ' ' and status == 0) {
-                // Parse status code
-                p += 1;
-                while (p < b.*.last and p.* >= '0' and p.* <= '9') : (p += 1) {
-                    status = status * 10 + @as(ngx_uint_t, p.* - '0');
-                }
-            }
-            // Find end of headers (\r\n\r\n)
-            if (p + 3 < b.*.last and p[0] == '\r' and p[1] == '\n' and p[2] == '\r' and p[3] == '\n') {
-                body_start = p + 4;
-                break;
-            }
-        }
-
-        if (body_start == core.nullptr(u8) or status == 0) {
-            return NGX_AGAIN;
-        }
-
-        // Get response body length
-        const body_len = @intFromPtr(b.*.last) - @intFromPtr(body_start);
+        const expected_body_len = parse_content_length(received[0 .. header_end + 2]) orelse return NGX_ERROR;
+        const body_offset = header_end + 4;
+        const available_body_len = received.len - body_offset;
+        if (available_body_len < expected_body_len) return NGX_AGAIN;
+        const body_start = b.*.pos + body_offset;
+        const body_len = expected_body_len;
 
         // Store response data
         rctx.*.response_data = ngx_str_t{
@@ -1001,7 +963,7 @@ fn ngx_conf_set_consul_pass(
     if (core.castPtr(consul_loc_conf, loc)) |lccf| {
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
-            const parsed = parse_host_port(arg.*);
+            const parsed = parse_host_port(arg.*) orelse return @constCast("consul_services requires a valid host[:port]");
             lccf.*.host = parsed.host;
             lccf.*.port = parsed.port;
             lccf.*.enabled = 1;
@@ -1028,7 +990,7 @@ fn ngx_conf_set_consul_kv(
     if (core.castPtr(consul_loc_conf, loc)) |lccf| {
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
-            const parsed = parse_host_port(arg.*);
+            const parsed = parse_host_port(arg.*) orelse return @constCast("consul_kv requires a valid host[:port]");
             lccf.*.host = parsed.host;
             lccf.*.port = parsed.port;
             lccf.*.enabled = 1;
@@ -1055,7 +1017,7 @@ fn ngx_conf_set_consul_catalog(
     if (core.castPtr(consul_loc_conf, loc)) |lccf| {
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
-            const parsed = parse_host_port(arg.*);
+            const parsed = parse_host_port(arg.*) orelse return @constCast("consul_catalog requires a valid host[:port]");
             lccf.*.host = parsed.host;
             lccf.*.port = parsed.port;
             lccf.*.enabled = 1;
@@ -1246,17 +1208,25 @@ test "consul module" {
 }
 
 test "parse_host_port" {
-    const r1 = parse_host_port(ngx_string("localhost:8500"));
+    const r1 = parse_host_port(ngx_string("localhost:8500")).?;
     try expectEqual(r1.port, 8500);
     try expectEqual(r1.host.len, 9);
 
-    const r2 = parse_host_port(ngx_string("127.0.0.1:8501"));
+    const r2 = parse_host_port(ngx_string("127.0.0.1:8501")).?;
     try expectEqual(r2.port, 8501);
     try expectEqual(r2.host.len, 9);
 
-    const r3 = parse_host_port(ngx_string("consul.local"));
+    const r3 = parse_host_port(ngx_string("consul.local")).?;
     try expectEqual(r3.port, 8500);
     try expectEqual(r3.host.len, 12);
+
+    const r4 = parse_host_port(ngx_string("[::1]:8502")).?;
+    try expectEqual(r4.port, 8502);
+    try expect(std.mem.eql(u8, core.slicify(u8, r4.host.data, r4.host.len), "::1"));
+
+    try expect(parse_host_port(ngx_string("localhost:bad")) == null);
+    try expect(parse_host_port(ngx_string("localhost:70000")) == null);
+    try expect(parse_host_port(ngx_string("localhost:0")) == null);
 }
 
 test "write_decimal" {
@@ -1270,4 +1240,31 @@ test "write_decimal" {
 
     try expectEqual(write_decimal(&test_buf, 8080), 4);
     try expect(std.mem.eql(u8, test_buf[0..4], "8080"));
+}
+
+test "bounded writer rejects overflow without advancing" {
+    var storage: [8]u8 = undefined;
+    var writer = BoundedWriter{ .bytes = &storage };
+    try expect(writer.append("12345678"));
+    try expect(!writer.append("x"));
+    try expectEqual(@as(usize, 8), writer.len);
+    try expect(std.mem.eql(u8, storage[0..writer.len], "12345678"));
+}
+
+test "bounded writer escapes JSON and URL components" {
+    var storage: [128]u8 = undefined;
+    var writer = BoundedWriter{ .bytes = &storage };
+    try expect(writer.appendJsonString("quote\" slash\\ line\n\x01"));
+    try expect(std.mem.eql(u8, storage[0..writer.len], "\"quote\\\" slash\\\\ line\\n\\u0001\""));
+
+    writer.len = 0;
+    try expect(writer.appendUrlComponent("a b/c?d"));
+    try expect(std.mem.eql(u8, storage[0..writer.len], "a%20b%2Fc%3Fd"));
+}
+
+test "content length framing is strict and bounded" {
+    try expectEqual(@as(?usize, 12), parse_content_length("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n"));
+    try expect(parse_content_length("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n") == null);
+    try expect(parse_content_length("HTTP/1.1 200 OK\r\nContent-Length: nope\r\n") == null);
+    try expect(parse_content_length("HTTP/1.1 200 OK\r\nContent-Length: 70000\r\n") == null);
 }

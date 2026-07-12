@@ -64,6 +64,8 @@ Possible error messages:
 - Requests without `Content-Type: application/json` header pass through without validation
 - Empty request bodies pass through without validation
 - Validation runs in the access phase before content handlers
+- Unsupported or malformed schema keywords reject nginx configuration; they are never silently ignored
+- `jsonschema_body_max_size <size>;` is a location directive with a `1m` default; larger and file-backed bodies are rejected
 
 ### Documentation Audit Checklist
 
@@ -71,4 +73,9 @@ Possible error messages:
 - [x] Bun integration coverage exists at `tests/jsonschema/`.
 - [x] Bun integration coverage now verifies PUT/PATCH validation, JSON content types with parameters, missing content-type passthrough, empty JSON body passthrough, and integer-specific schemas.
 - [x] Gap fixed in this audit pass: `type: "integer"` now rejects fractional numeric values instead of being treated the same as `number`.
+- [x] Schema configuration now recursively rejects unsupported vocabulary and malformed supported keyword shapes; config tests cover both cases.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S1 POLICY SEMANTICS FIXED.** Validation remains a deliberately small schema subset, and configuration now recursively rejects every unsupported keyword, unknown type, and malformed supported keyword shape instead of silently weakening policy. `jsonschema_body_max_size` (1 MiB default) bounds copied bodies, temp-file bodies are rejected explicitly, and JSON media types are exact and case-insensitive. Broader JSON Schema vocabulary remains intentionally unsupported.

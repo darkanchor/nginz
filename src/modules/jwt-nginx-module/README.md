@@ -13,9 +13,20 @@ JWT (JSON Web Token) validation for nginx access control.
 - **Token sources**: Authorization Bearer tokens and `token=$variable` via `jwt_secret`
 - **Claim and header extraction**: `jwt_claim`, `jwt_header`, nested dot-path/array-index lookups, `$jwt_claims`, and `$jwt_nowtime`
 - **Validation controls**: `jwt_require_claim`, `jwt_require_header`, `jwt_require`, `jwt_validate_exp`, `jwt_validate_sig`, `jwt_leeway`, `jwt_issuer`, and `jwt_audience`
+- **Key selection policy**: loaded keys are bound to their declared algorithm; `jwt_strict_kid on` (the default) rejects unknown `kid` values and requires `kid` when more than one key is available
 - **Operational controls**: `jwt_revocation_list_sub`, `jwt_revocation_list_kid`, and `jwt_phase access|preaccess`
 
 ### Directives
+
+#### jwt_strict_kid
+
+*syntax:* `jwt_strict_kid on|off;`
+*context:* `http`, `server`, `location`
+*default:* `on`
+
+With the secure default, a token carrying `kid` is verified only with the matching key, and a token without `kid` is rejected when multiple keys are configured. Set this to `off` only for a deliberate legacy fallback policy.
+
+Keyval files may use the legacy string form (which defaults PEM keys to `RS256` and secrets to `HS256`) or an explicit algorithm binding: `{"key-id":{"key":"-----BEGIN PUBLIC KEY-----...","alg":"RS384"}}`.
 
 #### jwt_secret
 
@@ -355,3 +366,7 @@ Progress from implemented parity waves:
 - [x] Implement real subrequest-backed `jwt_key_request` semantics. *(NGX_HTTP_SUBREQUEST_WAITED + IN_MEMORY, completion callback, re-entrant handler, 7 integration tests)*
 - [x] Extend algorithm-matrix coverage further across ES384/ES512/ES256K and PS384/PS512 variants. *(ES384, ES512, PS384, PS512 covered; ES256K deferred — Bun's built-in OpenSSL lacks secp256k1)*
 - [x] Extend perf coverage beyond the current HS256-focused baseline. *(RS256 worst-case analysis in `perf/jwt/notes/2026-04-29-rs256-worstcase.md`: 1,955 rps/core, 2.1× slower than HS256, IPC=1.11, ~427K instr/req)*
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 FIXED (algorithm and key-selection policy).** Verification now requires the token algorithm to equal the key's declared algorithm, invalid JWKS algorithm/type combinations are skipped, and multi-key selection fails shut on missing or unknown `kid` by default. `jwt_strict_kid off` is an explicit legacy escape hatch. Keyval objects support explicit `{ "key": ..., "alg": ... }` bindings, and focused integration coverage proves RSA same-key hash substitution and unknown/missing `kid` rejection. Broader negative curve/type and signature-shape matrices remain defense-in-depth follow-up coverage.

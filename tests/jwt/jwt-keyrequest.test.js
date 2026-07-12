@@ -89,13 +89,21 @@ describe("JWT — Key Request (Subrequest)", () => {
   });
 
   test("accepts token signed with key fetched via subrequest", async () => {
-    const token = createHS256Token({ sub: "test-user", exp: FAR_FUTURE }, SUBREQ_SECRET);
+    const token = createHS256Token({ sub: "test-user", exp: FAR_FUTURE }, SUBREQ_SECRET, { kid: "subreq-key" });
     const res = await fetch(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text.trim()).toBe("KEYREQUEST OK");
+  });
+
+  test("strict kid rejects a missing kid when inherited and local key sources coexist", async () => {
+    const token = createHS256Token({ sub: "missing-kid", exp: FAR_FUTURE }, SUBREQ_SECRET);
+    const res = await fetch(`${TEST_URL}/protected`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
   });
 
   test("rejects token with wrong secret (subrequest-loaded key mismatch)", async () => {
@@ -112,7 +120,7 @@ describe("JWT — Key Request (Subrequest)", () => {
   });
 
   test("accepts token on variable-based key_request URL", async () => {
-    const token = createHS256Token({ sub: "test-var", exp: FAR_FUTURE }, SUBREQ_SECRET);
+    const token = createHS256Token({ sub: "test-var", exp: FAR_FUTURE }, SUBREQ_SECRET, { kid: "subreq-key" });
     const res = await fetch(`${TEST_URL}/protected-var`, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -348,7 +356,7 @@ describe("JWT — Key Request (Subrequest)", () => {
   });
 
   test("preaccess jwt_key_request route accepts valid token from query-variable token source", async () => {
-    const token = createHS256Token({ sub: "nested-preaccess", exp: FAR_FUTURE }, SUBREQ_SECRET);
+    const token = createHS256Token({ sub: "nested-preaccess", exp: FAR_FUTURE }, SUBREQ_SECRET, { kid: "subreq-key" });
     const res = await fetch(`${TEST_URL}/protected-sub-inner-preaccess?token=${encodeURIComponent(token)}`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("KEYREQUEST SUB INNER PREACCESS OK");

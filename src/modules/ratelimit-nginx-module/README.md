@@ -159,3 +159,7 @@ Because `ratelimit` now runs in the ACCESS phase, it only sees signals from modu
 - [x] ACCESS-phase composition tradeoff is documented: ratelimit only sees earlier soft-signal modules, not handlers that already finalized the request.
 - [x] Fixed-window counters now live in a shared-memory zone, and the Bun coverage runs with `worker_processes 2` to verify cross-worker enforcement.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S1 CAPACITY POLICY FIXED; IDENTITY/TELEMETRY OPEN.** At 1,024 simultaneous live windows, a new key is now denied rather than evicting another client's enforcement state; expired entries remain reusable. A full-table unit proof preserves the first bucket, and the focused 14-case multi-worker suite is green. Saturation metrics and collision-resolving key identity beyond the current 64-bit hash remain S1 hardening.

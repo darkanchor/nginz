@@ -379,7 +379,7 @@ describe("waf module", () => {
   // Body checking tests
   describe("body checking", () => {
     test("blocks SQLi in POST body", async () => {
-      const res = await fetch(`${TEST_URL}/body`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/body`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "username=admin' OR '1'='1",
@@ -391,7 +391,7 @@ describe("waf module", () => {
     });
 
     test("blocks XSS in POST body", async () => {
-      const res = await fetch(`${TEST_URL}/body`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/body`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "comment=<script>alert(1)</script>",
@@ -425,7 +425,7 @@ describe("waf module", () => {
     });
 
     test("blocks XSS in PATCH body", async () => {
-      const res = await fetch(`${TEST_URL}/body`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/body`, {
         method: "PATCH",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "bio=<svg onload=alert(1)>",
@@ -486,7 +486,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_BODY rule from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-body`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-body`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "comment=native-body-needle",
@@ -626,7 +626,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_BODY selector rule for form bodies", async () => {
-      const res = await fetch(`${TEST_URL}/rules-body-selector-form`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-body-selector-form`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "comment=scoped-body-hit&other=ok",
@@ -637,7 +637,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_BODY selector rule for JSON bodies", async () => {
-      const res = await fetch(`${TEST_URL}/rules-body-selector-json`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-body-selector-json`, {
         method: "POST",
         headers: { "Content-Type": "application/json; charset=utf-8" },
         body: JSON.stringify({ comment: "json-body-hit", other: "ok" }),
@@ -645,6 +645,21 @@ describe("waf module", () => {
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
+    });
+
+    test("serves the next request after a body-phase denial", async () => {
+      const blocked = await fetchNoKeepAlive(`${TEST_URL}/rules-body-selector-json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ comment: "json-body-hit" }),
+      });
+      expect(blocked.status).toBe(403);
+      expect(blocked.headers.get("connection")).toBe("close");
+      await blocked.text();
+
+      const clean = await fetch(`${TEST_URL}/clean`);
+      expect(clean.status).toBe(200);
+      expect(await clean.text()).toContain("clean response");
     });
 
     test("per-rule deny overrides detect mode", async () => {
@@ -706,7 +721,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on explicit @libinjection_xss operator in request body", async () => {
-      const res = await fetch(`${TEST_URL}/rules-libinjection-body`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-libinjection-body`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "payload=<svg onload=alert(1)>",
@@ -779,6 +794,20 @@ describe("waf module", () => {
       expect(recovered.status).toBe(200);
       expect(await recovered.text()).toContain("rules score weighted response");
     }, 15000);
+
+    test("keeps reputation state isolated between locations with different policies", async () => {
+      await restartWafServer();
+
+      for (let i = 0; i < 2; i++) {
+        const res = await fetchNoKeepAlive(`${TEST_URL}/rules-score?token=score-subset-needle`);
+        expect(res.status).toBe(200);
+        await res.text();
+      }
+
+      const scoped = await fetchNoKeepAlive(`${TEST_URL}/rules-score-weighted?token=clean`);
+      expect(scoped.status).toBe(200);
+      expect(await scoped.text()).toContain("rules score weighted response");
+    });
 
     test("setvar ip.score alias maps to the same weighted reputation behavior", async () => {
       await restartWafServer();
@@ -1155,7 +1184,7 @@ describe("waf module", () => {
     });
 
     test("validateUtf8Encoding matches malformed UTF-8 bytes", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-validate-utf8`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-operators-validate-utf8`, {
         method: "POST",
         headers: { "Content-Type": "application/octet-stream" },
         body: new Uint8Array([0x61, 0xc0, 0xaf, 0x62]),
@@ -1166,7 +1195,7 @@ describe("waf module", () => {
     });
 
     test("validateUtf8Encoding also matches truncated multibyte sequences", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-validate-utf8`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-operators-validate-utf8`, {
         method: "POST",
         headers: { "Content-Type": "application/octet-stream" },
         body: new Uint8Array([0xe2, 0x82]),
@@ -1282,7 +1311,7 @@ describe("waf module", () => {
     });
 
     test("keeps body selector coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-body`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-collections-body`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "comment=collections-body-hit",
@@ -1332,7 +1361,7 @@ describe("waf module", () => {
 
   describe("broader body processors", () => {
     test("keeps form body selector coverage concrete in body.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-body-form`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-body-form`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "comment=body-form-hit",
@@ -1343,7 +1372,7 @@ describe("waf module", () => {
     });
 
     test("supports nested JSON selector paths in request bodies", async () => {
-      const res = await fetch(`${TEST_URL}/rules-body-json-nested`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-body-json-nested`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ profile: { comment: "nested-json-hit" } }),
@@ -1356,7 +1385,7 @@ describe("waf module", () => {
     test("supports multipart form field selectors in request bodies", async () => {
       const form = new FormData();
       form.append("comment", "multipart-hit");
-      const res = await fetch(`${TEST_URL}/rules-body-multipart`, {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/rules-body-multipart`, {
         method: "POST",
         body: form,
       });

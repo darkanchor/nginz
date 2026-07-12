@@ -28,9 +28,7 @@ const NArray = ngx.array.NArray;
 extern var ngx_http_core_module: ngx_module_t;
 extern var ngx_http_upstream_module: ngx_module_t;
 extern var ngx_worker: ngx_uint_t;
-extern var ngx_http_worker_events_default_zone: [*c]core.ngx_shm_zone_t;
-extern fn ngx_http_worker_events_publish_internal(
-    zone: [*c]core.ngx_shm_zone_t,
+extern fn ngx_http_worker_events_publish_default(
     channel_str: ngx_str_t,
     type_str: ngx_str_t,
     payload_str: ngx_str_t,
@@ -340,8 +338,6 @@ fn getCurrentTimeMs() i64 {
 }
 
 fn publishHealthTransition(healthy: bool, status: ngx_uint_t, checked_at_ms: i64) void {
-    const zone = ngx_http_worker_events_default_zone;
-    if (zone == core.nullptr(core.ngx_shm_zone_t)) return;
     if (healthcheck_worker_events_channel.len == 0 or healthcheck_worker_events_channel.data == null) return;
 
     const event_type = ngx_string("transition");
@@ -353,7 +349,7 @@ fn publishHealthTransition(healthy: bool, status: ngx_uint_t, checked_at_ms: i64
     ) catch return;
 
     const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
-    _ = ngx_http_worker_events_publish_internal(zone, healthcheck_worker_events_channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_default(healthcheck_worker_events_channel, event_type, payload_str);
 }
 
 // ── Zone init callbacks ──────────────────────────────────────────────────────
@@ -1919,6 +1915,28 @@ fn ngx_http_healthcheck_variable(
 fn preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     _ = cf;
     // Reset per-config-cycle globals before directive parsing starts.
+    // The master process parses reloads in-place; any pointer or option left
+    // here would otherwise be inherited by new workers after its cycle pool is
+    // retired, or keep a removed health_probe directive active.
+    ngx_http_healthcheck_zone = core.nullptr(core.ngx_shm_zone_t);
+    healthcheck_probe_enabled = false;
+    healthcheck_probe_interval_ms = 5000;
+    healthcheck_probe_timeout_ms = 1000;
+    healthcheck_probe_fail_threshold = 2;
+    healthcheck_probe_pass_threshold = 1;
+    healthcheck_probe_slow_start_ms = 0;
+    healthcheck_probe_port = 80;
+    healthcheck_probe_host_len = 0;
+    healthcheck_probe_path_len = 1;
+    healthcheck_probe_flags = 0;
+    @memset(healthcheck_probe_host_buf[0..], 0);
+    @memset(healthcheck_probe_path_buf[0..], 0);
+    healthcheck_probe_path_buf[0] = '/';
+    healthcheck_probe_match_status_min = 0;
+    healthcheck_probe_match_status_max = 0;
+    healthcheck_probe_match_body_len = 0;
+    @memset(healthcheck_probe_match_body_buf[0..], 0);
+    healthcheck_worker_events_channel = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
     upstream_probe_count = 0;
     peer_probe_count = 0;
     @memset(peer_probe_index_slots[0..], 0);
@@ -2286,3 +2304,22 @@ export var ngx_http_healthcheck_module = blk: {
 };
 
 test "healthcheck module" {}
+
+test "preconfiguration clears service probe state from the prior cycle" {
+    healthcheck_probe_enabled = true;
+    healthcheck_probe_interval_ms = 99;
+    healthcheck_probe_host_len = 4;
+    healthcheck_probe_flags = PROBE_FLAG_TLS | PROBE_FLAG_HAS_MATCH;
+    healthcheck_worker_events_channel = ngx_string("stale-channel");
+    upstream_probe_count = 7;
+    peer_probe_count = 9;
+
+    try std.testing.expectEqual(NGX_OK, preconfiguration(core.nullptr(ngx_conf_t)));
+    try std.testing.expect(!healthcheck_probe_enabled);
+    try std.testing.expectEqual(@as(ngx_msec_t, 5000), healthcheck_probe_interval_ms);
+    try std.testing.expectEqual(@as(usize, 0), healthcheck_probe_host_len);
+    try std.testing.expectEqual(@as(u8, 0), healthcheck_probe_flags);
+    try std.testing.expectEqual(@as(usize, 0), healthcheck_worker_events_channel.len);
+    try std.testing.expectEqual(@as(usize, 0), upstream_probe_count);
+    try std.testing.expectEqual(@as(usize, 0), peer_probe_count);
+}

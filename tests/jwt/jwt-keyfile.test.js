@@ -168,23 +168,23 @@ describe("JWT — Algorithm Support & Key Loading", () => {
       "rs256-key": rsaKeys.RS256.publicKey,
     });
     writeKeyFile(keyDir, "keys-rs384.json", {
-      "rs384-key": rsaKeys.RS384.publicKey,
+      "rs384-key": { key: rsaKeys.RS384.publicKey, alg: "RS384" },
     });
     writeKeyFile(keyDir, "keys-rs512.json", {
-      "rs512-key": rsaKeys.RS512.publicKey,
+      "rs512-key": { key: rsaKeys.RS512.publicKey, alg: "RS512" },
     });
     writeKeyFile(keyDir, "keys-kid.json", {
-      "key-alpha": rsaKeys.RS256.publicKey,
-      "key-beta": rsaKeys.RS384.publicKey,
+      "key-alpha": { key: rsaKeys.RS256.publicKey, alg: "RS256" },
+      "key-beta": { key: rsaKeys.RS384.publicKey, alg: "RS384" },
     });
     writeRsaJwksFile(keyDir, "keys-jwks-rs256.json", "jwks-rs256", "RS256", rsaKeys.RS256.publicKey);
-    writeKeyFile(keyDir, "keys-es256.json", { "es256-key": ecKeys.ES256.publicKey });
-    writeKeyFile(keyDir, "keys-es384.json", { "es384-key": ecKeys.ES384.publicKey });
-    writeKeyFile(keyDir, "keys-es512.json", { "es512-key": ecKeys.ES512.publicKey });
-    writeKeyFile(keyDir, "keys-ps256.json", { "ps256-key": pssKeys.PS256.publicKey });
-    writeKeyFile(keyDir, "keys-ps384.json", { "ps384-key": pssKeys.PS384.publicKey });
-    writeKeyFile(keyDir, "keys-ps512.json", { "ps512-key": pssKeys.PS512.publicKey });
-    writeKeyFile(keyDir, "keys-eddsa.json", { "eddsa-key": eddsaKeys.EdDSA.publicKey });
+    writeKeyFile(keyDir, "keys-es256.json", { "es256-key": { key: ecKeys.ES256.publicKey, alg: "ES256" } });
+    writeKeyFile(keyDir, "keys-es384.json", { "es384-key": { key: ecKeys.ES384.publicKey, alg: "ES384" } });
+    writeKeyFile(keyDir, "keys-es512.json", { "es512-key": { key: ecKeys.ES512.publicKey, alg: "ES512" } });
+    writeKeyFile(keyDir, "keys-ps256.json", { "ps256-key": { key: pssKeys.PS256.publicKey, alg: "PS256" } });
+    writeKeyFile(keyDir, "keys-ps384.json", { "ps384-key": { key: pssKeys.PS384.publicKey, alg: "PS384" } });
+    writeKeyFile(keyDir, "keys-ps512.json", { "ps512-key": { key: pssKeys.PS512.publicKey, alg: "PS512" } });
+    writeKeyFile(keyDir, "keys-eddsa.json", { "eddsa-key": { key: eddsaKeys.EdDSA.publicKey, alg: "EdDSA" } });
 
     await startNginz("tests/jwt/nginx.keyfile.conf", MODULE);
   }, 30000);
@@ -369,21 +369,28 @@ describe("JWT — Algorithm Support & Key Loading", () => {
     expect(res.status).toBe(200);
   });
 
-  test("kid: falls back to first key when kid is unknown", async () => {
-    // Unknown kid falls back to first key (key-alpha = RS256)
+  test("kid: rejects an unknown kid instead of falling back", async () => {
     const token = createRsaTokenWithKid("RS256", "key-unknown", { sub: "test" }, rsaKeys.RS256.privateKey);
     const res = await fetch(`${TEST_URL}/kid-match`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
   });
 
-  test("kid: defaults to first key when kid header absent", async () => {
+  test("kid: rejects a missing kid when multiple keys are configured", async () => {
     const token = createRsaToken("RS256", { sub: "no-kid-user" }, rsaKeys.RS256.privateKey);
     const res = await fetch(`${TEST_URL}/kid-match`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
+  });
+
+  test("algorithm: rejects RS384 even when the RS256 key can verify it", async () => {
+    const token = createRsaToken("RS384", { sub: "alg-confusion" }, rsaKeys.RS256.privateKey);
+    const res = await fetch(`${TEST_URL}/alg-rs256-only`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(401);
   });
 
   test("jwks: validates RSA token from JWKS key material", async () => {

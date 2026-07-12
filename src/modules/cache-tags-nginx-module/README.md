@@ -129,3 +129,7 @@ Current implementation has these limitations:
 - [x] Bun integration coverage now runs with `worker_processes 2` and verifies cross-worker capture plus purge behavior.
 - [x] Variable integration coverage now verifies `$cache_tags_last_purged`, `$cache_tags_last_tag`, and `$cache_tags_last_error` on purge success/miss/error paths.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S1 DATA INTEGRITY FIXED; OBSERVABILITY OPEN.** Oversized tags/URIs are rejected before consuming shared slots, bucket/table saturation returns an incomplete outcome, and the response filter emits a warning instead of silently truncating or dropping. Unit bounds coverage and the focused 17-case shared-worker suite are green. Dedicated saturation/drop counters and graceful-reload pressure tests remain; the store is still metadata only, so removing a mapping is not proof that nginx cache content was invalidated.

@@ -422,3 +422,122 @@ Recommended order:
 4. only then consider a lightweight registry / installer workflow
 
 The platform value comes from having good reusable modules first, not from building a package manager before there is an ecosystem worth packaging.
+
+## Whole-Module Engineering Audit — 2026-07-12
+
+### Scope and confidence
+
+This pass reviewed all 26 directories under `src/modules`, from the small synchronous modules through the shared-memory, asynchronous upstream, cryptographic, and database modules. The baseline revision was `ca4841d` (`zones`), whose fix establishes an important rule: an `ngx_shm_zone_t *` stored in a process global is a descriptor owned by one nginx configuration cycle, not permanent module-owned state. Every active cycle must register/rebind its zones, and removing a directive must clear or replace every cycle-owned global reference.
+
+`zig build test` passes. The full `bun test` run reports 1,129 passing and four failing tests: the real Redis and PostgreSQL container suites cannot start because their named containers are absent, while two njs combo-subrequest cases fail even in an isolated rerun (duplicate INCR side effect and a connection reset). Passing happy-path tests do not discharge the findings below, which require capacity exhaustion, configuration removal on reload, oversized/malicious upstream data, TLS failure, client abort, or concurrent cross-worker mutation. Each module README contains the detailed verdict and required proof.
+
+### Severity and scheduling decision
+
+- **S0 — release blocker:** memory-safety/lifetime defects, authentication or PKI transport bypass, or deterministic cross-policy/cross-backend state aliasing. Fix and add a regression proof before feature releases.
+- **S1 — high:** bounded-input, policy-isolation, capacity, failure-mode, or availability defects that can deny service or weaken a control under realistic stress. Fix immediately after S0, before performance work.
+- **S2 — medium:** contention, avoidable allocation/copying, and observability gaps where correctness is preserved. Optimize only after S0/S1 invariants are proven.
+- **S3 — low/feature:** protocol breadth, richer syntax, and product gaps. Schedule last.
+
+This ordering is deliberate: **robustness first, performance second, feature gaps last**. A fast shared-memory primitive with an unclear owner, scope, capacity failure, or reload lifetime is not acceptable foundation work.
+
+### Audit disposition by module (easy to hard)
+
+| Module | Decision | Principal issue or proof |
+|---|---|---|
+| `hello` | pass / S3 cleanup | synchronous request-pool-only code; improve response metadata |
+| `canary` | S1 fixed | checked entropy, strict percentage parsing, explicit zero override |
+| `requestid` | S1 fixed | checked entropy and bounded visible-ASCII propagated IDs |
+| `transform` | S1 buffering fixed | known-length 1 MiB default bound, consumed memory/file buffers, exact JSON media type; streaming remains deferred |
+| `prometheus` | pass, then S2 | reload-safe shared zone; per-request global mutex contention |
+| `circuit-breaker` | S0 fixed / S1 | saturation fails closed without aliasing; telemetry and half-open admission remain |
+| `cache-tags` | S1 integrity fixed | bounds/capacity reject with warning; counters/reload pressure remain |
+| `ratelimit` | S1 capacity fixed | live windows never evicted; collision identity/metrics remain |
+| `graphql` | S1 heuristic fixed | bounded body/temp-file policy plus fail-closed fragments; a real parser/complexity model remains deferred |
+| `jsonschema` | S1 semantics fixed | unsupported vocabulary rejects config; bounded body/temp-file and exact JSON media policy added |
+| `echoz` | S0 fixed | lifetime-ordered null checks plus worker-survival regression |
+| `worker-events` | S0 fixed / S1 | cycle registry prevents stale/last-zone routing; explicit named native binding remains |
+| `cache-purge` | S1 partial | hard cache-tags dependency and safe event lifetime; named binding/ack remains |
+| `consul` | S0 fixed / S1 | checked pool builders and complete bounded framing; chunked support deferred |
+| `redis` | S0 fixed / S1 | bounded RESP/JSON handling; larger incremental streaming deferred |
+| `wechatpay` | S0 fixed / S1 | verified TLS plus shared freshness/replay window; capacity/body bounds remain |
+| `oidc` | S0 fixed / S1 | verified HTTPS token/discovery/JWKS and bounds; evented fetch/TLS negatives remain |
+| `jwt` | S0 fixed | exact key algorithm and strict multi-key `kid` selection enforced |
+| `nftset` | pass with S1 | shared zones are cycle-safe; synchronous Netlink blocks request workers |
+| `healthcheck` | S0 fixed / S1 | cycle globals fully reset; verified, event-driven probe I/O remains |
+| `upstream-balancer` | S0 fixed / proof | idempotent request cleanup and init-failure unpin added; stress proof remains |
+| `dynamic-upstreams` | S0 fixed / proof | traversals pin snapshots and drain readers lock; stress/reload proof remains |
+| `waf` | S1 isolation fixed | policy-scoped reputation prevents cross-location contamination; capacity/reload/multi-worker proof remains |
+| `acme` | S0 transport fixed / S1 | verified TLS, HTTPS default, and explicit private-CA live issuance fixed; negative TLS and capacity behavior need proof |
+| `njs` | S0 cleared / soak | composition passes 17/17 and 170/170 repeated after Redis/pgrest fixes |
+| `pgrest` | S0 fixed / S1 | per-worker pools keyed by backend and limit; capacity/teardown proof remains |
+
+### S0 fix program
+
+#### 1. Stop worker corruption and unsafe parsing
+
+Fix `echoz`, `consul`, and `redis` first because they have direct worker-safety failure paths. Introduce checked builders/parsers with explicit maximums and controlled HTTP errors. Verification must include boundary-minus-one/boundary/boundary-plus-one, integer overflow, fragmented input, temp-file bodies where applicable, malformed peer data, and a follow-up request proving the worker survived.
+
+#### 2. Restore authentication and PKI transport guarantees
+
+Enable CA and hostname verification by default in `oidc`, `acme`, and `wechatpay`; insecure test trust must require explicit test-only configuration. Enforce WeChat Pay timestamp/replay policy. In `jwt`, require exact algorithm/key matching and a strict `kid` policy. Negative tests must cover untrusted CA, hostname mismatch, expired/not-yet-valid certificate, algorithm substitution, wrong curve/key type, missing/unknown `kid`, and replay.
+
+#### 3. Make scope, capacity, and reload ownership explicit
+
+- `circuit-breaker`: never return another key's entry on exhaustion; use a keyed store or fail conservatively with saturation telemetry.
+- `worker-events`: remove the last-created default-zone dependency; consumers bind a named zone in current-cycle configuration.
+- `healthcheck`: move service-probe/event settings into cycle configuration or reset/copy all globals in preconfiguration; no pointer into a retired pool may reach a worker timer.
+- `pgrest`: create per-worker pools keyed by backend/configuration identity rather than a singleton.
+
+Required reload matrix for every module owning cycle state: unchanged config, changed value, added directive, removed directive, failed reload followed by continued old-worker service, repeated successful reloads, and graceful old-worker exit.
+
+#### 4. Close dynamic peer lifetime races
+
+Treat `dynamic-upstreams` and `upstream-balancer` as one correctness unit. Every snapshot traversal must pin a generation; every pin must have an idempotent request-pool cleanup backstop; drain state must be immutable/versioned or read under synchronization. Stress proof must run simultaneous traffic, PUT/PATCH/drain/undrain, retries, client aborts, no-eligible-peer cases, reloads, and slab pressure while asserting that retired generations are reclaimed.
+
+#### 5. Diagnose the njs composition crash and duplicate side effect
+
+Run `tests/njs/combo-subrequest.test.js` with preserved nginx logs, worker exit status, and core/sanitizer evidence. Determine whether a subrequest is being executed twice, a Redis response is being replayed, or pgrest/njs request finalization is corrupting the parent lifecycle. The acceptance proof is deterministic single execution of non-idempotent subrequests, no connection reset, and repeated multi-worker runs under the same composition graph.
+
+### Shared-memory proof obligations
+
+No SHM module is considered complete until its README/tests answer all of these:
+
+1. **Owner/tag:** which module tag owns the zone, and can another module safely retrieve it?
+2. **Cycle binding:** where is the current cycle's descriptor registered and rebound? What happens when configuration removes it?
+3. **Data lifetime:** which bytes live in slab memory, cycle pools, request pools, worker globals, or stack storage?
+4. **Scope key:** are entries global, server-, location-, upstream-, policy-, or tenant-scoped? Is that scope encoded in the key rather than implied by call site?
+5. **Synchronization:** which lock/atomic protocol protects every field and compound invariant? Release/acquire on a count does not legalize concurrent non-atomic mutation of the entries it counts.
+6. **Capacity:** what happens at full capacity? Never alias an unrelated key, silently reset a security budget, or truncate identity.
+7. **Failure mode:** does allocation/lookup/lock/dependency failure fail open, fail closed, reject configuration, or return an operational error? The choice must be explicit and observable.
+8. **Reload proof:** do unchanged/changed/removed zones preserve only intended data, with no old descriptor or config-pool pointer retained?
+9. **Cross-worker proof:** do at least two workers observe the same committed state without half-written entries or stale local caches?
+10. **Observability:** expose saturation, eviction, truncation, dropped events, allocation failure, and last error without requiring debug logs.
+
+### S1 robustness program
+
+After S0 is green:
+
+1. Bound body/filter/parser work in `transform`, `graphql`, `jsonschema`, and WAF; define temp-file and unsupported-syntax behavior.
+2. Make WAF reputation scope explicit and test conflicting location policies.
+3. Make cache-tags identities non-truncating and cache-purge dependencies/physical invalidation semantics honest.
+4. Define conservative capacity policy for ratelimit and add saturation metrics.
+5. Make canary/requestid entropy and configuration failures explicit.
+6. Bound nftset's synchronous Netlink latency or move it off the request path.
+7. Turn silent configured-resource omissions (healthcheck caps, optional native dependencies) into config errors or explicit degraded states.
+
+### S2 performance program
+
+Only after the robustness suite passes:
+
+- replace Prometheus request-path mutex serialization with documented atomic/snapshot semantics;
+- reduce WAF and nftset lock hold times without weakening compound invariants;
+- make transform/Consul/Redis/pgrest response processing streaming or bounded-chunk where semantics allow;
+- shard or index fixed shared tables only after scope/capacity behavior is correct;
+- benchmark pgrest per-backend pools and serializers after pool isolation, not before;
+- benchmark dynamic peer selection under generation churn and verify reclamation counters alongside latency.
+
+Performance acceptance must include correctness counters (drops, evictions, active/retired generations, pool ownership), not throughput alone.
+
+### S3 feature decisions
+
+Defer new rule syntax, new GraphQL/JSON Schema vocabulary, additional Redis/Consul operations, broader JWT algorithms, richer ACME automation, and new native modules until S0 and S1 are closed. The existing njs platform remains the preferred place for fast-changing orchestration and glue. Feature work may proceed only when it does not expand an unaudited lifetime, parser, or shared-state surface.

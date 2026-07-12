@@ -206,11 +206,12 @@ fn ngx_http_cache_tags_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaqu
 
 // Find or create a tag entry
 fn findOrCreateTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
+    if (tag.len == 0 or tag.len > MAX_TAG_LEN) return null;
     if (store.*.tag_count == 0) {
         if (store.*.tag_count >= MAX_TAGS) return null;
         for (&store[0].tags, 0..) |*entry, i| {
             if (store[0].tag_used[i] != @as(u8, 0)) continue;
-            const len = @min(tag.len, MAX_TAG_LEN);
+            const len = tag.len;
             entry.tag_len = len;
             entry.uri_count = 0;
             @memcpy(entry.tag[0..len], tag[0..len]);
@@ -236,7 +237,7 @@ fn findOrCreateTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
 
     for (&store[0].tags, 0..) |*entry, i| {
         if (store[0].tag_used[i] != @as(u8, 0)) continue;
-        const len = @min(tag.len, MAX_TAG_LEN);
+        const len = tag.len;
         entry.tag_len = len;
         entry.uri_count = 0;
         @memcpy(entry.tag[0..len], tag[0..len]);
@@ -262,34 +263,37 @@ fn findTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
 }
 
 // Add a URI to a tag
-fn addUriToTag(tag_entry: *TagEntry, uri: []const u8) void {
-    if (tag_entry.uri_count >= MAX_URIS_PER_TAG) return;
+fn addUriToTag(tag_entry: *TagEntry, uri: []const u8) bool {
+    if (uri.len == 0 or uri.len > MAX_URI_LEN or tag_entry.uri_count >= MAX_URIS_PER_TAG) return false;
 
     // Check if URI already exists
     for (0..tag_entry.uri_count) |i| {
         if (tag_entry.uri_lens[i] == uri.len and
             std.mem.eql(u8, tag_entry.uris[i][0..tag_entry.uri_lens[i]], uri))
         {
-            return; // Already exists
+            return true; // Already exists
         }
     }
 
-    const len = @min(uri.len, MAX_URI_LEN);
+    const len = uri.len;
     @memcpy(tag_entry.uris[tag_entry.uri_count][0..len], uri[0..len]);
     tag_entry.uri_lens[tag_entry.uri_count] = len;
     tag_entry.uri_count += 1;
+    return true;
 }
 
 // Parse comma-separated tags and associate with URI
-fn associateTagsWithUri(store: [*c]cache_tags_store, tags_str: []const u8, uri: []const u8) void {
+fn associateTagsWithUri(store: [*c]cache_tags_store, tags_str: []const u8, uri: []const u8) bool {
+    if (uri.len == 0 or uri.len > MAX_URI_LEN) return false;
+    var complete = true;
     var start: usize = 0;
     for (tags_str, 0..) |c, i| {
         if (c == ',') {
             const tag = std.mem.trim(u8, tags_str[start..i], " \t");
             if (tag.len > 0) {
                 if (findOrCreateTag(store, tag)) |entry| {
-                    addUriToTag(entry, uri);
-                }
+                    if (!addUriToTag(entry, uri)) complete = false;
+                } else complete = false;
             }
             start = i + 1;
         }
@@ -298,9 +302,10 @@ fn associateTagsWithUri(store: [*c]cache_tags_store, tags_str: []const u8, uri: 
     const tag = std.mem.trim(u8, tags_str[start..], " \t");
     if (tag.len > 0) {
         if (findOrCreateTag(store, tag)) |entry| {
-            addUriToTag(entry, uri);
-        }
+            if (!addUriToTag(entry, uri)) complete = false;
+        } else complete = false;
     }
+    return complete;
 }
 
 // Purge all URIs associated with a tag, returns count
@@ -373,8 +378,12 @@ export fn ngx_http_cache_tags_header_filter(r: [*c]ngx_http_request_t) callconv(
         if (getTagStore()) |store| {
             if (getTagShpool()) |shpool| {
                 shm.ngx_shmtx_lock(&shpool.*.mutex);
-                associateTagsWithUri(store, tags_value, uri);
+                const complete = associateTagsWithUri(store, tags_value, uri);
                 shm.ngx_shmtx_unlock(&shpool.*.mutex);
+                if (!complete) {
+                    ngx.log.ngz_log_error(ngx.log.NGX_LOG_WARN, r.*.connection.*.log, 0,
+                        "cache_tags: tag/URI rejected due to bounds or shared-store capacity", .{});
+                }
             }
         }
     }
@@ -645,8 +654,8 @@ test "cache_tags module" {}
 test "tag parsing" {
     var store = std.mem.zeroes(cache_tags_store);
 
-    associateTagsWithUri(&store, "product, category, featured", "/api/products/123");
-    associateTagsWithUri(&store, "category", "/api/products/456");
+    try std.testing.expect(associateTagsWithUri(&store, "product, category, featured", "/api/products/123"));
+    try std.testing.expect(associateTagsWithUri(&store, "category", "/api/products/456"));
 
     try expectEqual(store.tag_count, 3);
 
@@ -663,4 +672,13 @@ test "tag parsing" {
     try expectEqual(purged, 2);
     try expectEqual(store.tag_count, 2);
     try expectEqual(findTag(&store, "category") == null, true);
+}
+
+test "oversized tag and URI are rejected without consuming slots" {
+    var store = std.mem.zeroes(cache_tags_store);
+    var long_tag = [_]u8{'t'} ** (MAX_TAG_LEN + 1);
+    var long_uri = [_]u8{'u'} ** (MAX_URI_LEN + 1);
+    try std.testing.expect(!associateTagsWithUri(&store, &long_tag, "/ok"));
+    try std.testing.expect(!associateTagsWithUri(&store, "ok", &long_uri));
+    try expectEqual(@as(usize, 0), store.tag_count);
 }

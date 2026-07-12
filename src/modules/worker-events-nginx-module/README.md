@@ -488,3 +488,7 @@ A useful way to frame it is:
 - consumers like cache/session/health modules: decide what to do about that signal
 
 That architecture makes sense. The dangerous part is not the HTTP endpoint. The dangerous part is building a shared-memory event ring that stays deterministic under concurrent workers.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 LIFECYCLE/ISOLATION FIXED; NAMED NATIVE ROUTING OPEN.** The last-created descriptor global has been removed from native consumers. A current-cycle registry is cleared in preconfiguration, and the compatibility publisher succeeds only when exactly one zone exists; zero-zone and multi-zone configurations return an error rather than dereferencing retired state or cross-routing to the last zone. Unit proofs cover registry reset and ambiguous-zone rejection, and the 47 focused API/multi-worker/multi-zone tests remain green. Explicit named-zone binding for native publishers and observable publish/drop outcomes remain follow-up work.

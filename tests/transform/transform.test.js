@@ -1,6 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
-  ensureBuild,
   startNginz,
   stopNginz,
   cleanupRuntime,
@@ -14,8 +13,6 @@ const MODULE_NAME = "transform";
 let httpMock;
 
 beforeAll(async () => {
-  ensureBuild();
-
   // Create mock backend that returns various JSON responses
   httpMock = createHTTPMock(MOCK_PORTS.HTTP);
   httpMock.setDefault((req) => {
@@ -65,6 +62,25 @@ beforeAll(async () => {
     if (url.pathname === "/invalid-json") {
       return new Response('{"data":', {
         headers: { "Content-Type": "application/json" }
+      });
+    }
+
+    if (url.pathname.startsWith("/sized/")) {
+      const size = Number(url.pathname.split("/").pop());
+      return new Response(`{"data":"${"x".repeat(size - 11)}"}`, {
+        headers: { "Content-Type": "application/json", "Content-Length": String(size) }
+      });
+    }
+
+    if (url.pathname === "/json-lookalike") {
+      return new Response('{"data":{"leaked":true}}', {
+        headers: { "Content-Type": "application/jsonp" }
+      });
+    }
+
+    if (url.pathname === "/json-case") {
+      return new Response('{"data":{"case":"ok"}}', {
+        headers: { "Content-Type": "Application/JSON ; charset=utf-8" }
       });
     }
 
@@ -160,4 +176,29 @@ describe("transform_response directive", () => {
     const text = await res.text();
     expect(text).toBe('{"data":');
   });
+
+  test("transforms a response exactly at the configured buffer limit", async () => {
+    const res = await fetch(`${TEST_URL}/limit-exact`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toBe("x".repeat(117));
+  });
+
+  test("rejects a known response one byte above the configured buffer limit", async () => {
+    const res = await fetch(`${TEST_URL}/limit-over`);
+    expect(res.status).toBe(502);
+    expect(await res.text()).toBe("");
+  });
+
+  test("does not transform JSON-like media types", async () => {
+    const res = await fetch(`${TEST_URL}/json-lookalike`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ data: { leaked: true } });
+  });
+
+  test("matches the JSON media type case-insensitively", async () => {
+    const res = await fetch(`${TEST_URL}/json-case`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ case: "ok" });
+  });
+
 });

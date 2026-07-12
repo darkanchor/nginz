@@ -504,3 +504,7 @@ Comparison against the [GetPageSpeed nftset-access module](https://nginx-extras.
 - [x] `nftset_ratelimit` now uses a shared-memory zone for cross-worker fixed-window accounting.
 - [x] The lookup cache now keeps per-worker L1 hits while adding a shared-memory L2 plus generation-based invalidation for definitive auto-add / auto-ban writes.
 - [x] `GETSETELEM` `ENOENT` is now conservatively disambiguated with a `GETSET` slow-path probe so missing sets become lookup errors while confirmed existing-set misses still return `not_in_set`.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: PASS WITH S1 AVAILABILITY HARDENING.** Both shared zones are refreshed per cycle and shared mutations are locked; the L1/L2 generation design and fixed-window scope are coherent. The principal risk is synchronous Netlink `send/recv` in the HTTP access path: repeated cache misses or kernel delay block a worker until the socket timeout. Treat this as an availability boundary—use a very small configurable budget or asynchronous lookup, publish timeout/error/cache-saturation metrics, and test sequence wrap, multipart Netlink replies, truncated messages, reload, and high-cardinality eviction. Keep fail-open/fail-closed choice explicit per policy.

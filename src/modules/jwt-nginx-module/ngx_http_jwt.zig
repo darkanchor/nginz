@@ -180,6 +180,7 @@ const jwt_loc_conf = extern struct {
     // Toggles
     validate_exp: ngx_flag_t,
     validate_sig: ngx_flag_t,
+    strict_kid: ngx_flag_t,
     leeway: ngx_int_t,
     phase: ngx_uint_t,
 };
@@ -407,6 +408,10 @@ fn verify_jwt_with_key(
     signature: []const u8,
     key: *const JwtKey,
 ) bool {
+    // A key's declared algorithm is part of its trust policy.  Key type alone
+    // is insufficient: the same RSA key can otherwise validate RS256, RS384,
+    // RS512, and PSS tokens regardless of the configured/JWKS `alg` value.
+    if (key.alg != alg) return false;
     if (sig_info.is_rsa != (key.pkey != null)) return false;
 
     if (sig_info.is_rsa) {
@@ -518,22 +523,41 @@ fn load_keys_keyval(data: []u8, pool: [*c]core.ngx_pool_t, keys: *[MAX_KEYS]JwtK
         if (val_node.*.string == null) continue;
         const kid = ngx_str_t{ .data = val_node.*.string, .len = ngx.string.strlen(val_node.*.string) };
 
-        // Get value as string
-        const val_str = CJSON.stringValue(val_node) orelse continue;
+        // Legacy keyval entries are strings and default to HS256/RS256.  An
+        // object entry can bind the material to an explicit algorithm:
+        //   "kid": { "key": "...", "alg": "RS384" }
+        var val_str: ngx_str_t = undefined;
+        var declared_alg: ?Algorithm = null;
+        if (CJSON.stringValue(val_node)) |s| {
+            val_str = s;
+        } else {
+            const key_node = CJSON.query(val_node, "$.key") orelse continue;
+            val_str = CJSON.stringValue(key_node) orelse continue;
+            const alg_node = CJSON.query(val_node, "$.alg") orelse continue;
+            const alg_str = CJSON.stringValue(alg_node) orelse continue;
+            declared_alg = algo_from_str(core.slicify(u8, alg_str.data, alg_str.len)) orelse continue;
+        }
         const val_slice = core.slicify(u8, val_str.data, val_str.len);
 
         if (std.mem.startsWith(u8, val_slice, "-----BEGIN")) {
             const pkey = load_pubkey_from_pem(val_slice) orelse continue;
+            const alg = declared_alg orelse .RS256;
+            if (!algo_info(alg).is_rsa) {
+                EVP_PKEY_free(pkey);
+                continue;
+            }
             keys[count.*] = JwtKey{
                 .kid = kid,
-                .alg = .RS256,
+                .alg = alg,
                 .pkey = pkey,
                 .secret = ngx.string.ngx_null_str,
             };
         } else {
+            const alg = declared_alg orelse .HS256;
+            if (algo_info(alg).is_rsa) continue;
             keys[count.*] = JwtKey{
                 .kid = kid,
-                .alg = .HS256,
+                .alg = alg,
                 .pkey = null,
                 .secret = val_str,
             };
@@ -576,11 +600,12 @@ fn load_keys_jwks(data: []u8, pool: [*c]core.ngx_pool_t, keys: *[MAX_KEYS]JwtKey
         var alg: Algorithm = if (std.mem.eql(u8, kty_slice, "RSA")) .RS256 else .HS256;
         if (CJSON.query(entry, "$.alg")) |alg_node| {
             if (CJSON.stringValue(alg_node)) |a| {
-                alg = algo_from_str(core.slicify(u8, a.data, a.len)) orelse .HS256;
+                alg = algo_from_str(core.slicify(u8, a.data, a.len)) orelse continue;
             }
         }
 
         if (std.mem.eql(u8, kty_slice, "oct")) {
+            if (algo_info(alg).is_rsa) continue;
             // HMAC key: extract "k" field (base64url-encoded secret)
             if (CJSON.query(entry, "$.k")) |k_node| {
                 if (CJSON.stringValue(k_node)) |k_val| {
@@ -602,6 +627,7 @@ fn load_keys_jwks(data: []u8, pool: [*c]core.ngx_pool_t, keys: *[MAX_KEYS]JwtKey
                 }
             }
         } else if (std.mem.eql(u8, kty_slice, "RSA")) {
+            if (!algo_info(alg).is_rsa) continue;
             const n_node = CJSON.query(entry, "$.n") orelse continue;
             const e_node = CJSON.query(entry, "$.e") orelse continue;
             const n_val = CJSON.stringValue(n_node) orelse continue;
@@ -698,12 +724,18 @@ fn validate_jwt_signature(token: []const u8, lccf: [*c]jwt_loc_conf, rctx: ?*jwt
             if (try_verify_key_slice(rx.request_keys[0..rx.request_keys_count], kid, true, alg, sig_info, header_payload, signature_slice)) return true;
         }
 
-        if (try_verify_key_slice(lccf.*.keys[0..lccf.*.keys_count], kid, false, alg, sig_info, header_payload, signature_slice)) return true;
-        if (rctx) |rx| {
-            if (try_verify_key_slice(rx.request_keys[0..rx.request_keys_count], kid, false, alg, sig_info, header_payload, signature_slice)) return true;
+        if (lccf.*.strict_kid == 0) {
+            if (try_verify_key_slice(lccf.*.keys[0..lccf.*.keys_count], kid, false, alg, sig_info, header_payload, signature_slice)) return true;
+            if (rctx) |rx| {
+                if (try_verify_key_slice(rx.request_keys[0..rx.request_keys_count], kid, false, alg, sig_info, header_payload, signature_slice)) return true;
+            }
         }
         return false;
     }
+
+    // Without a kid, selecting among multiple keys is ambiguous.  Keep the
+    // one-key case ergonomic while making multi-key configurations fail shut.
+    if (lccf.*.strict_kid != 0 and total_keys != 1) return false;
 
     if (try_verify_key_slice(lccf.*.keys[0..lccf.*.keys_count], null, false, alg, sig_info, header_payload, signature_slice)) return true;
     if (rctx) |rx| {
@@ -1107,6 +1139,7 @@ fn create_jwt_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.require_var_count = 0;
         p.*.validate_exp = conf.NGX_CONF_UNSET;
         p.*.validate_sig = conf.NGX_CONF_UNSET;
+        p.*.strict_kid = conf.NGX_CONF_UNSET;
         p.*.leeway = conf.NGX_CONF_UNSET;
         p.*.phase = conf.NGX_CONF_UNSET_UINT;
         p.*.revoked_subs_count = 0;
@@ -1137,6 +1170,9 @@ fn merge_jwt_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
     if (ch.key_format == 1 and p.key_format != 1) ch.key_format = p.key_format;
     if (ch.validate_exp == conf.NGX_CONF_UNSET) ch.validate_exp = p.validate_exp;
     if (ch.validate_sig == conf.NGX_CONF_UNSET) ch.validate_sig = p.validate_sig;
+    if (ch.strict_kid == conf.NGX_CONF_UNSET) {
+        ch.strict_kid = if (p.strict_kid == conf.NGX_CONF_UNSET) 1 else p.strict_kid;
+    }
     if (ch.leeway == conf.NGX_CONF_UNSET) ch.leeway = p.leeway;
     if (ch.token_var.len == 0) ch.token_var = p.token_var;
     if (ch.token_var_index == conf.NGX_CONF_UNSET_UINT) ch.token_var_index = p.token_var_index;
@@ -2083,6 +2119,14 @@ export const ngx_http_jwt_commands = [_]ngx_command_t{
         .set = ngx_conf_set_jwt_validate_sig,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("jwt_strict_kid"),
+        .type = conf.NGX_HTTP_MAIN_CONF | conf.NGX_HTTP_SRV_CONF | conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_FLAG,
+        .set = conf.ngx_conf_set_flag_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(jwt_loc_conf, "strict_kid"),
         .post = null,
     },
     ngx_command_t{

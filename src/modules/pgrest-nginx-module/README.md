@@ -1562,3 +1562,7 @@ For each workload, record at least:
 ### Current conclusion
 
 The current pgrest module already has the right broad shape for strong simple-query performance: direct nginx integration, non-blocking pooled PostgreSQL access, and no heavyweight application runtime in the middle. The clearest obstacles to beating PostgREST on common general queries are the current eager-buffered response path, per-cell JSON formatting cost, and the small pool/concurrency envelope. If those three areas improve materially, pgrest has a credible path to outperform PostgREST on the narrow but important class of small-to-medium JSON table reads.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S0 BACKEND ISOLATION FIXED; S1 CAPACITY/HARDENING OPEN.** The process singleton is replaced by a per-worker bounded registry keyed by connection string and pool size. Each libpq connection records its owning pool, so event callbacks, error cleanup, and idle reuse cannot return it to another backend. A focused integration regression keeps live primary and secondary pools active in alternating request order, and the existing 121-case mock suite remains green. Registry saturation telemetry/configuration, graceful explicit pool teardown, SQL/JSON builder fuzzing, and complete scalar-parameterization proof remain robustness work before response-buffer/serialization optimization.

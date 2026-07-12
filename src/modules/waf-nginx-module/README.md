@@ -435,5 +435,10 @@ The next reputation-model step remains intentionally deferred. A first attempt a
 - [x] Shared-memory reputation now also supports score-based banning via `waf_score_threshold` and `waf_score_decay_window`, with Bun coverage for thresholding and quiet-period decay.
 - [x] Variable integration coverage now verifies `$waf_result`, `$waf_rule_id`, `$waf_score`, and `$waf_category` across allowed, detect-mode, rule-match, and score-enabled requests.
 - [x] Body-phase blocking now preserves clean request lifecycle behavior for blocked form, nested JSON, multipart, and libinjection-backed body matches instead of leaking preread body bytes into later request parsing.
+- [x] Body-phase denials now use a protocol-signaled connection close without forcing nginx lingering-close resets; Bun coverage isolates denial probes from its global keepalive pool and verifies the next request remains serviceable.
 - [x] Static IP allow/deny remains intentionally delegated to nginx's built-in access controls rather than being reimplemented in the WAF module.
 - [x] No additional documentation gaps were identified in this audit pass.
+
+### Engineering Audit Verdict (2026-07-12)
+
+**Verdict: S1 POLICY ISOLATION FIXED; CAPACITY PROOF OPEN.** Shared reputation entries are keyed by client IP and a stable hash of the effective location policy/rule source, so locations with different thresholds, windows, score policies, or rule files cannot reinterpret each other's state. The suite proves cross-location isolation. Saturation/eviction observability, bounded body/parser work, reload tests, and multi-worker stress proof remain open.
