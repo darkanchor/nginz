@@ -94,6 +94,8 @@ bun perf/pgrest/benchmark/run.js --profile=perf-stat --scenario=small-page --ser
 
 Default profiling mode is `snapshot`. When `perf` is installed and the user asks for `--profile=perf-stat`, the runner adds system-counter capture without requiring module instrumentation.
 
+The PostgreSQL container defaults to `pg18`; set `PGREST_BENCH_PG_CONTAINER` to reuse an already-running compatible container without renaming or disrupting it.
+
 Results are written to `perf/pgrest/benchmark/output/`.
 
 The runner now isolates each invocation with:

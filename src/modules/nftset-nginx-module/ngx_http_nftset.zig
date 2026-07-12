@@ -845,21 +845,15 @@ fn cacheStore(key: []const u8, membership: CacheMembership, now: ngx_msec_t, ttl
     slot.expires_at = now + ttl;
 }
 
-fn sharedCacheLookup(key: []const u8, now: ngx_msec_t) CacheLookup {
-    const shpool = getLookupCacheShpool() orelse return .miss;
-    const store = getLookupCacheStore() orelse return .miss;
-    const cache_store: *nftset_lookup_cache_store = @ptrCast(store);
+fn sharedCacheLookupLocked(cache_store: *nftset_lookup_cache_store, key: []const u8, now: ngx_msec_t) CacheLookup {
     const key_hash = buildCacheKeyHash(key);
-
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
-    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
-
-    for (&cache_store.entries) |*entry| {
+    const start: usize = @intCast(key_hash % NFTSET_SHARED_CACHE_SIZE);
+    for (0..NFTSET_SHARED_CACHE_SIZE) |offset| {
+        const entry = &cache_store.entries[(start + offset) % NFTSET_SHARED_CACHE_SIZE];
         if (entry.key_hash == 0) continue;
-        if (entry.expires_at < now) {
-            entry.* = std.mem.zeroes(SharedCacheEntry);
-            continue;
-        }
+        // Read lookups do not reclaim expired slots. Reclamation belongs to
+        // the store path, keeping cache misses read-light under the mutex.
+        if (entry.expires_at < now) continue;
         if (entry.key_hash != key_hash or entry.key_len != key.len) continue;
         if (!std.mem.eql(u8, entry.key[0..entry.key_len], key)) continue;
         entry.last_used_at = now;
@@ -869,14 +863,26 @@ fn sharedCacheLookup(key: []const u8, now: ngx_msec_t) CacheLookup {
     return .miss;
 }
 
+fn sharedCacheLookup(key: []const u8, now: ngx_msec_t) CacheLookup {
+    const shpool = getLookupCacheShpool() orelse return .miss;
+    const store = getLookupCacheStore() orelse return .miss;
+    const cache_store: *nftset_lookup_cache_store = @ptrCast(store);
+
+    shm.ngx_shmtx_lock(&shpool.*.mutex);
+    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    return sharedCacheLookupLocked(cache_store, key, now);
+}
+
 fn sharedCacheStoreLocked(store: *nftset_lookup_cache_store, key: []const u8, membership: CacheMembership, now: ngx_msec_t, ttl: ngx_msec_t) void {
     if (ttl == 0 or key.len == 0) return;
 
     const key_hash = buildCacheKeyHash(key);
+    const start: usize = @intCast(key_hash % NFTSET_SHARED_CACHE_SIZE);
     var target: ?*SharedCacheEntry = null;
     var oldest: ?*SharedCacheEntry = null;
 
-    for (&store.entries) |*entry| {
+    for (0..NFTSET_SHARED_CACHE_SIZE) |offset| {
+        const entry = &store.entries[(start + offset) % NFTSET_SHARED_CACHE_SIZE];
         if (entry.key_hash == 0) {
             target = entry;
             break;
@@ -2463,6 +2469,33 @@ test "cacheStore and cacheLookup roundtrip membership" {
     switch (cacheLookup(key, 151)) {
         .hit => return error.TestUnexpectedResult,
         .miss => {},
+    }
+}
+
+test "shared cache hash probing preserves colliding identities" {
+    var store = std.mem.zeroes(nftset_lookup_cache_store);
+    const first = "collision-a";
+    var second_buf: [32]u8 = undefined;
+    var second: []const u8 = undefined;
+    const bucket = buildCacheKeyHash(first) % NFTSET_SHARED_CACHE_SIZE;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const candidate = try std.fmt.bufPrint(&second_buf, "collision-{d}", .{i});
+        if (!std.mem.eql(u8, candidate, first) and buildCacheKeyHash(candidate) % NFTSET_SHARED_CACHE_SIZE == bucket) {
+            second = candidate;
+            break;
+        }
+    }
+
+    sharedCacheStoreLocked(&store, first, .in_set, 100, 1000);
+    sharedCacheStoreLocked(&store, second, .not_in_set, 100, 1000);
+    switch (sharedCacheLookupLocked(&store, first, 200)) {
+        .hit => |membership| try expectEqual(CacheMembership.in_set, membership),
+        .miss => return error.TestUnexpectedResult,
+    }
+    switch (sharedCacheLookupLocked(&store, second, 200)) {
+        .hit => |membership| try expectEqual(CacheMembership.not_in_set, membership),
+        .miss => return error.TestUnexpectedResult,
     }
 }
 

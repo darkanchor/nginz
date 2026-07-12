@@ -1308,7 +1308,7 @@ Error responses:
 | Directive | Syntax | Context | Default | Description |
 |-----------|--------|---------|---------|-------------|
 | `pgrest_pass` | `pgrest_pass "conninfo"` | `location` | — | PostgreSQL connection string for the location. Registers the pgrest content handler. All `pgrest_pass` locations in a worker process share one connection pool; pointing two locations at different hosts is not supported while connections are active. |
-| `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum number of pooled connections (1–16). Inherited by nested locations. |
+| `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum number of pooled connections (1–32). Inherited by nested locations. |
 | `pgrest_timeout` | `pgrest_timeout 15s` | `location` | 15s | Connect/query socket timeout. Inherited by nested locations. The default accommodates dashboard-style analytical reads during sustained telemetry ingestion; latency-sensitive APIs can set a shorter value. |
 | `pgrest_schemas` | `pgrest_schemas "schema1, schema2"` | `location` | — | Allowlist of schemas. The first schema becomes the default. Disallowed schemas receive `PGRST106`. |
 | `pgrest_jwt_secret` | `pgrest_jwt_secret "secret"` | `location` | — | HS256 secret for JWT signature validation. When set, tokens are validated before role extraction. |
@@ -1565,4 +1565,4 @@ The current pgrest module already has the right broad shape for strong simple-qu
 
 ### Engineering Audit Verdict (2026-07-12)
 
-**Verdict: S0/S1 CORE FIXED.** The process singleton is replaced by a per-worker bounded registry keyed by connection string and pool size, with explicit worker startup/exit lifecycle. Registry overflow rejects a seventeenth backend without aliasing; a two-worker saturation/reload integration proves admitted pools remain usable and clean workers admit formerly rejected backends. libpq incrementally frames PostgreSQL traffic. Before serialization, pgrest now computes the bounded JSON size and returns a controlled 502 for results above 64 KiB rather than clamping the allocation and risking truncated or out-of-bounds JSON. The 124-case focused mock suite is green; larger streamed representations and richer telemetry are performance/features.
+**Verdict: S0/S1 CORE FIXED; S2 POOL ENVELOPE MEASURED.** Per-worker pools are isolated by backend and have explicit lifecycle/capacity behavior. pgrest serializes directly into its nginx output buffer and rejects representations above its bound. The pool remains 16 connections by default but can be configured up to 32. A ReleaseSmall small-page matrix showed that 32 removes concurrency-32 pool-exhaustion 503s (200/200 correct), while peak throughput remained at concurrency 8; larger pools are therefore an explicit deployment tuning choice, not a new default. The 124-case focused suite is green.

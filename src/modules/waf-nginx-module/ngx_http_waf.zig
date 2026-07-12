@@ -1236,12 +1236,6 @@ fn resetBanEntry(entry: *waf_ban_entry) void {
     entry.* = std.mem.zeroes(waf_ban_entry);
 }
 
-fn snapshotBanEntry(entry: *waf_ban_entry) void {
-    var snapshot_buf: [128]u8 = undefined;
-    const snapshot = std.fmt.bufPrint(&snapshot_buf, "{}:{}:{}:{}:{}:{}", .{ entry.*.count, entry.*.strikes, entry.*.score, entry.*.ban_until, entry.*.first_seen, entry.*.last_seen }) catch return;
-    std.mem.doNotOptimizeAway(snapshot);
-}
-
 fn hashPolicyBytes(hash: *u64, bytes: []const u8) void {
     for (bytes) |byte| {
         hash.* ^= byte;
@@ -1256,6 +1250,7 @@ fn policyScope(lccf: *waf_loc_conf) u64 {
     hashPolicyBytes(&hash, std.mem.asBytes(&lccf.sqli_enabled));
     hashPolicyBytes(&hash, std.mem.asBytes(&lccf.xss_enabled));
     hashPolicyBytes(&hash, std.mem.asBytes(&lccf.check_body));
+    hashPolicyBytes(&hash, std.mem.asBytes(&lccf.body_max_size));
     hashPolicyBytes(&hash, std.mem.asBytes(&lccf.ban_threshold));
     hashPolicyBytes(&hash, std.mem.asBytes(&lccf.ban_window));
     hashPolicyBytes(&hash, std.mem.asBytes(&lccf.ban_duration));
@@ -1346,9 +1341,7 @@ fn findBanEntry(store: [*c]waf_ban_store, ip: []const u8, scope: u64) ?[*c]waf_b
     return null;
 }
 
-fn getOrCreateBanEntry(store: [*c]waf_ban_store, ip: []const u8, lccf: *waf_loc_conf) ?[*c]waf_ban_entry {
-    const now = nowSeconds();
-    const scope = policyScope(lccf);
+fn getOrCreateBanEntry(store: [*c]waf_ban_store, ip: []const u8, lccf: *waf_loc_conf, scope: u64, now: ngx_uint_t) ?[*c]waf_ban_entry {
     if (findBanEntry(store, ip, scope)) |entry| {
         decayBanEntry(entry, now, lccf);
         return entry;
@@ -1365,11 +1358,11 @@ fn getOrCreateBanEntry(store: [*c]waf_ban_store, ip: []const u8, lccf: *waf_loc_
     for (0..store.*.entries_count) |i| {
         const entry: [*c]waf_ban_entry = store.*.entries + i;
         const entry_ref: *waf_ban_entry = @ptrCast(@alignCast(entry));
-        decayBanEntry(entry_ref, now, lccf);
-        // Reclaim only an inactive entry. Never evict a live count, score, or
-        // ban under pressure: doing so would let a new identity erase an
-        // existing client's protection state.
-        if (entry[0].ban_until == 0 and entry[0].count == 0 and entry[0].score == 0) {
+        // Entries may belong to a different policy scope. Applying the
+        // current location's decay windows to them would mutate another
+        // policy's state. Reclaim only an already-quiescent entry; its own
+        // scope will perform policy-aware decay when that identity is seen.
+        if (entry[0].ban_until == 0 and entry[0].count == 0 and entry[0].score == 0 and entry[0].strikes == 0) {
             assignBanEntry(entry_ref, ip, scope);
             store.*.reclaimed_entries += 1;
             return entry;
@@ -1391,16 +1384,16 @@ fn isClientBanned(r: [*c]ngx_http_request_t, lccf: *waf_loc_conf) bool {
     else
         null;
     if (shpool == null) return false;
+    const scope = policyScope(lccf);
+    const now = nowSeconds();
 
     shm.ngx_shmtx_lock(&shpool.?.*.mutex);
     defer shm.ngx_shmtx_unlock(&shpool.?.*.mutex);
 
     const store = if (getBanStoreFromZone(zone)) |existing| existing else ensureBanStore(zone, shpool.?) orelse return false;
 
-    if (findBanEntry(store, ip, policyScope(lccf))) |entry| {
-        const now = nowSeconds();
+    if (findBanEntry(store, ip, scope)) |entry| {
         decayBanEntry(entry, now, lccf);
-        snapshotBanEntry(entry);
         if (entry.*.ban_until > now) return true;
     }
     return false;
@@ -1418,14 +1411,14 @@ fn recordOffense(r: [*c]ngx_http_request_t, lccf: *waf_loc_conf, score_weight: u
         null;
 
     if (shpool == null) return;
+    const scope = policyScope(lccf);
+    const now = nowSeconds();
     shm.ngx_shmtx_lock(&shpool.?.*.mutex);
     defer shm.ngx_shmtx_unlock(&shpool.?.*.mutex);
 
     const store = if (getBanStoreFromZone(zone)) |existing| existing else ensureBanStore(zone, shpool.?) orelse return;
-    const entry = getOrCreateBanEntry(store, ip, lccf) orelse return;
-    const now = nowSeconds();
+    const entry = getOrCreateBanEntry(store, ip, lccf, scope, now) orelse return;
     applyOffenseToEntry(entry, now, lccf, @max(@as(u16, 1), score_weight));
-    snapshotBanEntry(entry);
 }
 
 fn ngx_http_waf_ban_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) callconv(.c) ngx_int_t {
@@ -2189,7 +2182,15 @@ export fn ngx_http_waf_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void
     while (chain != null) : (chain = chain.*.next) {
         if (chain.*.buf != null) {
             const b = chain.*.buf;
-            body_len += @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
+            const chunk_len = @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
+            // Enforce the cap while measuring. Checking only after allocating
+            // the aggregate lets chunked requests force an unbounded pool
+            // allocation before receiving the intended 413.
+            if (chunk_len > lccf.*.body_max_size -| body_len) {
+                http.ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+                return;
+            }
+            body_len += chunk_len;
         }
     }
 
@@ -2227,11 +2228,7 @@ export fn ngx_http_waf_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void
 
     const body = core.slicify(u8, body_ptr, body_len);
 
-    // Allocate buffers for analysis (limit to reasonable size)
-    if (body_len > lccf.*.body_max_size) {
-        http.ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
-        return;
-    }
+    // Allocate buffers for analysis after the bounded measurement pass.
     const analyze_len = body_len;
 
     const decode_buf_mem = core.ngx_pnalloc(r.*.pool, analyze_len * 2) orelse {

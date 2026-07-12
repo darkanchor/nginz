@@ -776,13 +776,11 @@ fn ngx_http_redis_upstream_process_header(
                         return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
                     }
 
-                    // Copy data to request pool
-                    if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, needed))) |data_copy| {
-                        @memcpy(core.slicify(u8, data_copy, needed), received[data_start_idx..][0..needed]);
-                        rctx.*.data = ngx_str_t{ .data = data_copy, .len = needed };
-                    } else {
-                        return NGX_ERROR;
-                    }
+                    // The bounded upstream buffer belongs to this request and
+                    // is not reused after u.length becomes zero. Render JSON
+                    // directly from it instead of copying the RESP payload to
+                    // a second request-pool allocation first.
+                    rctx.*.data = ngx_str_t{ .data = b.*.pos + data_start_idx, .len = needed };
 
                     rctx.*.data_len = @intCast(needed);
                     rctx.*.state = .done;
@@ -866,12 +864,7 @@ fn ngx_http_redis_upstream_process_header(
                     rctx.*.state = .resp_error;
                     return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
                 };
-                if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, int_len))) |data_copy| {
-                    @memcpy(core.slicify(u8, data_copy, int_len), int_text);
-                    rctx.*.data = ngx_str_t{ .data = data_copy, .len = int_len };
-                } else {
-                    return NGX_ERROR;
-                }
+                rctx.*.data = ngx_str_t{ .data = b.*.pos + 1, .len = int_len };
 
                 rctx.*.data_len = @intCast(int_len);
                 rctx.*.state = .done;
@@ -932,14 +925,8 @@ fn ngx_http_redis_upstream_process_header(
                                 return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
                             }
 
-                            // Copy value
-                            if (core.castPtr(u8, core.ngx_pnalloc(r.*.pool, elem_len))) |val_copy| {
-                                @memcpy(core.slicify(u8, val_copy, elem_len), received[pos..][0..elem_len]);
-                                values[idx][0] = ngx_str_t{ .data = @constCast("1"), .len = 1 }; // present marker
-                                values[idx][1] = ngx_str_t{ .data = val_copy, .len = elem_len };
-                            } else {
-                                return NGX_ERROR;
-                            }
+                            values[idx][0] = ngx_str_t{ .data = @constCast("1"), .len = 1 }; // present marker
+                            values[idx][1] = ngx_str_t{ .data = b.*.pos + pos, .len = elem_len };
                             pos += elem_len + 2;
                         }
                     } else {

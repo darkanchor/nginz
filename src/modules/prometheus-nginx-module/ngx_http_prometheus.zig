@@ -70,21 +70,31 @@ fn getMetricsStore() ?[*c]prometheus_metrics_store {
     return core.castPtr(prometheus_metrics_store, ngx_http_prometheus_zone.*.data);
 }
 
-fn getMetricsShpool() ?[*c]core.ngx_slab_pool_t {
-    const zone = ngx_http_prometheus_zone;
-    if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.shm.addr == null or zone.*.data == null) {
-        return null;
-    }
-    return core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr);
+fn loadCounter(counter: *const u64) u64 {
+    return @atomicLoad(u64, counter, .monotonic);
+}
+
+fn incrementCounter(counter: *u64, amount: u64) void {
+    _ = @atomicRmw(u64, counter, .Add, amount, .monotonic);
 }
 
 fn snapshotMetrics() ?prometheus_metrics_store {
     const store = getMetricsStore() orelse return null;
-    const shpool = getMetricsShpool() orelse return null;
-
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
-    const snapshot = store.*;
-    shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    var snapshot = std.mem.zeroes(prometheus_metrics_store);
+    snapshot.initialized = store.*.initialized;
+    snapshot.requests_total = loadCounter(&store.*.requests_total);
+    snapshot.requests_1xx = loadCounter(&store.*.requests_1xx);
+    snapshot.requests_2xx = loadCounter(&store.*.requests_2xx);
+    snapshot.requests_3xx = loadCounter(&store.*.requests_3xx);
+    snapshot.requests_4xx = loadCounter(&store.*.requests_4xx);
+    snapshot.requests_5xx = loadCounter(&store.*.requests_5xx);
+    const shared_buckets: *[HISTOGRAM_BUCKETS.len]u64 = @ptrCast(&store.*.histogram_buckets);
+    for (&snapshot.histogram_buckets, 0..) |*bucket, i| {
+        bucket.* = loadCounter(&shared_buckets[i]);
+    }
+    snapshot.histogram_inf = loadCounter(&store.*.histogram_inf);
+    snapshot.histogram_sum = loadCounter(&store.*.histogram_sum);
+    snapshot.histogram_count = loadCounter(&store.*.histogram_count);
     return snapshot;
 }
 
@@ -282,12 +292,7 @@ export fn ngx_http_prometheus_handler(
         }
     }.f;
 
-    const store = getMetricsStore() orelse return NGX_ERROR;
-    const shpool = getMetricsShpool() orelse return NGX_ERROR;
-
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
-    const snapshot = store.*;
-    shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    const snapshot = snapshotMetrics() orelse return NGX_ERROR;
 
     // nginx_up gauge
     appendStr(buf_ptr, &pos, "# HELP nginx_up Whether nginx is up\n");
@@ -404,26 +409,22 @@ fn ngx_http_prometheus_log_handler(
     }
 
     const store = getMetricsStore() orelse return NGX_OK;
-    const shpool = getMetricsShpool() orelse return NGX_OK;
-
-    shm.ngx_shmtx_lock(&shpool.*.mutex);
-    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
 
     // Increment total counter
-    store.*.requests_total += 1;
+    incrementCounter(&store.*.requests_total, 1);
 
     // Increment status-specific counter
     const status = r.*.headers_out.status;
     if (status >= 100 and status < 200) {
-        store.*.requests_1xx += 1;
+        incrementCounter(&store.*.requests_1xx, 1);
     } else if (status >= 200 and status < 300) {
-        store.*.requests_2xx += 1;
+        incrementCounter(&store.*.requests_2xx, 1);
     } else if (status >= 300 and status < 400) {
-        store.*.requests_3xx += 1;
+        incrementCounter(&store.*.requests_3xx, 1);
     } else if (status >= 400 and status < 500) {
-        store.*.requests_4xx += 1;
+        incrementCounter(&store.*.requests_4xx, 1);
     } else if (status >= 500 and status < 600) {
-        store.*.requests_5xx += 1;
+        incrementCounter(&store.*.requests_5xx, 1);
     }
 
     // Calculate request duration in milliseconds
@@ -432,16 +433,17 @@ fn ngx_http_prometheus_log_handler(
     const duration_ms: u64 = if (current_ms >= start_time_ms) current_ms - start_time_ms else 0;
 
     // Update histogram buckets (cumulative)
-    for (&store[0].histogram_buckets, 0..) |*bucket, i| {
+    const shared_buckets: *[HISTOGRAM_BUCKETS.len]u64 = @ptrCast(&store.*.histogram_buckets);
+    for (0..HISTOGRAM_BUCKETS.len) |i| {
         if (duration_ms <= HISTOGRAM_BUCKETS[i]) {
-            bucket.* += 1;
+            incrementCounter(&shared_buckets[i], 1);
         }
     }
 
     // Update +Inf bucket, sum, and count
-    store.*.histogram_inf += 1;
-    store.*.histogram_sum += duration_ms;
-    store.*.histogram_count += 1;
+    incrementCounter(&store.*.histogram_inf, 1);
+    incrementCounter(&store.*.histogram_sum, duration_ms);
+    incrementCounter(&store.*.histogram_count, 1);
 
     return NGX_OK;
 }

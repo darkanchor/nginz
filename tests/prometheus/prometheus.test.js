@@ -238,7 +238,7 @@ describe("prometheus module", () => {
       const afterMatch = afterBody.match(/nginx_http_requests_total (\d+)/);
       const newCount = parseInt(afterMatch[1]);
 
-      expect(newCount).toBeGreaterThanOrEqual(initialCount + requestCount);
+      expect(newCount).toBe(initialCount + requestCount);
     });
   });
 

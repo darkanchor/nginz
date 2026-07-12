@@ -399,11 +399,9 @@ All slab allocations for a new snapshot (Snapshot struct, peers struct, N × pee
 
 **Better**: allocate outside the lock using a pool-backed staging area or per-call `ngx_slab_calloc`, then hold the mutex only for the pointer swap. Deferred to Phase 3 hardening.
 
-### 2. Slab mutex on every proxied request (`du_get_active_peers`)
+### 2. Request-path snapshot pinning
 
-`du_get_active_peers` is called on every upstream connection to pin the active snapshot. It acquires and releases `shpool->mutex` to safely read `store->active` and increment the refcount atomically. At high request rates this becomes contention on a single shared lock.
-
-**Better**: a dedicated per-store spinlock or an atomic compare-and-swap loop for the refcount increment, leaving the slab mutex for allocations only. Deferred to Phase 3 hardening.
+Fixed: request-path snapshot pinning no longer acquires the slab mutex. A short reader guard, atomic active-pointer load, and atomic snapshot refcount increment protect activation/reaping races; the slab mutex remains limited to activation and reclamation.
 
 ### 3. Blocking consul HTTP in the event loop
 

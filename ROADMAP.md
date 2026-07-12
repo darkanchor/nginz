@@ -448,7 +448,7 @@ This ordering is deliberate: **robustness first, performance second, feature gap
 | `canary` | S1 fixed | checked entropy, strict percentage parsing, explicit zero override |
 | `requestid` | S1 fixed | checked entropy and bounded visible-ASCII propagated IDs |
 | `transform` | S1 buffering fixed | known-length 1 MiB default bound, consumed memory/file buffers, exact JSON media type; streaming remains deferred |
-| `prometheus` | pass, then S2 | reload-safe shared zone; per-request global mutex contention |
+| `prometheus` | S2 contention fixed | reload-safe shared zone; mutex-free atomic log-path counters with documented snapshot semantics |
 | `circuit-breaker` | S0/S1 core fixed | saturation fails closed without aliasing; single-probe recovery/reload proof; admission and store-pressure telemetry |
 | `cache-tags` | S1 capacity/reload fixed | bounded rejection counters, full-table listing, and saturated-store graceful-reload proof |
 | `ratelimit` | S1 capacity/reload fixed | live windows never evicted; saturation/reclaim counters and two-worker reload proof; collision identity remains |
@@ -554,6 +554,13 @@ Only after the robustness suite passes:
 - benchmark dynamic peer selection under generation churn and verify reclamation counters alongside latency.
 
 Performance acceptance must include correctness counters (drops, evictions, active/retired generations, pool ownership), not throughput alone.
+
+S2 progress:
+
+- [x] Replace Prometheus request-path mutex serialization with atomic counters and exact multi-worker update proof.
+- [x] Reduce WAF and nftset shared-lock hold times without weakening compound invariants; add hash-started collision-safe nftset probing.
+- [x] Remove Redis's avoidable pre-render payload copies; pgrest already renders directly to its nginx output buffer, while transform/Consul representation changes remain semantic copies.
+- [x] Benchmark pgrest's pool envelope and dynamic peer selection under churn with correctness gates; retain conservative defaults where higher concurrency only increases tail latency.
 
 ### S3 feature decisions
 

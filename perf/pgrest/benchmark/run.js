@@ -11,7 +11,7 @@ import { SCENARIOS, getScenario } from "./scenarios.js";
 import { validateScenarioPair } from "./validate.js";
 
 const MODULE = "pgrest";
-const PG_CONTAINER = "pg18";
+const PG_CONTAINER = process.env.PGREST_BENCH_PG_CONTAINER || "pg18";
 const PG_USER = "nginz_test";
 const PG_PASSWORD = "nginz_test_pass";
 const PERF_DIR = join(process.cwd(), "perf", "pgrest");
@@ -61,7 +61,7 @@ function buildPostgrestAdminBaseUrl() {
 
 function buildNginzConfig() {
   const configPath = join(activeArtifacts.runtimeDir, "nginx.conf");
-  const config = `daemon off;\nerror_log logs/error.log notice;\npid logs/nginx.pid;\n\nevents {\n    worker_connections 256;\n}\n\nhttp {\n    access_log logs/access.log;\n\n    server {\n        listen ${activeRuntime.nginzPort};\n\n        location /api/ {\n            pgrest_pass \"host=127.0.0.1 port=5432 dbname=${activeRuntime.database} user=${PG_USER} password=${PG_PASSWORD}\";\n            pgrest_schemas \"public\";\n            pgrest_pool_size 16;\n        }\n    }\n}\n`;
+  const config = `daemon off;\nerror_log logs/error.log notice;\npid logs/nginx.pid;\n\nevents {\n    worker_connections 256;\n}\n\nhttp {\n    access_log logs/access.log;\n\n    server {\n        listen ${activeRuntime.nginzPort};\n\n        location /api/ {\n            pgrest_pass \"host=127.0.0.1 port=5432 dbname=${activeRuntime.database} user=${PG_USER} password=${PG_PASSWORD}\";\n            pgrest_schemas \"public\";\n            pgrest_pool_size 32;\n        }\n    }\n}\n`;
   writeFileSync(configPath, config);
   return configPath;
 }

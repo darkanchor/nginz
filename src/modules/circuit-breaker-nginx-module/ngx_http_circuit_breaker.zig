@@ -257,6 +257,7 @@ fn recordFailure(stats: *SharedCircuitStats, failure_threshold: ngx_uint_t) void
 // Request context to track if we should record the response
 const circuit_breaker_ctx = extern struct {
     should_track: ngx_flag_t,
+    is_half_open_probe: ngx_flag_t,
     admission: ngx_str_t,
 };
 
@@ -264,13 +265,6 @@ const admission_allow = ngx_string("allow");
 const admission_open = ngx_string("open");
 const admission_half_open_busy = ngx_string("half_open_busy");
 const admission_capacity = ngx_string("capacity");
-
-fn setCircuitContext(r: [*c]ngx_http_request_t, should_track: ngx_flag_t, admission: ngx_str_t) bool {
-    const ctx = http.ngz_http_get_module_ctx(circuit_breaker_ctx, r, &ngx_http_circuit_breaker_module) catch return false;
-    ctx.*.should_track = should_track;
-    ctx.*.admission = admission;
-    return true;
-}
 
 // Access phase handler - check circuit state
 fn ngx_http_circuit_breaker_access_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
@@ -283,8 +277,13 @@ fn ngx_http_circuit_breaker_access_handler(r: [*c]ngx_http_request_t) callconv(.
         return NGX_DECLINED;
     }
 
+    // Allocate request-local state before reserving a shared half-open slot.
+    // Otherwise an allocation failure after the reservation can leave the
+    // circuit permanently reporting a probe in flight.
+    const ctx = http.ngz_http_get_module_ctx(circuit_breaker_ctx, r, &ngx_http_circuit_breaker_module) catch return NGX_ERROR;
     const shpool = getCircuitShpool() orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
     shm.ngx_shmtx_lock(&shpool.*.mutex);
+    var is_half_open_probe: ngx_flag_t = 0;
     const admission = blk: {
         // Saturation or missing shared state must fail closed. Failing open
         // here silently removes protection precisely when its state is gone.
@@ -300,6 +299,7 @@ fn ngx_http_circuit_breaker_access_handler(r: [*c]ngx_http_request_t) callconv(.
                     break :blk admission_half_open_busy;
                 }
                 stats.*.state = CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT;
+                is_half_open_probe = 1;
                 break :blk admission_allow;
             },
             .closed => break :blk admission_allow,
@@ -310,10 +310,14 @@ fn ngx_http_circuit_breaker_access_handler(r: [*c]ngx_http_request_t) callconv(.
     // Do not render a response under the shared-memory mutex: response
     // headers can evaluate observability variables that acquire this mutex.
     if (admission.data == admission_allow.data) {
-        if (!setCircuitContext(r, 1, admission_allow)) return NGX_ERROR;
+        ctx.*.should_track = 1;
+        ctx.*.is_half_open_probe = is_half_open_probe;
+        ctx.*.admission = admission_allow;
         return NGX_DECLINED;
     }
-    _ = setCircuitContext(r, 0, admission);
+    ctx.*.should_track = 0;
+    ctx.*.is_half_open_probe = 0;
+    ctx.*.admission = admission;
     r.*.headers_out.status = http.NGX_HTTP_SERVICE_UNAVAILABLE;
     return http.NGX_HTTP_SERVICE_UNAVAILABLE;
 }
@@ -347,11 +351,14 @@ fn ngx_http_circuit_breaker_log_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     const stats = getCircuitStats(lccf) orelse return NGX_OK;
     const status = r.*.headers_out.status;
 
-    // Release the half-open probe slot before applying its result. Both
-    // recordSuccess and recordFailure then operate on the normal half-open
-    // state and choose the next durable state atomically under this mutex.
-    if (stats.*.state == CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT) {
+    // Only the request that acquired the half-open slot may settle it. A
+    // slower request admitted while the circuit was closed can finish after
+    // the transition and must not be mistaken for the recovery probe.
+    if (ctx.*.is_half_open_probe == 1) {
+        if (stats.*.state != CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT) return NGX_OK;
         stats.*.state = @intFromEnum(CircuitState.half_open);
+    } else if (circuitStateFromByte(stats.*.state) != .closed) {
+        return NGX_OK;
     }
 
     // Consider 5xx as failures, everything else as success
@@ -590,7 +597,7 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     ngx_http_circuit_breaker_zone = zone;
 
     // Register $ngz_circuit_state variable
-    var vs = [_]http.ngx_http_variable_t{http.ngx_http_variable_t{
+    var vs = [_]http.ngx_http_variable_t{ http.ngx_http_variable_t{
         .name = ngx_string("ngz_circuit_state"),
         .set_handler = null,
         .get_handler = ngx_http_circuit_state_variable,
@@ -618,7 +625,7 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         .data = CIRCUIT_METRIC_CAPACITY,
         .flags = http.NGX_HTTP_VAR_NOCACHEABLE,
         .index = 0,
-    }};
+    } };
     for (&vs) |*v| {
         if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
             x.*.get_handler = v.get_handler;
@@ -711,4 +718,19 @@ test "capacity exhaustion never aliases an existing circuit" {
     try std.testing.expect(findOrCreateCircuit(&store, "overflow-circuit") == null);
     try std.testing.expectEqual(first_before, store.entries[0].stats.failure_count);
     try std.testing.expectEqual(@as(ngx_uint_t, MAX_CIRCUITS), store.circuit_count);
+}
+
+test "an ordinary request cannot settle an in-flight half-open probe" {
+    var stats = std.mem.zeroes(SharedCircuitStats);
+    stats.state = CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT;
+    stats.success_count = 0;
+
+    // This is the state guard used by the log handler for a request admitted
+    // before the circuit transitioned out of closed.
+    if (circuitStateFromByte(stats.state) == .closed) {
+        recordSuccess(&stats, 1);
+    }
+
+    try expectEqual(CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT, stats.state);
+    try expectEqual(@as(ngx_uint_t, 0), stats.success_count);
 }

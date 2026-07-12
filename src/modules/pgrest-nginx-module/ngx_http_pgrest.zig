@@ -112,7 +112,8 @@ const ngx_pgrest_loc_conf_t = extern struct {
 // ============================================================================
 
 /// Maximum connections in the pool
-const POOL_MAX_CONNECTIONS = 16;
+const POOL_DEFAULT_CONNECTIONS = 16;
+const POOL_MAX_CONNECTIONS = 32;
 // Dashboard-style analytical reads can contend with sustained telemetry writes.
 // Fifteen seconds kept the 200 req/s monitoring workload inside the request
 // budget while remaining bounded; latency-sensitive APIs can override it.
@@ -167,7 +168,7 @@ const PgConnPool = struct {
     pub fn init(self: *PgConnPool) void {
         self.initialized = false;
         self.active_count = 0;
-        self.max_connections = POOL_MAX_CONNECTIONS;
+        self.max_connections = POOL_DEFAULT_CONNECTIONS;
         self.conninfo_len = 0;
         for (&self.connections) |*c| {
             c.conn = null;
@@ -1962,7 +1963,7 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
     const max_conn: usize = if (loc_conf.*.pool_size > 0)
         @intCast(loc_conf.*.pool_size)
     else
-        POOL_MAX_CONNECTIONS;
+        POOL_DEFAULT_CONNECTIONS;
     const conn_pool = get_or_create_pool(conninfo, max_conn) orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
 
     g_pgrest_trace_seq += 1;
@@ -9535,19 +9536,20 @@ test "backend pool registry isolates connection strings and pool limits" {
 }
 
 test "ngx_conf_set_pgrest_pool_size rejects values outside 1..POOL_MAX_CONNECTIONS" {
-    // POOL_MAX_CONNECTIONS is 16; the setter parses a string into ngx_int_t.
+    // The setter accepts the configurable maximum while keeping a lower
+    // conservative default.
     // We test the boundary check directly via the parsing helper it relies on.
     const s1 = "0";
     try expectEqual(std.fmt.parseInt(ngx_int_t, s1, 10) catch -1, 0);
     // 0 < 1 → should be rejected by the setter
 
-    const s2 = "16";
-    try expectEqual(std.fmt.parseInt(ngx_int_t, s2, 10) catch -1, 16);
-    // 16 == POOL_MAX_CONNECTIONS → accepted
+    const s2 = "32";
+    try expectEqual(std.fmt.parseInt(ngx_int_t, s2, 10) catch -1, 32);
+    // 32 == POOL_MAX_CONNECTIONS → accepted
 
-    const s3 = "17";
-    try expectEqual(std.fmt.parseInt(ngx_int_t, s3, 10) catch -1, 17);
-    // 17 > POOL_MAX_CONNECTIONS → should be rejected
+    const s3 = "33";
+    try expectEqual(std.fmt.parseInt(ngx_int_t, s3, 10) catch -1, 33);
+    // 33 > POOL_MAX_CONNECTIONS → should be rejected
 }
 
 test "build_where_clause_from_args emits $N placeholders when ctx supplied" {
