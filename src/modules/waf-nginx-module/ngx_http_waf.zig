@@ -130,6 +130,8 @@ const waf_ban_store = extern struct {
     initialized: ngx_flag_t,
     entries_count: ngx_uint_t,
     entries: [*c]waf_ban_entry,
+    capacity_rejected: u64,
+    reclaimed_entries: u64,
 };
 
 extern var ngx_http_core_module: ngx_module_t;
@@ -137,6 +139,8 @@ extern var ngx_http_core_module: ngx_module_t;
 // WAF modes
 const WAF_MODE_DETECT: ngx_uint_t = 0;
 const WAF_MODE_BLOCK: ngx_uint_t = 1;
+const DEFAULT_WAF_BODY_MAX_SIZE: usize = 8 * 1024;
+const NGX_HTTP_REQUEST_ENTITY_TOO_LARGE: ngx_int_t = 413;
 
 // WAF location configuration
 const waf_loc_conf = extern struct {
@@ -145,6 +149,7 @@ const waf_loc_conf = extern struct {
     sqli_enabled: ngx_flag_t,
     xss_enabled: ngx_flag_t,
     check_body: ngx_flag_t,
+    body_max_size: usize,
     rules_file: ngx_str_t,
     rules: [*c]waf_rule,
     rule_count: usize,
@@ -1185,6 +1190,8 @@ fn ensureBanStore(zone: [*c]core.ngx_shm_zone_t, shpool: [*c]core.ngx_slab_pool_
     store.*.initialized = 1;
     store.*.entries_count = 0;
     store.*.entries = entries;
+    store.*.capacity_rejected = 0;
+    store.*.reclaimed_entries = 0;
     shpool.*.data = store;
     zone.*.data = store;
     return store;
@@ -1300,6 +1307,17 @@ fn applyOffenseToEntry(entry: *waf_ban_entry, now: ngx_uint_t, lccf: *waf_loc_co
         entry.*.first_seen = now;
         entry.*.count = 1;
         entry.*.last_seen = now;
+        // A threshold of one means the first offense is itself sufficient.
+        // The generic count-increment branch below only runs for an existing
+        // window, so without this explicit path threshold=1 never banned.
+        if (lccf.ban_threshold <= 1) {
+            if (entry.*.strikes < WAF_BAN_MAX_STRIKES) {
+                entry.*.strikes += 1;
+            }
+            entry.*.ban_until = now + computeBanDuration(lccf, entry.*.strikes);
+            entry.*.count = 0;
+            entry.*.score = 0;
+        }
         return;
     }
 
@@ -1328,7 +1346,7 @@ fn findBanEntry(store: [*c]waf_ban_store, ip: []const u8, scope: u64) ?[*c]waf_b
     return null;
 }
 
-fn getOrCreateBanEntry(shpool: [*c]core.ngx_slab_pool_t, store: [*c]waf_ban_store, ip: []const u8, lccf: *waf_loc_conf) ?[*c]waf_ban_entry {
+fn getOrCreateBanEntry(store: [*c]waf_ban_store, ip: []const u8, lccf: *waf_loc_conf) ?[*c]waf_ban_entry {
     const now = nowSeconds();
     const scope = policyScope(lccf);
     if (findBanEntry(store, ip, scope)) |entry| {
@@ -1344,27 +1362,21 @@ fn getOrCreateBanEntry(shpool: [*c]core.ngx_slab_pool_t, store: [*c]waf_ban_stor
         return entry;
     }
 
-    var candidate: ?[*c]waf_ban_entry = null;
     for (0..store.*.entries_count) |i| {
         const entry: [*c]waf_ban_entry = store.*.entries + i;
         const entry_ref: *waf_ban_entry = @ptrCast(@alignCast(entry));
         decayBanEntry(entry_ref, now, lccf);
-        if (entry[0].ban_until == 0 and entry[0].count == 0 and entry[0].strikes == 0) {
+        // Reclaim only an inactive entry. Never evict a live count, score, or
+        // ban under pressure: doing so would let a new identity erase an
+        // existing client's protection state.
+        if (entry[0].ban_until == 0 and entry[0].count == 0 and entry[0].score == 0) {
             assignBanEntry(entry_ref, ip, scope);
+            store.*.reclaimed_entries += 1;
             return entry;
         }
-
-        if (candidate == null or entry[0].last_seen < candidate.?[0].last_seen) {
-            candidate = entry;
-        }
     }
 
-    _ = shpool;
-    if (candidate) |entry| {
-        assignBanEntry(entry, ip, scope);
-        return entry;
-    }
-
+    store.*.capacity_rejected += 1;
     return null;
 }
 
@@ -1410,7 +1422,7 @@ fn recordOffense(r: [*c]ngx_http_request_t, lccf: *waf_loc_conf, score_weight: u
     defer shm.ngx_shmtx_unlock(&shpool.?.*.mutex);
 
     const store = if (getBanStoreFromZone(zone)) |existing| existing else ensureBanStore(zone, shpool.?) orelse return;
-    const entry = getOrCreateBanEntry(shpool.?, store, ip, lccf) orelse return;
+    const entry = getOrCreateBanEntry(store, ip, lccf) orelse return;
     const now = nowSeconds();
     applyOffenseToEntry(entry, now, lccf, @max(@as(u16, 1), score_weight));
     snapshotBanEntry(entry);
@@ -1436,6 +1448,8 @@ fn ngx_http_waf_ban_zone_init(zone: [*c]core.ngx_shm_zone_t, data: ?*anyopaque) 
     store.*.initialized = 1;
     store.*.entries_count = 0;
     store.*.entries = entries;
+    store.*.capacity_rejected = 0;
+    store.*.reclaimed_entries = 0;
     shpool.*.data = store;
     zone.*.data = store;
     return NGX_OK;
@@ -2214,8 +2228,11 @@ export fn ngx_http_waf_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void
     const body = core.slicify(u8, body_ptr, body_len);
 
     // Allocate buffers for analysis (limit to reasonable size)
-    const max_analyze_len: usize = 8192;
-    const analyze_len = @min(body_len, max_analyze_len);
+    if (body_len > lccf.*.body_max_size) {
+        http.ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+        return;
+    }
+    const analyze_len = body_len;
 
     const decode_buf_mem = core.ngx_pnalloc(r.*.pool, analyze_len * 2) orelse {
         http.ngx_http_finalize_request(r, NGX_ERROR);
@@ -2464,6 +2481,9 @@ export fn ngx_http_waf_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t
             r.*.method == http.NGX_HTTP_PUT or
             r.*.method == http.NGX_HTTP_PATCH)
         {
+            if (r.*.headers_in.content_length_n > @as(core.off_t, @intCast(lccf.*.body_max_size))) {
+                return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
+            }
             rctx.*.waiting_body = 1;
             const rc = http.ngx_http_read_client_request_body(r, ngx_http_waf_body_handler);
             if (rc >= http.NGX_HTTP_SPECIAL_RESPONSE) return rc;
@@ -2483,6 +2503,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.sqli_enabled = conf.NGX_CONF_UNSET;
         p.*.xss_enabled = conf.NGX_CONF_UNSET;
         p.*.check_body = conf.NGX_CONF_UNSET;
+        p.*.body_max_size = conf.NGX_CONF_UNSET_SIZE;
         p.*.rules_file = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
         p.*.rules = core.nullptr(waf_rule);
         p.*.rule_count = 0;
@@ -2529,6 +2550,9 @@ fn merge_loc_conf(
     // Inherit check_body
     if (c.*.check_body == conf.NGX_CONF_UNSET) {
         c.*.check_body = if (prev.*.check_body == conf.NGX_CONF_UNSET) 0 else prev.*.check_body;
+    }
+    if (c.*.body_max_size == conf.NGX_CONF_UNSET_SIZE) {
+        c.*.body_max_size = if (prev.*.body_max_size == conf.NGX_CONF_UNSET_SIZE) DEFAULT_WAF_BODY_MAX_SIZE else prev.*.body_max_size;
     }
 
     if (c.*.rules_file.len == 0) {
@@ -2793,6 +2817,49 @@ fn ngx_conf_set_waf_score_decay_window(
 
 const ngx_http_variable_value_t = http.ngx_http_variable_value_t;
 
+const WAF_BAN_METRIC_ENTRIES: core.uintptr_t = 0;
+const WAF_BAN_METRIC_CAPACITY_REJECTED: core.uintptr_t = 1;
+const WAF_BAN_METRIC_RECLAIMED: core.uintptr_t = 2;
+
+fn ngx_http_waf_ban_metric_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    var value: u64 = 0;
+    const zone = ngx_http_waf_ban_zone;
+    if (zone != core.nullptr(core.ngx_shm_zone_t) and zone.*.shm.addr != null) {
+        if (core.castPtr(core.ngx_slab_pool_t, zone.*.shm.addr)) |shpool| {
+            shm.ngx_shmtx_lock(&shpool.*.mutex);
+            if (getBanStoreFromZone(zone)) |store| {
+                value = switch (data) {
+                    WAF_BAN_METRIC_ENTRIES => @intCast(store.*.entries_count),
+                    WAF_BAN_METRIC_CAPACITY_REJECTED => store.*.capacity_rejected,
+                    WAF_BAN_METRIC_RECLAIMED => store.*.reclaimed_entries,
+                    else => 0,
+                };
+            }
+            shm.ngx_shmtx_unlock(&shpool.*.mutex);
+        }
+    }
+
+    var value_buf: [24]u8 = undefined;
+    const slice = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    v.*.data = copied.data;
+    v.*.flags.len = @intCast(copied.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
 fn ngx_http_waf_result_variable(
     r: [*c]ngx_http_request_t,
     v: [*c]ngx_http_variable_value_t,
@@ -2926,6 +2993,9 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         http.ngx_http_variable_t{ .name = ngx_string("waf_rule_id"), .set_handler = null, .get_handler = ngx_http_waf_rule_id_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
         http.ngx_http_variable_t{ .name = ngx_string("waf_score"), .set_handler = null, .get_handler = ngx_http_waf_score_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
         http.ngx_http_variable_t{ .name = ngx_string("waf_category"), .set_handler = null, .get_handler = ngx_http_waf_category_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("waf_ban_entries"), .set_handler = null, .get_handler = ngx_http_waf_ban_metric_variable, .data = WAF_BAN_METRIC_ENTRIES, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("waf_ban_capacity_rejected"), .set_handler = null, .get_handler = ngx_http_waf_ban_metric_variable, .data = WAF_BAN_METRIC_CAPACITY_REJECTED, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("waf_ban_reclaimed"), .set_handler = null, .get_handler = ngx_http_waf_ban_metric_variable, .data = WAF_BAN_METRIC_RECLAIMED, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
     };
     for (&vs) |*v| {
         if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
@@ -3017,6 +3087,14 @@ export const ngx_http_waf_commands = [_]ngx_command_t{
         .set = ngx_conf_set_waf_check_body,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("waf_body_max_size"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_size_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(waf_loc_conf, "body_max_size"),
         .post = null,
     },
     ngx_command_t{
@@ -3230,6 +3308,20 @@ test "applyOffenseToEntry bans on score threshold" {
     try expectEqual(@as(u16, 0), entry.score);
     try expectEqual(@as(u16, 1), entry.strikes);
     try expectEqual(@as(ngx_uint_t, 104), entry.ban_until);
+}
+
+test "applyOffenseToEntry honors a ban threshold of one" {
+    var lccf = std.mem.zeroes(waf_loc_conf);
+    lccf.ban_threshold = 1;
+    lccf.ban_window = 60;
+    lccf.ban_duration = 3;
+
+    var entry = std.mem.zeroes(waf_ban_entry);
+    applyOffenseToEntry(&entry, 100, &lccf, 1);
+
+    try expectEqual(@as(u16, 1), entry.strikes);
+    try expectEqual(@as(ngx_uint_t, 103), entry.ban_until);
+    try expectEqual(@as(u16, 0), entry.count);
 }
 
 test "applyOffenseToEntry honors weighted score increments" {

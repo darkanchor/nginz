@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
   startNginz,
+  reloadNginz,
   stopNginz,
   cleanupRuntime,
   TEST_URL,
@@ -218,4 +219,41 @@ describe("ratelimit module", () => {
       expect(statuses.filter((s) => s === 429).length).toBe(1);
     });
   });
+
+  test("reports full-table rejection and preserves counters across two-worker reload", async () => {
+    await stopNginz();
+    await startNginz(`tests/${MODULE}/nginx-capacity-reload.conf`, MODULE);
+
+    try {
+      // Start near a fresh fixed-window boundary so all entries remain live
+      // while the concurrent fill reaches capacity.
+      await Bun.sleep(1050);
+      const fills = await Promise.all(
+        Array.from({ length: 1024 }, (_, index) =>
+          fetch(`${TEST_URL}/fill?k=key-${index}`).then((res) => res.status),
+        ),
+      );
+      expect(fills.every((status) => status === 200)).toBe(true);
+
+      const overflow = await fetch(`${TEST_URL}/fill?k=overflow`);
+      expect(overflow.status).toBe(429);
+
+      let metrics = await fetch(`${TEST_URL}/metrics`);
+      expect(metrics.status).toBe(200);
+      expect(metrics.headers.get("x-ratelimit-entries")).toBe("1024");
+      expect(metrics.headers.get("x-ratelimit-capacity-rejected")).toBe("1");
+      expect(metrics.headers.get("x-ratelimit-reclaimed")).toBe("0");
+
+      await reloadNginz();
+
+      metrics = await fetch(`${TEST_URL}/metrics`);
+      expect(metrics.status).toBe(200);
+      expect(metrics.headers.get("x-ratelimit-entries")).toBe("1024");
+      expect(metrics.headers.get("x-ratelimit-capacity-rejected")).toBe("1");
+      expect(metrics.headers.get("x-ratelimit-reclaimed")).toBe("0");
+    } finally {
+      await stopNginz();
+      await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
+    }
+  }, 15000);
 });

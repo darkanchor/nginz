@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import {
   startNginz,
+  reloadNginz,
   stopNginz,
   cleanupRuntime,
   TEST_URL,
@@ -277,6 +278,7 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
     const res = await purge(["nonexistent-tag"]);
     expect(res.status).toBe(200);
     const body = await res.json();
+    expect(body.physical_cache_invalidated).toBe(false);
     expect(body.requested).toBe(1);
     expect(body.purged).toBe(0);
     expect(body.missing).toBe(1);
@@ -539,6 +541,45 @@ describe("cache-purge Phase 2 - prefix invalidation with 2 workers", () => {
   });
 });
 
+describe("cache-purge S1 - saturated metadata survives graceful reload", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-capacity-reload.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("purges pre-reload metadata after the shared tag table reaches capacity", async () => {
+    for (let i = 0; i < 257; i += 1) {
+      const res = await fetch(`${TEST_URL}/api?tag=cap-${i}`);
+      expect(res.status).toBe(200);
+    }
+
+    const beforeRes = await fetch(`${TEST_URL}/cache-tags`);
+    expect(beforeRes.status).toBe(200);
+    const before = await beforeRes.json();
+    expect(before.tags).toHaveLength(256);
+    expect(before.capture_rejections.tag_capacity).toBeGreaterThanOrEqual(1);
+
+    await reloadNginz();
+
+    const afterRes = await fetch(`${TEST_URL}/cache-tags`);
+    expect(afterRes.status).toBe(200);
+    const after = await afterRes.json();
+    expect(after.tags).toHaveLength(256);
+    expect(after.capture_rejections).toEqual(before.capture_rejections);
+
+    const purgeRes = await purge(["cap-0", "cap-127", "cap-255"]);
+    expect(purgeRes.status).toBe(200);
+    const purgeBody = await purgeRes.json();
+    expect(purgeBody.physical_cache_invalidated).toBe(false);
+    expect(purgeBody.purged).toBe(3);
+    expect(purgeBody.missing).toBe(0);
+  });
+});
+
 describe("cache-purge Phase 3 - allowlist authorization", () => {
   describe("allowed caller", () => {
     beforeAll(async () => {
@@ -651,6 +692,72 @@ describe("cache-purge Phase 3 - worker-events notifications", () => {
       expect.objectContaining({ match: "exact", target: "user-123" }),
     );
     expect(payload.purged).toBeGreaterThan(0);
+  });
+});
+
+describe("cache-purge S1 - worker-events publish outcome", () => {
+  beforeAll(async () => {
+    await startNginz(`tests/${MODULE}/nginx-worker-events-overflow.conf`, MODULE);
+  });
+
+  afterAll(async () => {
+    await stopNginz();
+    cleanupRuntime(MODULE);
+  });
+
+  test("reports accepted publishes and retained-history eviction separately", async () => {
+    for (let i = 0; i < 4; i += 1) {
+      const res = await fetch(`${TEST_URL}/api?tag=event-${i}`);
+      expect(res.status).toBe(200);
+    }
+
+    const fillRes = await purge(["event-0", "event-1", "event-2", "event-3"]);
+    expect(fillRes.status).toBe(200);
+    const fill = await fillRes.json();
+    expect(fill.worker_events).toEqual({
+      attempted: 4,
+      published: 4,
+      retention_evicted: 0,
+      failed: 0,
+    });
+
+    const tagRes = await fetch(`${TEST_URL}/api?tag=event-overflow`);
+    expect(tagRes.status).toBe(200);
+    const overflowRes = await purge(["event-overflow"]);
+    expect(overflowRes.status).toBe(200);
+    const overflow = await overflowRes.json();
+    expect(overflow.worker_events).toEqual({
+      attempted: 1,
+      published: 1,
+      retention_evicted: 1,
+      failed: 0,
+    });
+
+    const events = await getWorkerEvents("cache");
+    expect(events.dropped_events).toBe(1);
+    expect(events.events).toHaveLength(4);
+
+    await reloadNginz();
+
+    const afterReload = await getWorkerEvents("cache");
+    expect(afterReload.dropped_events).toBe(1);
+    expect(afterReload.events).toHaveLength(4);
+
+    const afterReloadTag = await fetch(`${TEST_URL}/api?tag=event-after-reload`);
+    expect(afterReloadTag.status).toBe(200);
+    const afterReloadPurge = await purge(["event-after-reload"]);
+    expect(afterReloadPurge.status).toBe(200);
+    const afterReloadOutcome = await afterReloadPurge.json();
+    expect(afterReloadOutcome.worker_events).toEqual({
+      attempted: 1,
+      published: 1,
+      retention_evicted: 1,
+      failed: 0,
+    });
+
+    const finalEvents = await getWorkerEvents("cache");
+    expect(finalEvents.dropped_events).toBe(2);
+    expect(finalEvents.events).toHaveLength(4);
   });
 });
 

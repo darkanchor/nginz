@@ -120,4 +120,4 @@ server {
 
 ### Engineering Audit Verdict (2026-07-12)
 
-**Verdict: S0 FIXED; S1 RECOVERY CONTROL OPEN.** Capacity exhaustion now returns no entry instead of aliasing entry zero, and protected requests fail closed with 503 when circuit state cannot be allocated. A 64+1 unit regression proves the first circuit remains unchanged, while the focused 16-case integration suite remains green. S1 follow-ups are saturation telemetry/configurable capacity, strict malformed directive rejection, and a bounded number of half-open probes to prevent a recovery stampede.
+**Verdict: S0 FIXED; S1 RECOVERY/RELOAD FIXED, CAPACITY TELEMETRY OPEN.** Capacity exhaustion returns no entry instead of aliasing entry zero, and protected requests fail closed when circuit state cannot be allocated; the 64+1 unit regression preserves the first circuit. Threshold/success/timeout directives now reject malformed or zero values. The half-open state admits exactly one recovery probe across workers, preventing a recovery stampede, and an open circuit remains enforced across graceful reload. The focused 18-case suite is green. Saturation telemetry and configurable capacity remain follow-up work.

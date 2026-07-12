@@ -35,6 +35,13 @@ This module should **not** own:
 - `POST` — publish one event; body: `{"type":"...", "payload":"..."}` (payload optional, string)
 - Other methods — return `405 Method Not Allowed`
 
+Successful `POST` responses include `retention_evicted`. `false` means the
+event was appended without replacing a retained event; `true` means the event
+was accepted but overwrote the ring's oldest entry. Native publishers receive
+the same distinction: `NGX_OK` for an append, `NGX_DECLINED` for an accepted
+append that evicted retained history, and `NGX_ERROR` for an invalid or
+unavailable publish route.
+
 **Shared memory layout:**
 - `WorkerEventsStore` control block (generation counter, write index, dropped-event accounting, capacity)
 - Ring entries placed at end of shared memory zone (bypasses slab allocator for large contiguous ring)
@@ -491,4 +498,4 @@ That architecture makes sense. The dangerous part is not the HTTP endpoint. The 
 
 ### Engineering Audit Verdict (2026-07-12)
 
-**Verdict: S0 LIFECYCLE/ISOLATION FIXED; NAMED NATIVE ROUTING OPEN.** The last-created descriptor global has been removed from native consumers. A current-cycle registry is cleared in preconfiguration, and the compatibility publisher succeeds only when exactly one zone exists; zero-zone and multi-zone configurations return an error rather than dereferencing retired state or cross-routing to the last zone. Unit proofs cover registry reset and ambiguous-zone rejection, and the 47 focused API/multi-worker/multi-zone tests remain green. Explicit named-zone binding for native publishers and observable publish/drop outcomes remain follow-up work.
+**Verdict: S0 LIFECYCLE/ISOLATION FIXED; S1 ACKNOWLEDGEMENT/CAPACITY/RELOAD FIXED.** The last-created descriptor global has been removed from native consumers. A current-cycle registry is cleared in preconfiguration, and the compatibility publisher succeeds only when exactly one zone exists; zero-zone and multi-zone configurations return an error rather than dereferencing retired state or cross-routing to the last zone. Native publishers now use explicit named zone/channel bindings (`dynamic-upstreams`, `cache-purge`, and `healthcheck`). Native return codes and HTTP responses distinguish append, accepted overwrite of retained history, and failure; cache-purge surfaces those outcomes to its callers. A two-worker full-ring native-publisher proof confirms drop accounting survives graceful reload and the next post-reload event reports its overwrite.

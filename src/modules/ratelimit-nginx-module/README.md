@@ -63,6 +63,13 @@ Where the effective key came from:
 
 The effective token cost applied to the current request.
 
+#### Shared-store metrics
+
+- `$ratelimit_entries` — occupied shared fixed-window buckets (maximum 1,024).
+- `$ratelimit_capacity_rejected` — cumulative new buckets denied because every
+  stored window is still live; no live client window is evicted.
+- `$ratelimit_reclaimed` — cumulative expired buckets reused for a new key.
+
 ### Usage
 
 ```nginx
@@ -162,4 +169,4 @@ Because `ratelimit` now runs in the ACCESS phase, it only sees signals from modu
 
 ### Engineering Audit Verdict (2026-07-12)
 
-**Verdict: S1 CAPACITY POLICY FIXED; IDENTITY/TELEMETRY OPEN.** At 1,024 simultaneous live windows, a new key is now denied rather than evicting another client's enforcement state; expired entries remain reusable. A full-table unit proof preserves the first bucket, and the focused 14-case multi-worker suite is green. Saturation metrics and collision-resolving key identity beyond the current 64-bit hash remain S1 hardening.
+**Verdict: S1 CAPACITY/TELEMETRY/RELOAD FIXED; IDENTITY HARDENING OPEN.** At 1,024 simultaneous live windows, a new key is denied rather than evicting another client's enforcement state; expired entries remain reusable. Shared metrics expose occupied entries, rejected new buckets, and safe reclamation. The focused 15-case two-worker suite fills all 1,024 live buckets, proves the 1,025th is rejected, and preserves its counters across graceful reload. Collision-resolving key identity beyond the current 64-bit hash remains hardening work.

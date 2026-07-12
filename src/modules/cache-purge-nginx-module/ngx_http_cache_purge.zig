@@ -14,6 +14,7 @@ const NArray = ngx.array.NArray;
 const NGX_OK = core.NGX_OK;
 const NGX_DONE = core.NGX_DONE;
 const NGX_ERROR = core.NGX_ERROR;
+const NGX_DECLINED = core.NGX_DECLINED;
 
 const ngx_str_t = core.ngx_str_t;
 const ngx_int_t = core.ngx_int_t;
@@ -32,7 +33,8 @@ const ngx_null_str = string.ngx_null_str;
 const CJSON = cjson.CJSON;
 
 extern var ngx_http_core_module: ngx_module_t;
-extern fn ngx_http_worker_events_publish_default(
+extern fn ngx_http_worker_events_publish_named(
+    zone_name: ngx_str_t,
     channel_str: ngx_str_t,
     type_str: ngx_str_t,
     payload_str: ngx_str_t,
@@ -61,6 +63,9 @@ const cache_tags_store = extern struct {
     tag_count: usize,
     tags: [MAX_TAGS]TagEntry,
     tag_used: [MAX_TAGS]u8,
+    capture_invalid_rejected: u64,
+    capture_tag_capacity_rejected: u64,
+    capture_uri_capacity_rejected: u64,
 };
 
 var ngx_http_cache_purge_tags_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_shm_zone_t);
@@ -101,6 +106,27 @@ const WorkerEventsMode = enum(c_uint) {
     unset = 255,
 };
 
+const WorkerEventPublishOutcome = struct {
+    attempted: usize,
+    published: usize,
+    retention_evicted: usize,
+    failed: usize,
+};
+
+fn record_worker_event_publish(outcome: *WorkerEventPublishOutcome, rc: ngx_int_t) void {
+    outcome.attempted += 1;
+    if (rc == NGX_OK) {
+        outcome.published += 1;
+    } else if (rc == NGX_DECLINED) {
+        // The new event was accepted, but the bounded ring evicted its oldest
+        // retained event. Surface that loss explicitly to the purge caller.
+        outcome.published += 1;
+        outcome.retention_evicted += 1;
+    } else {
+        outcome.failed += 1;
+    }
+}
+
 // ── Location config ───────────────────────────────────────────────────────────
 
 const DEFAULT_MAX_KEYS: ngx_uint_t = 256;
@@ -112,6 +138,7 @@ const cache_purge_loc_conf = extern struct {
     auth_mode: AuthMode,
     max_keys: ngx_uint_t,
     worker_events_channel: ngx_str_t,
+    worker_events_zone: ngx_str_t,
     worker_events_mode: WorkerEventsMode,
     allowlist_entries: NArray(ngx_str_t),
 };
@@ -124,6 +151,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.auth_mode = .unset;
         p.*.max_keys = 0;
         p.*.worker_events_channel = ngx_null_str;
+        p.*.worker_events_zone = ngx_null_str;
         p.*.worker_events_mode = .unset;
         return p;
     }
@@ -149,6 +177,7 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
         c.*.auth_mode = if (prev.*.auth_mode == .unset) .off else prev.*.auth_mode;
     }
     if (c.*.worker_events_channel.len == 0) c.*.worker_events_channel = prev.*.worker_events_channel;
+    if (c.*.worker_events_zone.len == 0) c.*.worker_events_zone = prev.*.worker_events_zone;
     if (c.*.worker_events_mode == .unset) {
         c.*.worker_events_mode = if (prev.*.worker_events_mode == .unset) .per_target else prev.*.worker_events_mode;
     }
@@ -396,7 +425,16 @@ fn send_single_target_response(
     purged: usize,
 ) void {
     const match_label = match_mode_label(lccf.*.match_mode);
-    const est_size = 192 + lccf.*.zone_name.len + match_label.len + 2 * json_escape_len(target);
+    var worker_events = std.mem.zeroes(WorkerEventPublishOutcome);
+    if (purged > 0 and lccf.*.worker_events_zone.len > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
+        switch (lccf.*.worker_events_mode) {
+            .off => {},
+            .summary => record_worker_event_publish(&worker_events, publish_purge_summary_event(lccf.*.worker_events_zone, lccf.*.worker_events_channel, 1, purged, 0, lccf.*.match_mode)),
+            .per_target, .unset => record_worker_event_publish(&worker_events, publish_purge_event(lccf.*.worker_events_zone, lccf.*.worker_events_channel, target, purged, lccf.*.match_mode)),
+        }
+    }
+
+    const est_size = 384 + lccf.*.zone_name.len + match_label.len + 2 * json_escape_len(target);
     const resp_raw = core.ngx_pnalloc(r.*.pool, est_size) orelse {
         http.ngx_http_finalize_request(r, http.NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
@@ -411,11 +449,19 @@ fn send_single_target_response(
     }
     append(&w, w_end, "\",\"match\":\"");
     append(&w, w_end, match_label);
-    append(&w, w_end, "\",\"requested\":1,\"purged\":");
+    append(&w, w_end, "\",\"physical_cache_invalidated\":false,\"requested\":1,\"purged\":");
     append_usize(&w, w_end, purged);
     append(&w, w_end, ",\"missing\":");
     append_usize(&w, w_end, if (purged == 0) @as(usize, 1) else @as(usize, 0));
-    append(&w, w_end, ",\"rejected\":0,\"results\":[{\"target\":\"");
+    append(&w, w_end, ",\"rejected\":0,\"worker_events\":{\"attempted\":");
+    append_usize(&w, w_end, worker_events.attempted);
+    append(&w, w_end, ",\"published\":");
+    append_usize(&w, w_end, worker_events.published);
+    append(&w, w_end, ",\"retention_evicted\":");
+    append_usize(&w, w_end, worker_events.retention_evicted);
+    append(&w, w_end, ",\"failed\":");
+    append_usize(&w, w_end, worker_events.failed);
+    append(&w, w_end, "},\"results\":[{\"target\":\"");
     append_escaped(&w, w_end, target);
     append(&w, w_end, "\",\"purged\":");
     append_usize(&w, w_end, purged);
@@ -426,20 +472,12 @@ fn send_single_target_response(
         .len = @intCast(@intFromPtr(w) - @intFromPtr(resp_mem)),
     };
 
-    if (purged > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
-        switch (lccf.*.worker_events_mode) {
-            .off => {},
-            .summary => publish_purge_summary_event(lccf.*.worker_events_channel, 1, purged, 0, lccf.*.match_mode),
-            .per_target, .unset => publish_purge_event(lccf.*.worker_events_channel, target, purged, lccf.*.match_mode),
-        }
-    }
-
     _ = send_json_response(r, http.NGX_HTTP_OK, resp_body);
     http.ngx_http_finalize_request(r, NGX_OK);
 }
 
-fn publish_purge_event(channel: ngx_str_t, target: []const u8, purged: usize, mode: MatchMode) void {
-    if (channel.len == 0 or channel.data == null) return;
+fn publish_purge_event(zone: ngx_str_t, channel: ngx_str_t, target: []const u8, purged: usize, mode: MatchMode) ngx_int_t {
+    if (zone.len == 0 or zone.data == null or channel.len == 0 or channel.data == null) return NGX_ERROR;
 
     const event_type = ngx_string("purged");
     const mode_label = match_mode_label(mode);
@@ -459,17 +497,18 @@ fn publish_purge_event(channel: ngx_str_t, target: []const u8, purged: usize, mo
         .len = @intCast(@intFromPtr(w) - @intFromPtr(&payload_buf)),
         .data = @ptrCast(&payload_buf),
     };
-    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
+    return ngx_http_worker_events_publish_named(zone, channel, event_type, payload_str);
 }
 
 fn publish_purge_summary_event(
+    zone: ngx_str_t,
     channel: ngx_str_t,
     requested: usize,
     purged: usize,
     missing: usize,
     mode: MatchMode,
-) void {
-    if (channel.len == 0 or channel.data == null) return;
+) ngx_int_t {
+    if (zone.len == 0 or zone.data == null or channel.len == 0 or channel.data == null) return NGX_ERROR;
 
     const event_type = ngx_string("purge_batch");
     const mode_label = match_mode_label(mode);
@@ -491,7 +530,7 @@ fn publish_purge_summary_event(
         .len = @intCast(@intFromPtr(w) - @intFromPtr(&payload_buf)),
         .data = @ptrCast(&payload_buf),
     };
-    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
+    return ngx_http_worker_events_publish_named(zone, channel, event_type, payload_str);
 }
 
 // ── Response helper ───────────────────────────────────────────────────────────
@@ -716,8 +755,33 @@ fn purge_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         shm.ngx_shmtx_unlock(&store_shpool.?.*.mutex);
     }
 
-    // Build JSON response outside shm lock
-    var est_size: usize = 256 + lccf.*.zone_name.len + match_label.len;
+    var worker_events = std.mem.zeroes(WorkerEventPublishOutcome);
+    if (target_count > 0 and lccf.*.worker_events_zone.len > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
+        switch (lccf.*.worker_events_mode) {
+            .off => {},
+            .summary => {
+                if (total_purged > 0) {
+                    record_worker_event_publish(&worker_events, publish_purge_summary_event(
+                        lccf.*.worker_events_zone,
+                        lccf.*.worker_events_channel,
+                        target_count,
+                        total_purged,
+                        total_missing,
+                        lccf.*.match_mode,
+                    ));
+                }
+            },
+            .per_target, .unset => for (0..target_count) |i| {
+                const result = results.?[i];
+                if (result.found != 1 or result.purged == 0 or result.target_len == 0) continue;
+                const target: []const u8 = @ptrCast(result.target[0..result.target_len]);
+                record_worker_event_publish(&worker_events, publish_purge_event(lccf.*.worker_events_zone, lccf.*.worker_events_channel, target, result.purged, lccf.*.match_mode));
+            },
+        }
+    }
+
+    // Build JSON response outside the cache-tags SHM lock.
+    var est_size: usize = 448 + lccf.*.zone_name.len + match_label.len;
     for (0..target_count) |i| {
         const result = results.?[i];
         const tgt: []const u8 = @ptrCast(result.target[0..result.target_len]);
@@ -737,13 +801,21 @@ fn purge_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
     }
     append(&w, w_end, "\",\"match\":\"");
     append(&w, w_end, match_label);
-    append(&w, w_end, "\",\"requested\":");
+    append(&w, w_end, "\",\"physical_cache_invalidated\":false,\"requested\":");
     append_usize(&w, w_end, target_count);
     append(&w, w_end, ",\"purged\":");
     append_usize(&w, w_end, total_purged);
     append(&w, w_end, ",\"missing\":");
     append_usize(&w, w_end, total_missing);
-    append(&w, w_end, ",\"rejected\":0,\"results\":[");
+    append(&w, w_end, ",\"rejected\":0,\"worker_events\":{\"attempted\":");
+    append_usize(&w, w_end, worker_events.attempted);
+    append(&w, w_end, ",\"published\":");
+    append_usize(&w, w_end, worker_events.published);
+    append(&w, w_end, ",\"retention_evicted\":");
+    append_usize(&w, w_end, worker_events.retention_evicted);
+    append(&w, w_end, ",\"failed\":");
+    append_usize(&w, w_end, worker_events.failed);
+    append(&w, w_end, "},\"results\":[");
     for (0..target_count) |i| {
         if (i > 0) append(&w, w_end, ",");
         const result = results.?[i];
@@ -760,29 +832,6 @@ fn purge_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         .data = resp_mem,
         .len = @intCast(@intFromPtr(w) - @intFromPtr(resp_mem)),
     };
-
-    if (target_count > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
-        switch (lccf.*.worker_events_mode) {
-            .off => {},
-            .summary => {
-                if (total_purged > 0) {
-                    publish_purge_summary_event(
-                        lccf.*.worker_events_channel,
-                        target_count,
-                        total_purged,
-                        total_missing,
-                        lccf.*.match_mode,
-                    );
-                }
-            },
-            .per_target, .unset => for (0..target_count) |i| {
-                const result = results.?[i];
-                if (result.found != 1 or result.purged == 0 or result.target_len == 0) continue;
-                const target: []const u8 = @ptrCast(result.target[0..result.target_len]);
-                publish_purge_event(lccf.*.worker_events_channel, target, result.purged, lccf.*.match_mode);
-            },
-        }
-    }
 
     _ = send_json_response(r, http.NGX_HTTP_OK, resp_body);
     http.ngx_http_finalize_request(r, NGX_OK);
@@ -969,6 +1018,19 @@ fn ngx_conf_set_cache_purge_worker_events_channel(
     return conf.NGX_CONF_OK;
 }
 
+fn ngx_conf_set_cache_purge_worker_events_zone(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(cache_purge_loc_conf, loc)) |lccf| {
+        var i: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| lccf.*.worker_events_zone = arg.*;
+    }
+    return conf.NGX_CONF_OK;
+}
+
 fn ngx_conf_set_cache_purge_worker_events_mode(
     cf: [*c]ngx_conf_t,
     cmd: [*c]ngx_command_t,
@@ -1095,6 +1157,14 @@ export const ngx_http_cache_purge_commands = [_]ngx_command_t{
         .name = ngx_string("cache_purge_worker_events_mode"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
         .set = ngx_conf_set_cache_purge_worker_events_mode,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("cache_purge_worker_events_zone"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = ngx_conf_set_cache_purge_worker_events_zone,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,

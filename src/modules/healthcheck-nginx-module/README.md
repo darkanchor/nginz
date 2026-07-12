@@ -64,7 +64,8 @@ That remaining work belongs at the integration boundary with `upstream-balancer`
 | `health_probe_passes` | `<count>` | `1` | Consecutive successes to recover |
 | `health_probe_slow_start` | `<time>` | `0` (disabled) | Recovery ramp duration |
 | `health_probe_match` | `status=<min>-<max> [body=<str>]` | — | Match rules for probe response |
-| `health_worker_events_channel` | `<channel>` | — | Publish service-level transition events to the worker-events default zone |
+| `health_worker_events_zone` | `<zone>` | — | Explicit worker-events zone for service-level transition events |
+| `health_worker_events_channel` | `<channel>` | — | Channel within the configured worker-events zone |
 
 #### Upstream-context
 

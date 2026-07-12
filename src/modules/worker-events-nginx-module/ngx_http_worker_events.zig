@@ -11,6 +11,7 @@ const cjson = ngx.cjson;
 
 const NGX_OK = core.NGX_OK;
 const NGX_ERROR = core.NGX_ERROR;
+const NGX_DECLINED = core.NGX_DECLINED;
 
 const ngx_str_t = core.ngx_str_t;
 const ngx_int_t = core.ngx_int_t;
@@ -118,6 +119,7 @@ fn get_current_time_msec() i64 {
 const PublishWriteResult = struct {
     generation: u64,
     created_at_msec: i64,
+    retention_evicted: bool,
 };
 
 fn valid_publish_str(value: ngx_str_t, max_len: usize, allow_empty: bool) bool {
@@ -147,7 +149,8 @@ fn publish_to_ring(
     const write_idx = store.*.write_index;
     const capacity = store.*.capacity;
 
-    if (store.*.retained_count == capacity) {
+    const retention_evicted = store.*.retained_count == capacity;
+    if (retention_evicted) {
         store.*.dropped_events += 1;
         if (store.*.oldest_generation == 0) {
             store.*.oldest_generation = entries[write_idx].generation;
@@ -182,7 +185,11 @@ fn publish_to_ring(
         store.*.oldest_generation = generation;
     }
 
-    return .{ .generation = generation, .created_at_msec = entry.*.created_at_msec };
+    return .{
+        .generation = generation,
+        .created_at_msec = entry.*.created_at_msec,
+        .retention_evicted = retention_evicted,
+    };
 }
 
 export fn ngx_http_worker_events_publish_internal(
@@ -191,7 +198,10 @@ export fn ngx_http_worker_events_publish_internal(
     type_str: ngx_str_t,
     payload_str: ngx_str_t,
 ) callconv(.c) ngx_int_t {
-    return if (publish_to_ring(zone, channel_str, type_str, payload_str) != null) NGX_OK else NGX_ERROR;
+    const result = publish_to_ring(zone, channel_str, type_str, payload_str) orelse return NGX_ERROR;
+    // NGX_DECLINED is an acknowledged write with an overwrite of the oldest
+    // retained event; callers must not treat it as a failed publication.
+    return if (result.retention_evicted) NGX_DECLINED else NGX_OK;
 }
 
 /// Backward-compatible native publisher path.  It is intentionally available
@@ -204,6 +214,22 @@ export fn ngx_http_worker_events_publish_default(
 ) callconv(.c) ngx_int_t {
     if (worker_events_zone_count != 1) return NGX_ERROR;
     return ngx_http_worker_events_publish_internal(worker_events_zones[0].zone, channel_str, type_str, payload_str);
+}
+
+/// Publish to an explicitly named zone in the current configuration cycle.
+/// Native consumers must use this in multi-zone deployments.
+export fn ngx_http_worker_events_publish_named(
+    zone_name: ngx_str_t,
+    channel_str: ngx_str_t,
+    type_str: ngx_str_t,
+    payload_str: ngx_str_t,
+) callconv(.c) ngx_int_t {
+    for (worker_events_zones[0..worker_events_zone_count]) |binding| {
+        if (string.eql(binding.name, zone_name)) {
+            return ngx_http_worker_events_publish_internal(binding.zone, channel_str, type_str, payload_str);
+        }
+    }
+    return NGX_ERROR;
 }
 
 // ── Zone init callback ───────────────────────────────────────────────────────
@@ -821,6 +847,8 @@ fn publish_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
         @memcpy(w2[0..n], nbuf[0..n]);
         w2 += n;
     }
+    append2(&w2, ",\"retention_evicted\":");
+    append2(&w2, if (publish_result.retention_evicted) "true" else "false");
     append2(&w2, "}");
 
     const resp_body = ngx_str_t{

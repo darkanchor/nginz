@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
   startNginz,
+  reloadNginz,
   stopNginz,
   cleanupRuntime,
   createHTTPMock,
@@ -292,6 +293,44 @@ describe("cache-tags module", () => {
       expect(purgeJson.tag).toBe("product");
       expect(purgeJson.purged).toBeGreaterThanOrEqual(uris.length);
     });
+  });
+
+  test("reports URI-capacity rejection without losing existing tag mappings", async () => {
+    const beforeRes = await fetch(`${TEST_URL}/cache/purge`);
+    const before = await beforeRes.json();
+    const beforeRejected = before.capture_rejections.uri_capacity;
+    const prefix = `capacity-${Date.now()}`;
+
+    for (let i = 0; i < 80; i += 1) {
+      const res = await fetch(`${TEST_URL}/api/${prefix}-${i}`);
+      expect(res.status).toBe(200);
+    }
+
+    const afterRes = await fetch(`${TEST_URL}/cache/purge`);
+    const after = await afterRes.json();
+    const apiTag = after.tags.find((tag) => tag.tag === "api");
+    expect(apiTag).toBeDefined();
+    expect(apiTag.uris).toBeLessThanOrEqual(64);
+    expect(after.capture_rejections.uri_capacity).toBeGreaterThan(beforeRejected);
+    expect(after.capture_rejections.invalid).toBeGreaterThanOrEqual(0);
+    expect(after.capture_rejections.tag_capacity).toBeGreaterThanOrEqual(0);
+  });
+
+  test("preserves saturated shared metadata and counters across graceful reload", async () => {
+    const beforeRes = await fetch(`${TEST_URL}/cache/purge`);
+    const before = await beforeRes.json();
+    const beforeApi = before.tags.find((tag) => tag.tag === "api");
+    expect(beforeApi).toBeDefined();
+    expect(before.capture_rejections.uri_capacity).toBeGreaterThan(0);
+
+    await reloadNginz();
+
+    const afterRes = await fetch(`${TEST_URL}/cache/purge`);
+    const after = await afterRes.json();
+    const afterApi = after.tags.find((tag) => tag.tag === "api");
+    expect(afterApi).toBeDefined();
+    expect(afterApi.uris).toBe(beforeApi.uris);
+    expect(after.capture_rejections).toEqual(before.capture_rejections);
   });
 
   describe("custom tag header", () => {

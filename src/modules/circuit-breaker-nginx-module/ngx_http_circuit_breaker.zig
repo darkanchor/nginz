@@ -38,6 +38,10 @@ const CircuitState = enum(u8) {
     open, // Circuit tripped, requests fail fast with 503
     half_open, // Testing if service recovered
 };
+// Kept outside the enum so the shared-memory structure layout stays stable
+// across graceful reloads. It represents a half-open circuit with its single
+// recovery probe admitted.
+const CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT: u8 = 3;
 
 // Location configuration
 const circuit_breaker_loc_conf = extern struct {
@@ -73,6 +77,7 @@ fn circuitStateFromByte(value: u8) CircuitState {
     return switch (value) {
         @intFromEnum(CircuitState.open) => .open,
         @intFromEnum(CircuitState.half_open) => .half_open,
+        CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT => .half_open,
         else => .closed,
     };
 }
@@ -213,6 +218,10 @@ fn recordSuccess(stats: *SharedCircuitStats, success_threshold: ngx_uint_t) void
                 stats.failure_count = 0;
                 stats.success_count = 0;
                 stats.last_state_change_ms = getCurrentTimeMs();
+            } else {
+                // The single half-open probe completed successfully; admit
+                // the next probe only after this outcome is recorded.
+                stats.state = @intFromEnum(CircuitState.half_open);
             }
         },
         .open => {
@@ -248,7 +257,20 @@ fn recordFailure(stats: *SharedCircuitStats, failure_threshold: ngx_uint_t) void
 // Request context to track if we should record the response
 const circuit_breaker_ctx = extern struct {
     should_track: ngx_flag_t,
+    admission: ngx_str_t,
 };
+
+const admission_allow = ngx_string("allow");
+const admission_open = ngx_string("open");
+const admission_half_open_busy = ngx_string("half_open_busy");
+const admission_capacity = ngx_string("capacity");
+
+fn setCircuitContext(r: [*c]ngx_http_request_t, should_track: ngx_flag_t, admission: ngx_str_t) bool {
+    const ctx = http.ngz_http_get_module_ctx(circuit_breaker_ctx, r, &ngx_http_circuit_breaker_module) catch return false;
+    ctx.*.should_track = should_track;
+    ctx.*.admission = admission;
+    return true;
+}
 
 // Access phase handler - check circuit state
 fn ngx_http_circuit_breaker_access_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_t {
@@ -263,29 +285,37 @@ fn ngx_http_circuit_breaker_access_handler(r: [*c]ngx_http_request_t) callconv(.
 
     const shpool = getCircuitShpool() orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
     shm.ngx_shmtx_lock(&shpool.*.mutex);
-    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    const admission = blk: {
+        // Saturation or missing shared state must fail closed. Failing open
+        // here silently removes protection precisely when its state is gone.
+        const stats = getCircuitStats(lccf) orelse break :blk admission_capacity;
 
-    // Saturation or missing shared state must fail closed.  Failing open here
-    // silently removes the protection precisely when its state is unavailable.
-    const stats = getCircuitStats(lccf) orelse return http.NGX_HTTP_SERVICE_UNAVAILABLE;
+        checkTimeout(stats, lccf.*.timeout_ms);
+        switch (circuitStateFromByte(stats.*.state)) {
+            .open => break :blk admission_open,
+            .half_open => {
+                // A half-open circuit admits exactly one probe. The marker is
+                // set while locked so concurrent workers cannot stampede it.
+                if (stats.*.state == CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT) {
+                    break :blk admission_half_open_busy;
+                }
+                stats.*.state = CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT;
+                break :blk admission_allow;
+            },
+            .closed => break :blk admission_allow,
+        }
+    };
+    shm.ngx_shmtx_unlock(&shpool.*.mutex);
 
-    // Check for timeout transition
-    checkTimeout(stats, lccf.*.timeout_ms);
-
-    switch (circuitStateFromByte(stats.*.state)) {
-        .open => {
-            // Circuit is open - fail fast with 503
-            r.*.headers_out.status = 503;
-            return 503;
-        },
-        .half_open, .closed => {
-            // Set context to track this request
-            if (http.ngz_http_get_module_ctx(circuit_breaker_ctx, r, &ngx_http_circuit_breaker_module)) |ctx| {
-                ctx.*.should_track = 1;
-            } else |_| {}
-            return NGX_DECLINED;
-        },
+    // Do not render a response under the shared-memory mutex: response
+    // headers can evaluate observability variables that acquire this mutex.
+    if (admission.data == admission_allow.data) {
+        if (!setCircuitContext(r, 1, admission_allow)) return NGX_ERROR;
+        return NGX_DECLINED;
     }
+    _ = setCircuitContext(r, 0, admission);
+    r.*.headers_out.status = http.NGX_HTTP_SERVICE_UNAVAILABLE;
+    return http.NGX_HTTP_SERVICE_UNAVAILABLE;
 }
 
 // Log phase handler - record success/failure
@@ -316,6 +346,13 @@ fn ngx_http_circuit_breaker_log_handler(r: [*c]ngx_http_request_t) callconv(.c) 
 
     const stats = getCircuitStats(lccf) orelse return NGX_OK;
     const status = r.*.headers_out.status;
+
+    // Release the half-open probe slot before applying its result. Both
+    // recordSuccess and recordFailure then operate on the normal half-open
+    // state and choose the next durable state atomically under this mutex.
+    if (stats.*.state == CIRCUIT_STATE_HALF_OPEN_PROBE_IN_FLIGHT) {
+        stats.*.state = @intFromEnum(CircuitState.half_open);
+    }
 
     // Consider 5xx as failures, everything else as success
     if (status >= 500 and status < 600) {
@@ -376,6 +413,28 @@ fn ngx_http_circuit_state_variable(
     return NGX_OK;
 }
 
+fn ngx_http_circuit_admission_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    _ = data;
+    const ctx = http.ngz_http_get_module_ctx(circuit_breaker_ctx, r, &ngx_http_circuit_breaker_module) catch {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    if (ctx.*.admission.len == 0 or ctx.*.admission.data == null) {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    }
+    v.*.data = ctx.*.admission.data;
+    v.*.flags.len = @intCast(ctx.*.admission.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
 fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     if (core.ngz_pcalloc_c(circuit_breaker_loc_conf, cf.*.pool)) |p| {
         p.*.enabled = conf.NGX_CONF_UNSET;
@@ -431,7 +490,9 @@ fn ngx_conf_set_threshold(
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             const slice = core.slicify(u8, arg.*.data, arg.*.len);
-            lccf.*.failure_threshold = std.fmt.parseInt(ngx_uint_t, slice, 10) catch 5;
+            const threshold = std.fmt.parseInt(ngx_uint_t, slice, 10) catch return conf.NGX_CONF_ERROR;
+            if (threshold == 0) return conf.NGX_CONF_ERROR;
+            lccf.*.failure_threshold = threshold;
         }
         return initCircuitKey(cf, lccf);
     }
@@ -448,7 +509,9 @@ fn ngx_conf_set_success_threshold(
         var i: ngx_uint_t = 1;
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             const slice = core.slicify(u8, arg.*.data, arg.*.len);
-            lccf.*.success_threshold = std.fmt.parseInt(ngx_uint_t, slice, 10) catch 2;
+            const threshold = std.fmt.parseInt(ngx_uint_t, slice, 10) catch return conf.NGX_CONF_ERROR;
+            if (threshold == 0) return conf.NGX_CONF_ERROR;
+            lccf.*.success_threshold = threshold;
         }
         if (lccf.*.enabled == 1 and lccf.*.circuit_key.len == 0) {
             return initCircuitKey(cf, lccf);
@@ -469,10 +532,13 @@ fn ngx_conf_set_timeout(
             const slice = core.slicify(u8, arg.*.data, arg.*.len);
             // Parse as milliseconds or with 's' suffix for seconds
             if (slice.len > 0 and slice[slice.len - 1] == 's') {
-                const secs = std.fmt.parseInt(ngx_uint_t, slice[0 .. slice.len - 1], 10) catch 30;
-                lccf.*.timeout_ms = secs * 1000;
+                const secs = std.fmt.parseInt(ngx_uint_t, slice[0 .. slice.len - 1], 10) catch return conf.NGX_CONF_ERROR;
+                if (secs == 0) return conf.NGX_CONF_ERROR;
+                lccf.*.timeout_ms = std.math.mul(ngx_uint_t, secs, 1000) catch return conf.NGX_CONF_ERROR;
             } else {
-                lccf.*.timeout_ms = std.fmt.parseInt(ngx_uint_t, slice, 10) catch 30000;
+                const timeout = std.fmt.parseInt(ngx_uint_t, slice, 10) catch return conf.NGX_CONF_ERROR;
+                if (timeout == 0) return conf.NGX_CONF_ERROR;
+                lccf.*.timeout_ms = timeout;
             }
         }
         if (lccf.*.enabled == 1 and lccf.*.circuit_key.len == 0) {
@@ -494,6 +560,13 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         .name = ngx_string("ngz_circuit_state"),
         .set_handler = null,
         .get_handler = ngx_http_circuit_state_variable,
+        .data = 0,
+        .flags = http.NGX_HTTP_VAR_NOCACHEABLE,
+        .index = 0,
+    }, http.ngx_http_variable_t{
+        .name = ngx_string("ngz_circuit_admission"),
+        .set_handler = null,
+        .get_handler = ngx_http_circuit_admission_variable,
         .data = 0,
         .flags = http.NGX_HTTP_VAR_NOCACHEABLE,
         .index = 0,

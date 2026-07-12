@@ -68,6 +68,9 @@ const cache_tags_store = extern struct {
     tag_count: usize,
     tags: [MAX_TAGS]TagEntry,
     tag_used: [MAX_TAGS]u8,
+    capture_invalid_rejected: u64,
+    capture_tag_capacity_rejected: u64,
+    capture_uri_capacity_rejected: u64,
 };
 
 var ngx_http_cache_tags_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_shm_zone_t);
@@ -264,7 +267,7 @@ fn findTag(store: [*c]cache_tags_store, tag: []const u8) ?*TagEntry {
 
 // Add a URI to a tag
 fn addUriToTag(tag_entry: *TagEntry, uri: []const u8) bool {
-    if (uri.len == 0 or uri.len > MAX_URI_LEN or tag_entry.uri_count >= MAX_URIS_PER_TAG) return false;
+    if (uri.len == 0 or uri.len > MAX_URI_LEN) return false;
 
     // Check if URI already exists
     for (0..tag_entry.uri_count) |i| {
@@ -275,6 +278,8 @@ fn addUriToTag(tag_entry: *TagEntry, uri: []const u8) bool {
         }
     }
 
+    if (tag_entry.uri_count >= MAX_URIS_PER_TAG) return false;
+
     const len = uri.len;
     @memcpy(tag_entry.uris[tag_entry.uri_count][0..len], uri[0..len]);
     tag_entry.uri_lens[tag_entry.uri_count] = len;
@@ -282,18 +287,45 @@ fn addUriToTag(tag_entry: *TagEntry, uri: []const u8) bool {
     return true;
 }
 
+fn associateTagWithUri(store: [*c]cache_tags_store, tag: []const u8, uri: []const u8) bool {
+    if (tag.len == 0 or tag.len > MAX_TAG_LEN) {
+        store.*.capture_invalid_rejected += 1;
+        return false;
+    }
+
+    const entry = findTag(store, tag) orelse blk: {
+        if (store.*.tag_count >= MAX_TAGS) {
+            store.*.capture_tag_capacity_rejected += 1;
+            return false;
+        }
+        break :blk findOrCreateTag(store, tag) orelse {
+            // A missing free slot despite a non-full count is still a capacity
+            // failure; never overwrite a live mapping to make room.
+            store.*.capture_tag_capacity_rejected += 1;
+            return false;
+        };
+    };
+
+    if (!addUriToTag(entry, uri)) {
+        store.*.capture_uri_capacity_rejected += 1;
+        return false;
+    }
+    return true;
+}
+
 // Parse comma-separated tags and associate with URI
 fn associateTagsWithUri(store: [*c]cache_tags_store, tags_str: []const u8, uri: []const u8) bool {
-    if (uri.len == 0 or uri.len > MAX_URI_LEN) return false;
+    if (uri.len == 0 or uri.len > MAX_URI_LEN) {
+        store.*.capture_invalid_rejected += 1;
+        return false;
+    }
     var complete = true;
     var start: usize = 0;
     for (tags_str, 0..) |c, i| {
         if (c == ',') {
             const tag = std.mem.trim(u8, tags_str[start..i], " \t");
             if (tag.len > 0) {
-                if (findOrCreateTag(store, tag)) |entry| {
-                    if (!addUriToTag(entry, uri)) complete = false;
-                } else complete = false;
+                if (!associateTagWithUri(store, tag, uri)) complete = false;
             }
             start = i + 1;
         }
@@ -301,11 +333,77 @@ fn associateTagsWithUri(store: [*c]cache_tags_store, tags_str: []const u8, uri: 
     // Handle last tag
     const tag = std.mem.trim(u8, tags_str[start..], " \t");
     if (tag.len > 0) {
-        if (findOrCreateTag(store, tag)) |entry| {
-            if (!addUriToTag(entry, uri)) complete = false;
-        } else complete = false;
+        if (!associateTagWithUri(store, tag, uri)) complete = false;
     }
     return complete;
+}
+
+fn jsonEscapedLen(input: []const u8) usize {
+    var len: usize = 0;
+    for (input) |byte| {
+        len += switch (byte) {
+            '"', '\\', '\x08', '\x0c', '\n', '\r', '\t' => 2,
+            0...0x07, 0x0b, 0x0e...0x1f => 6,
+            else => 1,
+        };
+    }
+    return len;
+}
+
+fn appendJsonEscaped(output: []u8, written: *usize, input: []const u8) void {
+    const hex = "0123456789abcdef";
+    for (input) |byte| {
+        switch (byte) {
+            '"' => {
+                output[written.*] = '\\';
+                output[written.* + 1] = '"';
+                written.* += 2;
+            },
+            '\\' => {
+                output[written.*] = '\\';
+                output[written.* + 1] = '\\';
+                written.* += 2;
+            },
+            '\x08' => {
+                output[written.*] = '\\';
+                output[written.* + 1] = 'b';
+                written.* += 2;
+            },
+            '\x0c' => {
+                output[written.*] = '\\';
+                output[written.* + 1] = 'f';
+                written.* += 2;
+            },
+            '\n' => {
+                output[written.*] = '\\';
+                output[written.* + 1] = 'n';
+                written.* += 2;
+            },
+            '\r' => {
+                output[written.*] = '\\';
+                output[written.* + 1] = 'r';
+                written.* += 2;
+            },
+            '\t' => {
+                output[written.*] = '\\';
+                output[written.* + 1] = 't';
+                written.* += 2;
+            },
+            0...0x07, 0x0b, 0x0e...0x1f => {
+                output[written.*] = '\\';
+                output[written.* + 1] = 'u';
+                output[written.* + 2] = '0';
+                output[written.* + 3] = '0';
+                output[written.* + 4] = hex[byte >> 4];
+                output[written.* + 5] = hex[byte & 0x0f];
+                written.* += 6;
+            },
+            else => {
+                output[written.*] = byte;
+                written.* += 1;
+            },
+        }
+    }
 }
 
 // Purge all URIs associated with a tag, returns count
@@ -417,44 +515,56 @@ export fn ngx_http_cache_tags_purge_handler(r: [*c]ngx_http_request_t) callconv(
         }
     }
 
-    // Build response
-    var response_buf: [1024]u8 = undefined;
-    var response_len: usize = 0;
-
     const store = getTagStore() orelse return NGX_ERROR;
     const shpool = getTagShpool() orelse return NGX_ERROR;
+    // A complete table can require more than the old fixed 1 KiB stack buffer.
+    // Allocate a bounded worst-case response before taking the SHM mutex.
+    const response_capacity = if (tag_to_purge) |tag|
+        128 + jsonEscapedLen(tag)
+    else
+        256 + MAX_TAGS * (64 + MAX_TAG_LEN * 6);
+    const response_data = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, response_capacity)) orelse return NGX_ERROR;
+    const response_buf = core.slicify(u8, response_data, response_capacity);
+    var response_len: usize = 0;
 
     shm.ngx_shmtx_lock(&shpool.*.mutex);
-    defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    {
+        defer shm.ngx_shmtx_unlock(&shpool.*.mutex);
 
-    if (tag_to_purge) |tag| {
-        const purged = purgeByTag(store, tag);
-        setCtxPurgeResult(r, tag, purged);
-        const result = std.fmt.bufPrint(&response_buf, "{{\"tag\":\"{s}\",\"purged\":{d}}}\n", .{ tag, purged }) catch {
-            return NGX_ERROR;
-        };
-        response_len = result.len;
-    } else {
-        // List all tags
-        var written: usize = 0;
-        written += (std.fmt.bufPrint(response_buf[written..], "{{\"tags\":[", .{}) catch return NGX_ERROR).len;
+        if (tag_to_purge) |tag| {
+            const purged = purgeByTag(store, tag);
+            setCtxPurgeResult(r, tag, purged);
+            var written: usize = 0;
+            written += (std.fmt.bufPrint(response_buf[written..], "{{\"tag\":\"", .{}) catch return NGX_ERROR).len;
+            appendJsonEscaped(response_buf, &written, tag);
+            written += (std.fmt.bufPrint(response_buf[written..], "\",\"purged\":{d},\"physical_cache_invalidated\":false}}\n", .{purged}) catch return NGX_ERROR).len;
+            response_len = written;
+        } else {
+            // List all tags and capture failures. The mutex covers only the
+            // bounded snapshot/formatting work, never response transmission.
+            var written: usize = 0;
+            written += (std.fmt.bufPrint(response_buf[written..], "{{\"tags\":[", .{}) catch return NGX_ERROR).len;
 
-        var first = true;
-        for (&store[0].tags, 0..) |*entry, i| {
-            if (store[0].tag_used[i] == @as(u8, 1)) {
-                const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
-                if (!first) {
-                    written += (std.fmt.bufPrint(response_buf[written..], ",", .{}) catch return NGX_ERROR).len;
+            var first = true;
+            for (&store[0].tags, 0..) |*entry, i| {
+                if (store[0].tag_used[i] == @as(u8, 1)) {
+                    const entry_tag: []const u8 = @ptrCast(entry.tag[0..entry.tag_len]);
+                    if (!first) {
+                        written += (std.fmt.bufPrint(response_buf[written..], ",", .{}) catch return NGX_ERROR).len;
+                    }
+                    written += (std.fmt.bufPrint(response_buf[written..], "{{\"tag\":\"", .{}) catch return NGX_ERROR).len;
+                    appendJsonEscaped(response_buf, &written, entry_tag);
+                    written += (std.fmt.bufPrint(response_buf[written..], "\",\"uris\":{d}}}", .{entry.uri_count}) catch return NGX_ERROR).len;
+                    first = false;
                 }
-                written += (std.fmt.bufPrint(response_buf[written..], "{{\"tag\":\"{s}\",\"uris\":{d}}}", .{
-                    entry_tag,
-                    entry.uri_count,
-                }) catch return NGX_ERROR).len;
-                first = false;
             }
+            written += (std.fmt.bufPrint(response_buf[written..], "],\"capture_rejections\":{{\"invalid\":{d},\"tag_capacity\":{d},\"uri_capacity\":{d}}}}}\n", .{
+                store.*.capture_invalid_rejected,
+                store.*.capture_tag_capacity_rejected,
+                store.*.capture_uri_capacity_rejected,
+            }) catch return NGX_ERROR).len;
+            response_len = written;
         }
-        written += (std.fmt.bufPrint(response_buf[written..], "]}}\n", .{}) catch return NGX_ERROR).len;
-        response_len = written;
     }
 
     // Set response headers
@@ -681,4 +791,19 @@ test "oversized tag and URI are rejected without consuming slots" {
     try std.testing.expect(!associateTagsWithUri(&store, &long_tag, "/ok"));
     try std.testing.expect(!associateTagsWithUri(&store, "ok", &long_uri));
     try expectEqual(@as(usize, 0), store.tag_count);
+    try expectEqual(@as(u64, 2), store.capture_invalid_rejected);
+}
+
+test "URI saturation is counted and does not reject an existing mapping" {
+    var store = std.mem.zeroes(cache_tags_store);
+    var uri_buf: [32]u8 = undefined;
+    for (0..MAX_URIS_PER_TAG) |i| {
+        const uri = try std.fmt.bufPrint(&uri_buf, "/items/{d}", .{i});
+        try std.testing.expect(associateTagsWithUri(&store, "items", uri));
+    }
+
+    try std.testing.expect(!associateTagsWithUri(&store, "items", "/items/overflow"));
+    try expectEqual(@as(u64, 1), store.capture_uri_capacity_rejected);
+    try std.testing.expect(associateTagsWithUri(&store, "items", "/items/0"));
+    try expectEqual(@as(u64, 1), store.capture_uri_capacity_rejected);
 }

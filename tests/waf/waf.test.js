@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { startNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
+import { startNginz, reloadNginz, stopNginz, cleanupRuntime, TEST_URL } from "../harness.js";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
@@ -125,6 +125,44 @@ function testConfigFailure(rulesFile) {
   } finally {
     rmSync(runtimeDir, { recursive: true, force: true });
   }
+}
+
+function writeWafSaturationConfig(path) {
+  const locations = Array.from({ length: 257 }, (_, index) => `
+        location = /capacity/${index} {
+            waf on;
+            waf_mode detect;
+            waf_sqli on;
+            waf_xss off;
+            waf_ban_threshold 1;
+            waf_ban_window ${index + 1};
+            waf_ban_duration 60;
+            add_header X-WAF-Ban-Entries $waf_ban_entries always;
+            add_header X-WAF-Ban-Capacity-Rejected $waf_ban_capacity_rejected always;
+            add_header X-WAF-Ban-Reclaimed $waf_ban_reclaimed always;
+            echozn "capacity response";
+        }`).join("\n");
+
+  writeFileSync(path, `worker_processes 2;
+daemon off;
+error_log logs/error.log notice;
+pid logs/nginx.pid;
+
+events {
+    worker_connections 128;
+}
+
+http {
+    access_log logs/access.log;
+    variables_hash_max_size 2048;
+    variables_hash_bucket_size 128;
+
+    server {
+        listen 8888;
+${locations}
+    }
+}
+`);
 }
 
 describe("waf module", () => {
@@ -378,6 +416,15 @@ describe("waf module", () => {
 
   // Body checking tests
   describe("body checking", () => {
+    test("rejects bodies above the configured WAF analysis limit", async () => {
+      const res = await fetchNoKeepAlive(`${TEST_URL}/body-limited`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `comment=${"safe".repeat(20)}`,
+      });
+      expect(res.status).toBe(413);
+    });
+
     test("blocks SQLi in POST body", async () => {
       const res = await fetchNoKeepAlive(`${TEST_URL}/body`, {
         method: "POST",
@@ -943,6 +990,48 @@ describe("waf module", () => {
       expect(res.headers.get("x-waf-rule-id")).toBe("3002");
       expect(Number(res.headers.get("x-waf-score"))).toBeGreaterThanOrEqual(1);
     });
+  });
+
+  describe("shared reputation capacity and reload", () => {
+    test("preserves active bans when the two-worker table is full and across reload", async () => {
+      const saturationConfigPath = join(stagedFixturesDir, "nginx-saturation.conf");
+      writeWafSaturationConfig(saturationConfigPath);
+
+      await stopNginz();
+      await startNginz(saturationConfigPath, MODULE);
+
+      try {
+        for (let index = 0; index < 257; index += 1) {
+          const res = await fetchNoKeepAlive(`${TEST_URL}/capacity/${index}?q=union%20select`);
+          expect(res.status).toBe(200);
+          expect(await res.text()).toContain("capacity response");
+        }
+
+        const saturated = await fetchNoKeepAlive(`${TEST_URL}/capacity/256?clean=1`);
+        expect(saturated.status).toBe(200);
+        expect(saturated.headers.get("x-waf-ban-entries")).toBe("256");
+        expect(saturated.headers.get("x-waf-ban-capacity-rejected")).toBe("1");
+        expect(saturated.headers.get("x-waf-ban-reclaimed")).toBe("0");
+
+        const preReloadBan = await fetchNoKeepAlive(`${TEST_URL}/capacity/0?clean=1`);
+        expect(preReloadBan.status).toBe(403);
+        expect((await preReloadBan.json()).rule).toBe("ban");
+
+        await reloadNginz();
+
+        const afterReloadMetrics = await fetchNoKeepAlive(`${TEST_URL}/capacity/256?clean=1`);
+        expect(afterReloadMetrics.status).toBe(200);
+        expect(afterReloadMetrics.headers.get("x-waf-ban-entries")).toBe("256");
+        expect(afterReloadMetrics.headers.get("x-waf-ban-capacity-rejected")).toBe("1");
+
+        const postReloadBan = await fetchNoKeepAlive(`${TEST_URL}/capacity/0?clean=1`);
+        expect(postReloadBan.status).toBe(403);
+        expect((await postReloadBan.json()).rule).toBe("ban");
+      } finally {
+        await stopNginz();
+        await startNginz(generatedConfigPath, MODULE);
+      }
+    }, 30000);
   });
 
   describe("configuration validation", () => {

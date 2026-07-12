@@ -45,6 +45,7 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
       });
       expect(res.status).toBe(200);
       const body = await res.json();
+      expect(body.retention_evicted).toBe(false);
       expect(body.status).toBe("published");
       publishedGens.push(body.generation);
     }
@@ -106,6 +107,8 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
         body: JSON.stringify({ type: "bulk", payload: String(i) }),
       });
       expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.retention_evicted).toBe(false);
     }
 
     const res = await fetch(`${TEST_URL}/worker-events`);
@@ -143,6 +146,8 @@ describe("worker-events Phase 2 - overflow semantics", () => {
         body: JSON.stringify({ type: "fill", payload: String(i) }),
       });
       expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.retention_evicted).toBe(false);
     }
 
     const res = await fetch(`${TEST_URL}/worker-events`);
@@ -161,6 +166,8 @@ describe("worker-events Phase 2 - overflow semantics", () => {
         body: JSON.stringify({ type: "overflow", payload: String(i) }),
       });
       expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.retention_evicted).toBe(true);
     }
 
     const res = await fetch(`${TEST_URL}/worker-events`);

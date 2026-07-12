@@ -30,8 +30,9 @@ This module should **not** own:
 - Exact and prefix invalidation remove matching entries from the shared `cache-tags` metadata store and return per-target accounting.
 - Exact invalidation uses a direct shared-store lookup/remove path; it does not scan the full tag table unless a broader match mode requires it.
 - The common exact single-target request shape `{"targets":["tag-a"]}` has a narrow fast path that skips the general JSON parser and falls back to the normal parser for any more complex body shape.
-- `cache_purge_worker_events_channel <channel>` optionally publishes purge notifications through the worker-events default zone.
+- `cache_purge_worker_events_zone <zone>` and `cache_purge_worker_events_channel <channel>` optionally publish purge notifications through an explicitly named worker-events zone.
 - `cache_purge_worker_events_mode <off|per_target|summary>` lets operators trade event detail for lower purge-path fanout cost.
+- Purge responses include `worker_events` accounting (`attempted`, `published`, `retention_evicted`, `failed`) whenever notifications are considered. `retention_evicted` is an accepted event that replaced the oldest retained ring entry, not a failed publication.
 - `cache_purge_authorize allowlist` gates the purge endpoint by client IP/CIDR via `cache_purge_allowlist`.
 - `cache_purge_match glob` and `cache_purge_authorize signed-token` remain config-time rejections until their cost and request contracts are defined.
 - `cache_purge_zone` is currently limited to the single cache-tags metadata store and only accepts `default` or `cache_tags_zone`.
@@ -62,7 +63,8 @@ This module should **not** own:
 | `cache_purge_allowlist` | `<ip-or-cidr> [ip-or-cidr ...]` | `location` | Define the client IP/CIDR allowlist used when `cache_purge_authorize allowlist` is enabled |
 | `cache_purge_max_keys` | `<count>` | `location` | Bound batch invalidation request size |
 | `cache_purge_worker_events_mode` | `<off|per_target|summary>` | `location` | Control whether successful purges emit no events, one event per mutated target, or one batch summary event |
-| `cache_purge_worker_events_channel` | `<channel>` | `location` | Optionally publish per-target invalidation events to the worker-events default zone |
+| `cache_purge_worker_events_zone` | `<zone>` | `location` | Explicit worker-events zone receiving purge notifications |
+| `cache_purge_worker_events_channel` | `<channel>` | `location` | Channel used within the configured worker-events zone |
 
 There is currently **no separate performance directive** for the fast exact-path behavior. If the request uses `cache_purge_match exact`, the module applies the cheaper path automatically when the body is the compact single-target JSON shape and falls back to the general parser otherwise.
 
@@ -270,7 +272,7 @@ Add optional advanced matching, authorization depth, and fanout integration.
 | `summary` | Multi-worker deployments doing high-fanout batch purges (many targets per POST). Emits one `purge_batch` event instead of one event per target, reducing event volume for consumers that only need to know *a batch happened*, not which tags. |
 | `off` | Single-worker nginx, or multi-worker setups where no consumer subscribes to purge events. Skips the worker-events mutex entirely. Use this in benchmarks and deployments where cross-worker cache invalidation notification is not needed. |
 
-If `cache_purge_worker_events_channel` is not set, no events are published regardless of mode, so the mode setting has no effect.
+If either `cache_purge_worker_events_zone` or `cache_purge_worker_events_channel` is not set, no events are published regardless of mode, so the mode setting has no effect.
 
 ### Observability
 
@@ -391,4 +393,4 @@ That architecture is sound. The risky part is the shared metadata design between
 
 ### Engineering Audit Verdict (2026-07-12)
 
-**Verdict: S1 DEPENDENCY LIFETIME FIXED; EVENT ACKNOWLEDGEMENT OPEN.** Cycle preconfiguration clears the cache-tags descriptor and API-enable state, and an enabled purge API now fails configuration when the canonical cache-tags owner/zone cannot be bound. Worker-events publication no longer sees a last-created/stale descriptor: the compatibility path fails on ambiguous multi-zone topology. The focused 39-case suite is green. Explicit named event-zone binding and surfacing publication failure in the purge response remain, as does the distinction between metadata deletion and physical nginx cache invalidation.
+**Verdict: S1 DEPENDENCY/CAPACITY/RELOAD/ACKNOWLEDGEMENT FIXED.** Cycle preconfiguration clears the cache-tags descriptor and API-enable state, and an enabled purge API now fails configuration when the canonical cache-tags owner/zone cannot be bound. Worker-events publication uses an explicit configured zone/channel pair, so multi-zone topology cannot cross-route purge events. A two-worker 256-tag saturation/reload proof confirms that pre-reload metadata and its rejection counters survive graceful reload and remain purgeable. A full worker-events ring retains its dropped-history accounting through reload and correctly reports the next post-reload overwrite. Responses distinguish an ordinary event publish, an accepted publish that evicted retained ring history, and a failure. Purge responses explicitly state `physical_cache_invalidated:false`; the operation deletes only shared tag metadata, not nginx cache files. The focused 41-case suite is green.

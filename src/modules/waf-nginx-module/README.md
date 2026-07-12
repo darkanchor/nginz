@@ -294,6 +294,9 @@ These variables are exposed per-request after the WAF access phase has run.
 | `$waf_rule_id` | decimal or not found | Numeric rule ID of the matched custom rule. Not found for built-in SQLi/XSS/ban matches (no rule ID). |
 | `$waf_score` | decimal | Current accumulated threat score for the client IP. `0` if score tracking is disabled or the IP has no recorded score. |
 | `$waf_category` | `sqli` / `xss` / `ban` / `rule` / not found | Category of the first detected threat. `rule` for custom file-driven rules. Not found if no threat was detected. |
+| `$waf_ban_entries` | decimal | Number of occupied shared reputation entries (maximum 256). |
+| `$waf_ban_capacity_rejected` | decimal | Cumulative new reputation identities rejected because all entries are live. Existing state is never evicted to make room. |
+| `$waf_ban_reclaimed` | decimal | Cumulative inactive entries safely reclaimed for a new identity. |
 
 These variables let `nginz-njs` scripted modules compose unified security decisions, add observability, or shape denial responses without duplicating WAF logic.
 
@@ -441,4 +444,4 @@ The next reputation-model step remains intentionally deferred. A first attempt a
 
 ### Engineering Audit Verdict (2026-07-12)
 
-**Verdict: S1 POLICY ISOLATION FIXED; CAPACITY PROOF OPEN.** Shared reputation entries are keyed by client IP and a stable hash of the effective location policy/rule source, so locations with different thresholds, windows, score policies, or rule files cannot reinterpret each other's state. The suite proves cross-location isolation. Saturation/eviction observability, bounded body/parser work, reload tests, and multi-worker stress proof remain open.
+**Verdict: S1 POLICY/BODY/CAPACITY/RELOAD FIXED.** Shared reputation entries are keyed by client IP and a stable hash of the effective location policy/rule source, so locations with different thresholds, windows, score policies, or rule files cannot reinterpret each other's state. `waf_body_max_size` (8 KiB default) rejects oversized inspected bodies with 413 rather than silently truncating rule evaluation. At capacity, only inactive entries are reclaimed; a new identity is counted and rejected rather than evicting an active ban. The exposed ban metrics and focused two-worker 257-policy proof show active bans and saturation counters survive graceful reload.

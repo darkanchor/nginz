@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import {
   startNginz,
+  reloadNginz,
   stopNginz,
   cleanupRuntime,
   TEST_URL,
@@ -156,6 +157,23 @@ describe("circuit-breaker module", () => {
 
       expect(upstream.getRequests().length).toBe(0);
     });
+
+    test("preserves an open two-worker circuit across graceful reload", async () => {
+      upstream.setFailureRate(1.0);
+      for (let i = 0; i < 3; i += 1) {
+        const res = await fetch(`${TEST_URL}/protected`);
+        expect(res.status).toBe(500);
+      }
+
+      await reloadNginz();
+      upstream.setFailureRate(0);
+      upstream.clearLog();
+
+      const blocked = await fetch(`${TEST_URL}/protected`);
+      expect(blocked.status).toBe(503);
+      expect(blocked.headers.get("X-Circuit-State")).toBe("open");
+      expect(upstream.getRequests()).toHaveLength(0);
+    });
   });
 
   describe("half-open state", () => {
@@ -203,6 +221,26 @@ describe("circuit-breaker module", () => {
       // Next request should also succeed
       const res2 = await fetch(`${TEST_URL}/fast`);
       expect(res2.status).toBe(200);
+    });
+
+    test("admits only one concurrent half-open recovery probe", async () => {
+      upstream.setFailureRate(1.0);
+      for (let i = 0; i < 3; i += 1) {
+        await fetch(`${TEST_URL}/fast`);
+      }
+
+      await Bun.sleep(1200);
+      upstream.setFailureRate(0);
+      upstream.setLatency(250);
+      upstream.clearLog();
+
+      const responses = await Promise.all(
+        Array.from({ length: 12 }, () => fetch(`${TEST_URL}/fast`)),
+      );
+      const statuses = responses.map((response) => response.status);
+      expect(statuses.filter((status) => status === 200)).toHaveLength(1);
+      expect(statuses.filter((status) => status === 503)).toHaveLength(11);
+      expect(upstream.getRequests()).toHaveLength(1);
     });
 
     test("re-opens circuit on failure in half-open state", async () => {
@@ -289,4 +327,5 @@ describe("circuit-breaker module", () => {
       expect(body).toBe("ok\n");
     });
   });
+
 });

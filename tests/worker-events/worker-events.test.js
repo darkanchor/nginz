@@ -150,6 +150,7 @@ describe("worker-events Phase 1 - publish and inspect", () => {
     expect(body.zone).toBe("bus");
     expect(body.channel).toBe("cache.invalidate");
     expect(body.generation).toBeGreaterThan(0);
+    expect(body.retention_evicted).toBe(false);
   });
 
   test("POST rejects missing type field", async () => {

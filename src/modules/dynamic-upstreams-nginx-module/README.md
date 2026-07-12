@@ -35,7 +35,7 @@ This module should **not** own:
 - Drain state remains separate from snapshot membership: `drain` / `undrain` update only the drain table consulted by `upstream-balancer` for new request selection.
 - `dynamic_upstreams_source static` plus `dynamic_upstreams_source_file` and `dynamic_upstreams_refresh` enables worker-0 polling of a JSON source file with no-op refresh on unchanged content.
 - `dynamic_upstreams_source consul` reconciles healthy instances from Consul’s `/v1/health/service/<name>?passing=true` endpoint, forwards optional `tag` / `dc` / token metadata, and treats an empty healthy result as a valid empty upstream snapshot.
-- Successful activation can publish a `snapshot_activated` event through `dynamic_upstreams_worker_events_channel`.
+- Successful activation can publish a `snapshot_activated` event through the explicit `dynamic_upstreams_worker_events_zone` and `dynamic_upstreams_worker_events_channel` pair.
 - Health-aware activation filters candidate peers through `ngz_healthcheck_is_peer_eligible()` before making a generation live.
 - Source-driven reconciliation still requires discovered peer addresses to be IP literals plus port; hostname resolution is not performed in this module.
 
@@ -67,7 +67,8 @@ This module should **not** own:
 | `dynamic_upstreams_source_file` | `<path>` | `location` | Provide the JSON snapshot file used by `dynamic_upstreams_source static` |
 | `dynamic_upstreams_target` | `<upstream_name>` | `location` | Bind the endpoint to an upstream group |
 | `dynamic_upstreams_refresh` | `<milliseconds>` | `location` | Configure background reconciliation cadence |
-| `dynamic_upstreams_worker_events_channel` | `<channel>` | `location` | Publish snapshot activation notifications to the worker-events default zone |
+| `dynamic_upstreams_worker_events_zone` | `<zone>` | `location` | Explicit worker-events zone for native notifications |
+| `dynamic_upstreams_worker_events_channel` | `<channel>` | `location` | Publish snapshot activation notifications to the configured worker-events zone |
 | `dynamic_upstreams_consul_address` | `<ip:port>` | `location` | Consul agent address (IP literal + port, default port 8500) |
 | `dynamic_upstreams_consul_service` | `<name>` | `location` | Consul service name to query via `/v1/health/service/<name>?passing=true` |
 | `dynamic_upstreams_consul_tag` | `<tag>` | `location` | Optional tag filter applied to the health query |

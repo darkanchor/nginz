@@ -449,14 +449,14 @@ This ordering is deliberate: **robustness first, performance second, feature gap
 | `requestid` | S1 fixed | checked entropy and bounded visible-ASCII propagated IDs |
 | `transform` | S1 buffering fixed | known-length 1 MiB default bound, consumed memory/file buffers, exact JSON media type; streaming remains deferred |
 | `prometheus` | pass, then S2 | reload-safe shared zone; per-request global mutex contention |
-| `circuit-breaker` | S0 fixed / S1 | saturation fails closed without aliasing; telemetry and half-open admission remain |
-| `cache-tags` | S1 integrity fixed | bounds/capacity reject with warning; counters/reload pressure remain |
-| `ratelimit` | S1 capacity fixed | live windows never evicted; collision identity/metrics remain |
+| `circuit-breaker` | S0 fixed / S1 | saturation fails closed without aliasing; single-probe half-open recovery and reload proof; telemetry remains |
+| `cache-tags` | S1 capacity/reload fixed | bounded rejection counters, full-table listing, and saturated-store graceful-reload proof |
+| `ratelimit` | S1 capacity/reload fixed | live windows never evicted; saturation/reclaim counters and two-worker reload proof; collision identity remains |
 | `graphql` | S1 heuristic fixed | bounded body/temp-file policy plus fail-closed fragments; a real parser/complexity model remains deferred |
 | `jsonschema` | S1 semantics fixed | unsupported vocabulary rejects config; bounded body/temp-file and exact JSON media policy added |
 | `echoz` | S0 fixed | lifetime-ordered null checks plus worker-survival regression |
-| `worker-events` | S0 fixed / S1 | cycle registry prevents stale/last-zone routing; explicit named native binding remains |
-| `cache-purge` | S1 partial | hard cache-tags dependency and safe event lifetime; named binding/ack remains |
+| `worker-events` | S0/S1 fixed | cycle registry, named native bindings, acknowledged append/overwrite/failure results, and two-worker full-ring reload proof |
+| `cache-purge` | S1 fixed | hard cache-tags dependency, safe event lifetime, named binding, saturated-store reload proof, and publish acknowledgement |
 | `consul` | S0 fixed / S1 | checked pool builders and complete bounded framing; chunked support deferred |
 | `redis` | S0 fixed / S1 | bounded RESP/JSON handling; larger incremental streaming deferred |
 | `wechatpay` | S0 fixed / S1 | verified TLS plus shared freshness/replay window; capacity/body bounds remain |
@@ -466,7 +466,7 @@ This ordering is deliberate: **robustness first, performance second, feature gap
 | `healthcheck` | S0 fixed / S1 | cycle globals fully reset; verified, event-driven probe I/O remains |
 | `upstream-balancer` | S0 fixed / proof | idempotent request cleanup and init-failure unpin added; stress proof remains |
 | `dynamic-upstreams` | S0 fixed / proof | traversals pin snapshots and drain readers lock; stress/reload proof remains |
-| `waf` | S1 isolation fixed | policy-scoped reputation prevents cross-location contamination; capacity/reload/multi-worker proof remains |
+| `waf` | S1 capacity/reload fixed | policy-scoped reputation, explicit body limit, live-entry-preserving saturation counters, and two-worker reload proof |
 | `acme` | S0 transport fixed / S1 | verified TLS, HTTPS default, and explicit private-CA live issuance fixed; negative TLS and capacity behavior need proof |
 | `njs` | S0 cleared / soak | composition passes 17/17 and 170/170 repeated after Redis/pgrest fixes |
 | `pgrest` | S0 fixed / S1 | per-worker pools keyed by backend and limit; capacity/teardown proof remains |
@@ -514,6 +514,17 @@ No SHM module is considered complete until its README/tests answer all of these:
 10. **Observability:** expose saturation, eviction, truncation, dropped events, allocation failure, and last error without requiring debug logs.
 
 ### S1 robustness program
+
+### Remaining S1 checklist (work in order)
+
+- [x] Give `healthcheck` an explicit worker-events zone binding and remove its default-zone routing.
+- [x] Surface named worker-events publish-result/drop acknowledgement for native publishers; cache-purge reports append/overwrite/failure counts.
+- [x] Expose WAF shared-table saturation counters and prove a full two-worker table preserves active bans through graceful reload. (Body processing is bounded by `waf_body_max_size`.)
+- [x] Prove cache-tags/cache-purge saturated shared metadata and rejection counters survive graceful reload. Physical cache eviction is explicitly out of scope, and responses declare metadata-only purge semantics.
+- [ ] Add ratelimit, circuit-breaker, ACME, OIDC, WeChat Pay, pgrest, and worker-events capacity/reload/cross-worker stress matrices.
+- [ ] Add TLS negative matrices: untrusted CA, hostname mismatch, expiration, and malformed/rotated trust material where applicable.
+- [ ] Finish bounded incremental framing for Consul/Redis/pgrest and move nftset Netlink I/O off request workers or enforce a strict latency budget.
+- [ ] Run the mandatory final `bun test` suite only after every focused S1 proof is green.
 
 After S0 is green:
 

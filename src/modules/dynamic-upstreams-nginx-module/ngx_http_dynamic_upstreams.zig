@@ -52,7 +52,8 @@ extern fn upstream_balancer_register_peer_source(
     vtable: ?*const PeerSourceVTable,
 ) callconv(.c) ngx_int_t;
 
-extern fn ngx_http_worker_events_publish_default(
+extern fn ngx_http_worker_events_publish_named(
+    zone_name: ngx_str_t,
     channel_str: ngx_str_t,
     type_str: ngx_str_t,
     payload_str: ngx_str_t,
@@ -120,6 +121,7 @@ const dynamic_upstreams_loc_conf = extern struct {
     refresh_ms: ngx_uint_t,
     target_uscf: [*c]ngx_http_upstream_srv_conf_t,
     worker_events_channel: ngx_str_t,
+    worker_events_zone: ngx_str_t,
     refresh_registered: ngx_flag_t,
     journal_path: ngx_str_t,
     journal_registered: ngx_flag_t,
@@ -321,16 +323,16 @@ fn record_store_success_locked(store: [*c]UpstreamStore) void {
     store.*.last_success_at_msec = currentTimeMsec();
 }
 
-fn publish_snapshot_event(channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, generation: u64, peer_count: usize) void {
-    publish_snapshot_event_type(ngx_string("snapshot_activated"), channel, target, source, generation, peer_count);
+fn publish_snapshot_event(zone: ngx_str_t, channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, generation: u64, peer_count: usize) void {
+    publish_snapshot_event_type(zone, ngx_string("snapshot_activated"), channel, target, source, generation, peer_count);
 }
 
-fn publish_snapshot_restored_event(channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, generation: u64, peer_count: usize) void {
-    publish_snapshot_event_type(ngx_string("snapshot_restored"), channel, target, source, generation, peer_count);
+fn publish_snapshot_restored_event(zone: ngx_str_t, channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, generation: u64, peer_count: usize) void {
+    publish_snapshot_event_type(zone, ngx_string("snapshot_restored"), channel, target, source, generation, peer_count);
 }
 
-fn publish_snapshot_event_type(event_type: ngx_str_t, channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, generation: u64, peer_count: usize) void {
-    if (channel.len == 0 or channel.data == null) return;
+fn publish_snapshot_event_type(zone: ngx_str_t, event_type: ngx_str_t, channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, generation: u64, peer_count: usize) void {
+    if (zone.len == 0 or zone.data == null or channel.len == 0 or channel.data == null) return;
     const source_slice = if (source.len == 0 or source.data == null)
         "static"
     else
@@ -343,11 +345,11 @@ fn publish_snapshot_event_type(event_type: ngx_str_t, channel: ngx_str_t, target
         .{ core.slicify(u8, target.data, target.len), source_slice, generation, peer_count },
     ) catch return;
     const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
-    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_named(zone, channel, event_type, payload_str);
 }
 
-fn publish_peer_drain_event(channel: ngx_str_t, target: ngx_str_t, event_type: ngx_str_t, address: []const u8, drain_count: u32, generation: u64) void {
-    if (channel.len == 0 or channel.data == null) return;
+fn publish_peer_drain_event(zone: ngx_str_t, channel: ngx_str_t, target: ngx_str_t, event_type: ngx_str_t, address: []const u8, drain_count: u32, generation: u64) void {
+    if (zone.len == 0 or zone.data == null or channel.len == 0 or channel.data == null) return;
 
     var payload_buf: [256]u8 = undefined;
     const payload = std.fmt.bufPrint(
@@ -356,11 +358,11 @@ fn publish_peer_drain_event(channel: ngx_str_t, target: ngx_str_t, event_type: n
         .{ core.slicify(u8, target.data, target.len), address, drain_count, generation },
     ) catch return;
     const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
-    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_named(zone, channel, event_type, payload_str);
 }
 
-fn publish_refresh_failed_event(channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, error_code: u32) void {
-    if (channel.len == 0 or channel.data == null) return;
+fn publish_refresh_failed_event(zone: ngx_str_t, channel: ngx_str_t, target: ngx_str_t, source: ngx_str_t, error_code: u32) void {
+    if (zone.len == 0 or zone.data == null or channel.len == 0 or channel.data == null) return;
 
     const event_type = ngx_string("refresh_failed");
     const source_slice = if (source.len == 0 or source.data == null)
@@ -375,13 +377,13 @@ fn publish_refresh_failed_event(channel: ngx_str_t, target: ngx_str_t, source: n
         .{ core.slicify(u8, target.data, target.len), source_slice, error_code },
     ) catch return;
     const payload_str = ngx_str_t{ .len = payload.len, .data = @constCast(payload.ptr) };
-    _ = ngx_http_worker_events_publish_default(channel, event_type, payload_str);
+    _ = ngx_http_worker_events_publish_named(zone, channel, event_type, payload_str);
 }
 
 fn record_refresh_failure(ducf: [*c]DynamicUpstreamsSrvConf, lccf: [*c]dynamic_upstreams_loc_conf, code: u32) void {
     record_store_error(ducf, code);
     if (lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
-        publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, code);
+        publish_refresh_failed_event(lccf.*.worker_events_zone, lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, code);
     }
 }
 
@@ -612,6 +614,7 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     lccf.*.refresh_ms = 0;
     lccf.*.target_uscf = core.nullptr(ngx_http_upstream_srv_conf_t);
     lccf.*.worker_events_channel = ngx_null_str;
+    lccf.*.worker_events_zone = ngx_null_str;
     lccf.*.refresh_registered = 0;
     lccf.*.journal_path = ngx_null_str;
     lccf.*.journal_registered = 0;
@@ -638,6 +641,7 @@ fn merge_loc_conf(cf: [*c]ngx_conf_t, parent: ?*anyopaque, child: ?*anyopaque) c
         c.*.target_uscf = prev.*.target_uscf;
     }
     if (c.*.worker_events_channel.len == 0) c.*.worker_events_channel = prev.*.worker_events_channel;
+    if (c.*.worker_events_zone.len == 0) c.*.worker_events_zone = prev.*.worker_events_zone;
     if (c.*.journal_path.len == 0) c.*.journal_path = prev.*.journal_path;
     if (c.*.consul_host.len == 0) c.*.consul_host = prev.*.consul_host;
     if (c.*.consul_port == 8500 and prev.*.consul_port != 8500) c.*.consul_port = prev.*.consul_port;
@@ -980,6 +984,19 @@ fn set_dynamic_upstreams_worker_events_channel(
         if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
             lccf.*.worker_events_channel = arg.*;
         }
+    }
+    return conf.NGX_CONF_OK;
+}
+
+fn set_dynamic_upstreams_worker_events_zone(
+    cf: [*c]ngx_conf_t,
+    cmd: [*c]ngx_command_t,
+    loc: ?*anyopaque,
+) callconv(.c) [*c]u8 {
+    _ = cmd;
+    if (core.castPtr(dynamic_upstreams_loc_conf, loc)) |lccf| {
+        var i: ngx_uint_t = 1;
+        if (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| lccf.*.worker_events_zone = arg.*;
     }
     return conf.NGX_CONF_OK;
 }
@@ -1889,11 +1906,11 @@ fn activate_snapshot_from_specs(
     shm.ngx_shmtx_unlock(&shpool.*.mutex);
     reap_draining(store, shpool);
 
-    if (lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
+    if (lccf.*.worker_events_zone.len > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
         if (publish_restored_event) {
-            publish_snapshot_restored_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, gen, eligible_count);
+            publish_snapshot_restored_event(lccf.*.worker_events_zone, lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, gen, eligible_count);
         } else {
-            publish_snapshot_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, gen, eligible_count);
+            publish_snapshot_event(lccf.*.worker_events_zone, lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, gen, eligible_count);
         }
     }
     write_journal_if_configured(lccf, eligible_specs, eligible_count, gen);
@@ -2350,8 +2367,9 @@ export fn du_patch_body_handler(r: [*c]ngx_http_request_t) callconv(.c) void {
 
     shm.ngx_shmtx_unlock(&shpool.*.mutex);
 
-    if (lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
+    if (lccf.*.worker_events_zone.len > 0 and lccf.*.worker_events_channel.len > 0 and lccf.*.worker_events_channel.data != null) {
         publish_peer_drain_event(
+            lccf.*.worker_events_zone,
             lccf.*.worker_events_channel,
             lccf.*.target,
             if (is_drain) ngx_string("peer_draining") else ngx_string("peer_undrained"),
@@ -2929,8 +2947,8 @@ fn run_refresh_entry(entry: *RefreshEntry, lg: [*c]ngx.log.ngx_log_t) void {
 
     const body_str = file.ngz_open_file(lccf.*.source_file, lg, pool) catch {
         record_store_error(ducf, DU_ERROR_SOURCE_READ_FAILED);
-        if (lccf.*.worker_events_channel.len > 0)
-            publish_refresh_failed_event(lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_SOURCE_READ_FAILED);
+        if (lccf.*.worker_events_zone.len > 0 and lccf.*.worker_events_channel.len > 0)
+            publish_refresh_failed_event(lccf.*.worker_events_zone, lccf.*.worker_events_channel, lccf.*.target, lccf.*.source, DU_ERROR_SOURCE_READ_FAILED);
         return;
     };
 
@@ -3139,6 +3157,14 @@ export const ngx_http_dynamic_upstreams_commands = [_]ngx_command_t{
         .name = ngx_string("dynamic_upstreams_refresh"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
         .set = set_dynamic_upstreams_refresh,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("dynamic_upstreams_worker_events_zone"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = set_dynamic_upstreams_worker_events_zone,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = 0,
         .post = null,

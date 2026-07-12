@@ -59,6 +59,8 @@ const ratelimit_store = extern struct {
     initialized: ngx_flag_t,
     entry_count: ngx_uint_t,
     entries: [MAX_ENTRIES]RateLimitEntry,
+    capacity_rejected: u64,
+    reclaimed_entries: u64,
 };
 
 var ngx_http_ratelimit_zone: [*c]core.ngx_shm_zone_t = core.nullptr(core.ngx_shm_zone_t);
@@ -162,8 +164,12 @@ fn getOrCreateEntry(store: *ratelimit_store, key_hash: u64, current_time: i64) ?
 
     // Never evict a live window: that resets another client's enforcement
     // budget.  Saturation is conservatively denied until an entry expires.
-    const entry = empty_entry orelse reusable_entry orelse return null;
+    const entry = empty_entry orelse reusable_entry orelse {
+        store.capacity_rejected += 1;
+        return null;
+    };
     if (entry.key_hash == 0) store.entry_count += 1;
+    if (entry.key_hash != 0) store.reclaimed_entries += 1;
     entry.* = .{
         .key_hash = key_hash,
         .count = 0,
@@ -403,6 +409,46 @@ fn ngx_http_ratelimit_cost_variable(
     return NGX_OK;
 }
 
+const RATELIMIT_METRIC_ENTRIES: core.uintptr_t = 0;
+const RATELIMIT_METRIC_CAPACITY_REJECTED: core.uintptr_t = 1;
+const RATELIMIT_METRIC_RECLAIMED: core.uintptr_t = 2;
+
+fn ngx_http_ratelimit_metric_variable(
+    r: [*c]ngx_http_request_t,
+    v: [*c]ngx_http_variable_value_t,
+    data: core.uintptr_t,
+) callconv(.c) ngx_int_t {
+    var value: u64 = 0;
+    if (getRateLimitShpool()) |shpool| {
+        shm.ngx_shmtx_lock(&shpool.*.mutex);
+        if (getRateLimitStore()) |store| {
+            value = switch (data) {
+                RATELIMIT_METRIC_ENTRIES => @intCast(store.*.entry_count),
+                RATELIMIT_METRIC_CAPACITY_REJECTED => store.*.capacity_rejected,
+                RATELIMIT_METRIC_RECLAIMED => store.*.reclaimed_entries,
+                else => 0,
+            };
+        }
+        shm.ngx_shmtx_unlock(&shpool.*.mutex);
+    }
+
+    var value_buf: [24]u8 = undefined;
+    const slice = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    const copied = ngx.string.ngx_string_from_pool(@constCast(slice.ptr), slice.len, r.*.pool) catch {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    v.*.data = copied.data;
+    v.*.flags.len = @intCast(copied.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
 fn normalizeVariableName(raw: []const u8) []const u8 {
     if (raw.len > 0 and raw[0] == '$') return raw[1..];
     return raw;
@@ -625,6 +671,9 @@ fn postconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
         http.ngx_http_variable_t{ .name = ngx_string("ratelimit_key"), .set_handler = null, .get_handler = ngx_http_ratelimit_key_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
         http.ngx_http_variable_t{ .name = ngx_string("ratelimit_source"), .set_handler = null, .get_handler = ngx_http_ratelimit_source_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
         http.ngx_http_variable_t{ .name = ngx_string("ratelimit_cost"), .set_handler = null, .get_handler = ngx_http_ratelimit_cost_variable, .data = 0, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("ratelimit_entries"), .set_handler = null, .get_handler = ngx_http_ratelimit_metric_variable, .data = RATELIMIT_METRIC_ENTRIES, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("ratelimit_capacity_rejected"), .set_handler = null, .get_handler = ngx_http_ratelimit_metric_variable, .data = RATELIMIT_METRIC_CAPACITY_REJECTED, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
+        http.ngx_http_variable_t{ .name = ngx_string("ratelimit_reclaimed"), .set_handler = null, .get_handler = ngx_http_ratelimit_metric_variable, .data = RATELIMIT_METRIC_RECLAIMED, .flags = http.NGX_HTTP_VAR_NOCACHEABLE, .index = 0 },
     };
     for (&vs) |*v| {
         if (http.ngx_http_add_variable(cf, &v.name, v.flags)) |x| {
@@ -724,4 +773,5 @@ test "full live table rejects a new key without evicting enforcement state" {
     const first_before = store.entries[0];
     try std.testing.expect(getOrCreateEntry(&store, MAX_ENTRIES + 10, now) == null);
     try std.testing.expectEqualDeep(first_before, store.entries[0]);
+    try expectEqual(@as(u64, 1), store.capacity_rejected);
 }
