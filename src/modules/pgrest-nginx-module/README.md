@@ -1315,6 +1315,14 @@ Error responses:
 | `pgrest_anon_role` | `pgrest_anon_role "role"` | `location` | — | PostgreSQL role to use when no valid JWT is provided. |
 | `pgrest_jwt_role_claim` | `pgrest_jwt_role_claim "claim"` | `location` | `role` | JWT claim name that contains the PostgreSQL role. |
 
+### Runtime diagnostics
+
+Routine pooled-connection state events (`pgrest-trace` and `pgrest-watch`) are
+debug-only and appear only with `error_log ... debug`. Timeouts and connection
+failures remain warning/error events. Long-running production configurations
+should normally use `error_log ... warn` and enable debug logging only for a
+bounded troubleshooting window.
+
 ## PostgREST Parity Matrix
 
 | Category | Status | Notes |

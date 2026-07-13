@@ -50,6 +50,15 @@ pub inline fn ngz_post_event(ev: [*c]ngx_event_t) void {
     }
 }
 
+/// Remove an event from nginx's posted-event queue. This mirrors the
+/// ngx_delete_posted_event() macro for connection owners that outlive a request.
+pub inline fn ngz_delete_posted_event(ev: [*c]ngx_event_t) void {
+    if (ev.*.flags.posted) {
+        ev.*.flags.posted = false;
+        ngx_queue.ngx_queue_remove(&ev.*.queue);
+    }
+}
+
 pub const NTimer = struct {
     const TimerUnit = extern struct {
         request: [*c]ngx_http_request_t,

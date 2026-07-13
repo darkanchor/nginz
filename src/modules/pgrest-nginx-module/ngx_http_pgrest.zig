@@ -14,6 +14,8 @@ const log = ngx.log;
 const cjson = ngx.cjson;
 const CJSON = cjson.CJSON;
 
+extern fn ngx_free_connection(c: [*c]core.ngx_connection_t) void;
+
 // libpq types and functions (re-exported from ngx_pq.zig)
 const PGconn = pq.PGconn;
 const PGresult = pq.PGresult;
@@ -202,14 +204,11 @@ const PgConnPool = struct {
 
     /// Release a connection back to pool
     pub fn releaseConn(self: *PgConnPool, pc: *PgPoolConn) void {
+        _ = self;
         if (pc.state == .conn_error or pc.conn == null) {
-            // Close failed connections
-            if (pc.conn != null) {
-                pgFinish(pc.conn);
-                pc.conn = null;
-            }
-            pc.state = .free;
-            if (self.active_count > 0) self.active_count -= 1;
+            // Failed connections must release both libpq's socket and the
+            // ngx_connection_t wrapper allocated around that socket.
+            cleanup_pool_conn(pc);
         } else {
             // Return to idle state for reuse
             pc.state = .idle;
@@ -228,17 +227,7 @@ fn is_pool_conn_reusable(pool_conn: *PgPoolConn) bool {
 fn discard_pool_conn(pool_conn: *PgPoolConn) void {
     pool_conn.state = .conn_error;
     pool_conn.request_ctx = null;
-    if (pool_conn.ngx_conn) |ngx_conn| {
-        if (ngx_conn.*.read != core.nullptr(core.ngx_event_t) and ngx_conn.*.read.*.flags.timer_set) {
-            event.ngx_event_del_timer(ngx_conn.*.read);
-        }
-        if (ngx_conn.*.write != core.nullptr(core.ngx_event_t) and ngx_conn.*.write.*.flags.timer_set) {
-            event.ngx_event_del_timer(ngx_conn.*.write);
-        }
-        ngx_conn.*.data = null;
-        pool_conn.ngx_conn = null;
-    }
-    pool_owner(pool_conn).releaseConn(pool_conn);
+    cleanup_pool_conn(pool_conn);
 }
 
 fn pool_owner(pool_conn: *PgPoolConn) *PgConnPool {
@@ -338,7 +327,7 @@ fn trace_pool_event(ctx: *PgRequestCtx, pool_conn: ?*PgPoolConn, event_name: []c
     const slot: usize = if (pool_conn) |pc| pool_slot_index(pc) else 9999;
     const fd: c_int = if (pool_conn) |pc| pc.fd else -1;
     const pool_state: c_int = if (pool_conn) |pc| @intFromEnum(pc.state) else -1;
-    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0,
+    log.ngz_log_debug(log.NGX_LOG_DEBUG_HTTP, r.*.connection.*.log, 0,
         "pgrest-trace req=%uz slot=%uz fd=%d event=%*s qstate=%d pstate=%d qseq=%uz",
         .{ ctx.*.trace_req_seq, slot, fd, @as(c_int, @intCast(ctx.*.trace_last_event_len)), &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state, ctx.*.trace_query_seq });
 }
@@ -392,13 +381,9 @@ fn get_or_create_pool(conninfo: []const u8, max_conn: usize) ?*PgConnPool {
 fn reset_pool_registry() void {
     for (g_conn_pools[0..g_conn_pool_count]) |*pool| {
         for (&pool.connections) |*pool_conn| {
-            if (pool_conn.conn) |conn| pgFinish(conn);
-            pool_conn.conn = null;
-            pool_conn.request_ctx = null;
-            if (pool_conn.ngx_conn) |ngx_conn| ngx_conn.*.data = null;
-            pool_conn.ngx_conn = null;
-            pool_conn.fd = -1;
-            pool_conn.state = .free;
+            if (pool_conn.conn != null or pool_conn.ngx_conn != null or pool_conn.state != .free) {
+                cleanup_pool_conn(pool_conn);
+            }
         }
         pool.init();
     }
@@ -1641,17 +1626,15 @@ fn log_pooled_event_watch_state(ctx: *PgRequestCtx, pool_conn: *PgPoolConn, labe
     if (ngx_conn.*.read == core.nullptr(core.ngx_event_t)) return;
 
     const rev = ngx_conn.*.read;
-    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0,
-        "pgrest-watch req=%uz slot=%uz fd=%d active=%d ready=%d timer=%d avail=%d",
-        .{
-            ctx.*.trace_req_seq,
-            pool_slot_index(pool_conn),
-            pool_conn.fd,
-            @as(c_int, if (rev.*.flags.active) 1 else 0),
-            @as(c_int, if (rev.*.flags.ready) 1 else 0),
-            @as(c_int, if (rev.*.flags.timer_set) 1 else 0),
-            rev.*.available,
-        });
+    log.ngz_log_debug(log.NGX_LOG_DEBUG_HTTP, r.*.connection.*.log, 0, "pgrest-watch req=%uz slot=%uz fd=%d active=%d ready=%d timer=%d avail=%d", .{
+        ctx.*.trace_req_seq,
+        pool_slot_index(pool_conn),
+        pool_conn.fd,
+        @as(c_int, if (rev.*.flags.active) 1 else 0),
+        @as(c_int, if (rev.*.flags.ready) 1 else 0),
+        @as(c_int, if (rev.*.flags.timer_set) 1 else 0),
+        rev.*.available,
+    });
 }
 
 fn set_pooled_timer_mode(ctx: *PgRequestCtx, pool_conn: *PgPoolConn, want_read: bool, want_write: bool) bool {
@@ -9298,19 +9281,33 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
 
 /// Clean up a pool connection entry
 fn cleanup_pool_conn(pool_conn: *PgPoolConn) void {
-    if (pool_conn.conn != null) {
-        pgFinish(pool_conn.conn);
-        pool_conn.conn = null;
-    }
+    const was_active = pool_conn.conn != null or pool_conn.ngx_conn != null or pool_conn.state != .free;
+
+    // The PostgreSQL fd is owned by libpq, while nginx owns the connection
+    // wrapper and event bookkeeping around the same fd. Return the wrapper to
+    // nginx first without closing the fd; PQfinish below remains the sole fd
+    // closer. This is the same ownership pattern used by llm-cost's writer.
     if (pool_conn.ngx_conn) |ngx_conn| {
         pool_conn.request_ctx = null;
+        if (ngx_conn.*.read != core.nullptr(core.ngx_event_t)) {
+            if (ngx_conn.*.read.*.flags.timer_set) event.ngx_event_del_timer(ngx_conn.*.read);
+            event.ngz_delete_posted_event(ngx_conn.*.read);
+        }
+        if (ngx_conn.*.write != core.nullptr(core.ngx_event_t)) {
+            if (ngx_conn.*.write.*.flags.timer_set) event.ngx_event_del_timer(ngx_conn.*.write);
+            event.ngz_delete_posted_event(ngx_conn.*.write);
+        }
         ngx_conn.*.data = null;
+        ngx_free_connection(ngx_conn);
+        ngx_conn.*.fd = -1;
         pool_conn.ngx_conn = null;
     }
+    if (pool_conn.conn) |conn| pgFinish(conn);
+    pool_conn.conn = null;
     pool_conn.state = .free;
     pool_conn.fd = -1;
     const owner = pool_owner(pool_conn);
-    if (owner.active_count > 0) {
+    if (was_active and owner.active_count > 0) {
         owner.active_count -= 1;
     }
 }

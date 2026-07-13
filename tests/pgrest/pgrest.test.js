@@ -2466,6 +2466,14 @@ describe("pgrest module", () => {
         headers: { Connection: "close" },
       });
       expect(afterReload.status).toBe(200);
+
+      // Retiring workers must return libpq's nginx connection wrappers before
+      // exit. Otherwise nginx reports "open socket ... left in connection" on
+      // every graceful reload. Routine pool traces are debug-only as well.
+      await Bun.sleep(500);
+      const errorLog = await Bun.file(`tests/${MODULE}/runtime/logs/error.log`).text();
+      expect(errorLog).not.toContain("open socket");
+      expect(errorLog).not.toMatch(/\[warn\].*pgrest-(trace|watch)/);
     });
   });
 });
