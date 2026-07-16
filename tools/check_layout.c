@@ -199,6 +199,7 @@ int main(void) {
     PRINT_SIZEOF(ngx_stream_phase_handler_t);
     PRINT_SIZEOF(ngx_stream_upstream_main_conf_t);
     PRINT_SIZEOF(ngx_stream_complex_value_t);
+    PRINT_SIZEOF(ngx_stream_script_engine_t);
 
     /* === Stream upstream structs === */
     PRINT_SIZEOF(ngx_stream_upstream_t);
@@ -311,11 +312,12 @@ int main(void) {
     PRINT_BITFIELD_OFFSET(ngx_http_v3_session_t, goaway);
 #if (NGX_STREAM)
     PRINT_BITFIELD_OFFSET(ngx_stream_upstream_server_t, backup);
-    PRINT_BITFIELD_OFFSET(ngx_stream_upstream_t, store);
-    PRINT_BITFIELD_OFFSET(ngx_stream_upstream_rr_peer_t, down);
+    PRINT_BITFIELD_OFFSET(ngx_stream_upstream_t, connected);
+    PRINT_BITFIELD_OFFSET(ngx_stream_upstream_rr_peer_t, zombie);
     PRINT_BITFIELD_OFFSET(ngx_stream_upstream_rr_peers_t, single);
-    PRINT_BITFIELD_OFFSET(ngx_stream_core_srv_conf_t, proxy_protocol);
+    PRINT_BITFIELD_OFFSET(ngx_stream_core_srv_conf_t, listen);
     PRINT_BITFIELD_OFFSET(ngx_stream_session_t, ssl);
+    PRINT_BITFIELD_OFFSET(ngx_stream_script_engine_t, flushed);
 #endif
 
     /* === Key offsets: ngx_http_upstream_t === */
@@ -363,6 +365,10 @@ int main(void) {
     PRINT_OFFSETOF(ngx_stream_upstream_t, peer);
     PRINT_OFFSETOF(ngx_stream_upstream_t, upstream);
     PRINT_OFFSETOF(ngx_stream_upstream_t, resolved);
+
+    /* === Key offsets: ngx_stream_script_engine_t === */
+    PRINT_OFFSETOF(ngx_stream_script_engine_t, end);
+    PRINT_OFFSETOF(ngx_stream_script_engine_t, status);
 #endif
 
     return 0;

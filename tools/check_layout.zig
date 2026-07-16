@@ -192,6 +192,7 @@ const sizeof_table = [_]SizeEntry{
     .{ .name = "ngx_stream_phase_handler_t", .zig_size = @sizeOf(vx.ngx_stream_phase_handler_t) },
     .{ .name = "ngx_stream_upstream_main_conf_t", .zig_size = @sizeOf(vx.ngx_stream_upstream_main_conf_t) },
     .{ .name = "ngx_stream_complex_value_t", .zig_size = @sizeOf(vx.ngx_stream_complex_value_t) },
+    .{ .name = "ngx_stream_script_engine_t", .zig_size = @sizeOf(vx.ngx_stream_script_engine_t) },
 
     // Stream upstream structs
     .{ .name = "ngx_stream_upstream_t", .zig_size = @sizeOf(vx.ngx_stream_upstream_t) },
@@ -262,6 +263,10 @@ const offsetof_table = [_]OffsetEntry{
     .{ .name = "ngx_stream_upstream_t", .field = "peer", .zig_offset = @offsetOf(vx.ngx_stream_upstream_t, "peer") },
     .{ .name = "ngx_stream_upstream_t", .field = "upstream", .zig_offset = @offsetOf(vx.ngx_stream_upstream_t, "upstream") },
     .{ .name = "ngx_stream_upstream_t", .field = "resolved", .zig_offset = @offsetOf(vx.ngx_stream_upstream_t, "resolved") },
+
+    // ngx_stream_script_engine_t
+    .{ .name = "ngx_stream_script_engine_t", .field = "end", .zig_offset = @offsetOf(vx.ngx_stream_script_engine_t, "end") },
+    .{ .name = "ngx_stream_script_engine_t", .field = "status", .zig_offset = @offsetOf(vx.ngx_stream_script_engine_t, "status") },
 };
 
 // Bitfield byte-offset checks.  One entry per field we want to verify.
@@ -412,6 +417,15 @@ const bitfield_table = [_]BitfieldEntry{
     .{ .name = "ngx_http_v2_stream_t", .field = "initialized", .zig_offset = flag_byte_offset(vx.ngx_http_v2_stream_t, "flags", "initialized"), .note = "http v2 stream flags" },
     .{ .name = "ngx_http_v2_out_frame_t", .field = "fin", .zig_offset = flag_byte_offset(vx.ngx_http_v2_out_frame_t, "flags", "fin"), .note = "http v2 out frame flags" },
     .{ .name = "ngx_http_v3_session_t", .field = "goaway", .zig_offset = flag_byte_offset(vx.ngx_http_v3_session_t, "flags", "goaway"), .note = "http v3 session flags" },
+
+    // Stream packed structs
+    .{ .name = "ngx_stream_upstream_server_t", .field = "backup", .zig_offset = flag_byte_offset(vx.ngx_stream_upstream_server_t, "flags", "backup"), .note = "stream upstream server flags" },
+    .{ .name = "ngx_stream_upstream_t", .field = "connected", .zig_offset = flag_byte_offset(vx.ngx_stream_upstream_t, "flags", "connected"), .note = "stream upstream flags" },
+    .{ .name = "ngx_stream_upstream_rr_peer_t", .field = "zombie", .zig_offset = flag_byte_offset(vx.ngx_stream_upstream_rr_peer_t, "flags", "zombie"), .note = "stream upstream zone peer flags" },
+    .{ .name = "ngx_stream_upstream_rr_peers_t", .field = "single", .zig_offset = flag_byte_offset(vx.ngx_stream_upstream_rr_peers_t, "flags", "single"), .note = "stream upstream peers flags" },
+    .{ .name = "ngx_stream_core_srv_conf_t", .field = "listen", .zig_offset = flag_byte_offset(vx.ngx_stream_core_srv_conf_t, "flags", "listen"), .note = "stream core server flags" },
+    .{ .name = "ngx_stream_session_t", .field = "ssl", .zig_offset = flag_byte_offset(vx.ngx_stream_session_t, "flags", "ssl"), .note = "stream session flags" },
+    .{ .name = "ngx_stream_script_engine_t", .field = "flushed", .zig_offset = flag_byte_offset(vx.ngx_stream_script_engine_t, "flags", "flushed"), .note = "stream script engine flags" },
 
     .{
         .name = "ngx_http_request_body_t",

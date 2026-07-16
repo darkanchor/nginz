@@ -1,7 +1,10 @@
 const std = @import("std");
 const common = @import("build_common.zig");
 
-const CHECK_C_FLAGS = common.C_FLAGS ++ [_][]const u8{"-D_GNU_SOURCE"};
+const CHECK_C_FLAGS = common.C_FLAGS ++ [_][]const u8{
+    "-D_GNU_SOURCE",
+    "-DNGX_STREAM=1",
+};
 
 pub fn addCheckLayoutSteps(
     b: *std.Build,

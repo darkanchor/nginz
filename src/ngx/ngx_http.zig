@@ -348,7 +348,7 @@ test "http" {
     try expectEqual(flag_byte_offset(ngx_http_request_t, "flags2", "http_minor"), 1400);
     try expectEqual(flag_byte_offset(ngx_http_request_t, "flags2", "http_major"), 1402);
 
-    try expectEqual(@sizeOf(ngx_http_script_engine_t), 88);
+    try expectEqual(@sizeOf(ngx_http_script_engine_t), 96);
     try expectEqual(@sizeOf(ngx_http_script_compile_t), 88);
     try expectEqual(@sizeOf(ngx_http_compile_complex_value_t), 32);
     try expectEqual(@sizeOf(ngx_http_script_regex_code_t), 72);
@@ -377,7 +377,7 @@ test "http" {
     try expectEqual(flag_byte_offset(ngx_http_cache_t, "flags", "lock"), 640);
     try expectEqual(flag_byte_offset(ngx_http_headers_in_t, "flags", "connection_type"), 376);
     try expectEqual(flag_byte_offset(ngx_http_connection_t, "flags", "ssl"), 64);
-    try expectEqual(flag_byte_offset(ngx_http_script_engine_t, "flags", "flushed"), 64);
+    try expectEqual(flag_byte_offset(ngx_http_script_engine_t, "flags", "flushed"), 72);
     try expectEqual(flag_byte_offset(ngx_http_script_compile_t, "flags", "compile_args"), 80);
     try expectEqual(flag_byte_offset(ngx_http_compile_complex_value_t, "flags", "zero"), 24);
     try expectEqual(flag_byte_offset(ngx_http_script_regex_code_t, "flags", "test"), 48);

@@ -423,8 +423,9 @@ pub const ngx_http_v3_srv_conf_t = extern struct {
 // =========================================================================
 // Stream types (from ngx_stream.h, ngx_stream_upstream.h, etc.)
 //
-// These are not auto-generated in ngx.zig because nginx is not
-// configured with --with-stream by default.
+// These are not auto-generated in ngx.zig.  They mirror the bundled nginx
+// configuration, including PCRE, stream upstream zones, and compatibility
+// fields.
 // =========================================================================
 
 const ngx_conf_t = ngx.ngx_conf_t;
@@ -432,12 +433,33 @@ const ngx_hash_t = ngx.ngx_hash_t;
 const ngx_log_t = ngx.ngx_log_t;
 const ngx_resolver_t = ngx.ngx_resolver_t;
 const ngx_resolver_ctx_t = ngx.ngx_resolver_ctx_t;
+const ngx_shm_zone_t = ngx.ngx_shm_zone_t;
+const ngx_slab_pool_t = ngx.ngx_slab_pool_t;
+const ngx_atomic_t = ngx.ngx_atomic_t;
 const ngx_variable_value_t = ngx.ngx_variable_value_t;
 const ngx_addr_t = ngx.ngx_addr_t;
 const uintptr_t = usize;
 
 // ngx_stream_variable_value_t is typedef'd to ngx_variable_value_t
 pub const ngx_stream_variable_value_t = ngx_variable_value_t;
+
+const ngx_stream_script_engine_flags_s = packed struct(u32) {
+    flushed: bool,
+    skip: bool,
+    padding: u30,
+};
+
+pub const ngx_stream_script_engine_t = extern struct {
+    ip: [*c]u_char = null,
+    pos: [*c]u_char = null,
+    end: [*c]u_char = null,
+    sp: [*c]ngx_stream_variable_value_t = null,
+    buf: ngx_str_t = .{ .len = 0, .data = null },
+    line: ngx_str_t = .{ .len = 0, .data = null },
+    flags: ngx_stream_script_engine_flags_s = @bitCast(@as(u32, 0)),
+    status: ngx_int_t = 0,
+    session: [*c]ngx_stream_session_t = null,
+};
 
 pub const ngx_stream_conf_ctx_t = extern struct {
     main_conf: [*c]?*anyopaque = null,
@@ -567,6 +589,8 @@ pub const ngx_stream_upstream_server_t = extern struct {
     slow_start: ngx_msec_t = 0,
     down: ngx_uint_t = 0,
     flags: ngx_stream_upstream_server_flags_s = @bitCast(@as(u32, 0)),
+    host: ngx_str_t = .{ .len = 0, .data = null },
+    service: ngx_str_t = .{ .len = 0, .data = null },
 };
 
 pub const ngx_stream_upstream_srv_conf_t = extern struct {
@@ -579,6 +603,9 @@ pub const ngx_stream_upstream_srv_conf_t = extern struct {
     line: ngx_uint_t = 0,
     port: u16 = 0, // in_port_t
     no_port: ngx_uint_t = 0,
+    shm_zone: [*c]ngx_shm_zone_t = null,
+    resolver: [*c]ngx_resolver_t = null,
+    resolver_timeout: ngx_msec_t = 0,
 };
 
 pub const ngx_stream_upstream_state_t = extern struct {
@@ -638,10 +665,11 @@ pub const ngx_stream_upstream_t = extern struct {
     flags: ngx_stream_upstream_flags_s = @bitCast(@as(u32, 0)),
 };
 
-// ngx_stream_upstream_rr_peer_t - with NGX_COMPAT_BEGIN(14)
-// Without NGX_STREAM_UPSTREAM_ZONE, spare slots remain at 14
+// ngx_stream_upstream_rr_peer_t - with NGX_STREAM_UPSTREAM_ZONE and
+// NGX_COMPAT_BEGIN(14).
 const ngx_stream_upstream_rr_peer_flags_s = packed struct(u32) {
-    padding: u32,
+    zombie: bool,
+    padding: u31,
 };
 
 pub const ngx_stream_upstream_rr_peer_t = extern struct {
@@ -664,6 +692,10 @@ pub const ngx_stream_upstream_rr_peer_t = extern struct {
     down: ngx_uint_t = 0,
     ssl_session: ?*anyopaque = null,
     ssl_session_len: c_int = 0,
+    flags: ngx_stream_upstream_rr_peer_flags_s = @bitCast(@as(u32, 0)),
+    lock: ngx_atomic_t = 0,
+    refs: ngx_uint_t = 0,
+    host: ?*anyopaque = null, // ngx_stream_upstream_host_t*
     next: [*c]ngx_stream_upstream_rr_peer_t = null,
     spare: [14]u64 = .{0} ** 14,
 };
@@ -679,6 +711,11 @@ const ngx_stream_upstream_rr_peers_flags_s = packed struct(u32) {
 
 pub const ngx_stream_upstream_rr_peers_t = extern struct {
     number: ngx_uint_t = 0,
+    shpool: [*c]ngx_slab_pool_t = null,
+    rwlock: ngx_atomic_t = 0,
+    config: [*c]ngx_uint_t = null,
+    resolve: [*c]ngx_stream_upstream_rr_peer_t = null,
+    zone_next: [*c]ngx_stream_upstream_rr_peers_t = null,
     total_weight: ngx_uint_t = 0,
     tries: ngx_uint_t = 0,
     flags: ngx_stream_upstream_rr_peers_flags_s = @bitCast(@as(u32, 0)),
@@ -752,6 +789,9 @@ pub const ngx_stream_session_t = extern struct {
     upstream: [*c]ngx_stream_upstream_t = null,
     upstream_states: [*c]ngx_array_t = null,
     variables: [*c]ngx_stream_variable_value_t = null,
+    ncaptures: ngx_uint_t = 0,
+    captures: [*c]c_int = null,
+    captures_data: [*c]u_char = null,
     phase_handler: ngx_int_t = 0,
     status: ngx_uint_t = 0,
     flags: ngx_stream_session_flags_s = @bitCast(@as(u32, 0)),
@@ -799,6 +839,10 @@ pub extern fn ngx_stream_complex_value(
 pub extern fn ngx_stream_compile_complex_value(
     ccv: [*c]ngx_stream_compile_complex_value_t,
 ) ngx_int_t;
+pub extern fn ngx_stream_script_check_length(
+    e: [*c]ngx_stream_script_engine_t,
+    len: usize,
+) ngx_int_t;
 
 // ngx_stream_filter_pt
 pub const ngx_stream_filter_pt = ?*const fn (
@@ -828,10 +872,12 @@ test "v3 structs" {
 }
 
 test "stream structs" {
-    try expectEqual(@sizeOf(ngx_stream_session_t) > 0, true);
+    try expectEqual(@sizeOf(ngx_stream_script_engine_t), 88);
+    try expectEqual(@sizeOf(ngx_stream_session_t), 152);
     try expectEqual(@sizeOf(ngx_stream_upstream_t) > 0, true);
     try expectEqual(@sizeOf(ngx_stream_module_t) > 0, true);
-    try expectEqual(@sizeOf(ngx_stream_upstream_srv_conf_t) > 0, true);
-    try expectEqual(@sizeOf(ngx_stream_upstream_rr_peer_t) > 0, true);
-    try expectEqual(@sizeOf(ngx_stream_upstream_rr_peers_t) > 0, true);
+    try expectEqual(@sizeOf(ngx_stream_upstream_server_t), 120);
+    try expectEqual(@sizeOf(ngx_stream_upstream_srv_conf_t), 120);
+    try expectEqual(@sizeOf(ngx_stream_upstream_rr_peer_t), 312);
+    try expectEqual(@sizeOf(ngx_stream_upstream_rr_peers_t), 96);
 }

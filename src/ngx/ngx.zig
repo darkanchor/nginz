@@ -2161,6 +2161,7 @@ const ngx_http_script_engine_flags_t = packed struct(u32) {
 pub const ngx_http_script_engine_t = extern struct {
     ip: [*c]u_char = @import("std").mem.zeroes([*c]u_char),
     pos: [*c]u_char = @import("std").mem.zeroes([*c]u_char),
+    end: [*c]u_char = @import("std").mem.zeroes([*c]u_char),
     sp: [*c]ngx_http_variable_value_t = @import("std").mem.zeroes([*c]ngx_http_variable_value_t),
     buf: ngx_str_t = @import("std").mem.zeroes(ngx_str_t),
     line: ngx_str_t = @import("std").mem.zeroes(ngx_str_t),

@@ -118,10 +118,11 @@ between Zig and C as inferred from the preceding field type:
 | 52| `ngx_http_v3_session_flags_s`         | u32     | payload_bytes: off_t| ok   |
 | 53| `ngx_stream_upstream_server_flags_s`  | u32     | down: ngx_uint_t    | ok   |
 | 54| `ngx_stream_upstream_flags_s`         | u32     | state: pointer      | ok   |
-| 55| `ngx_stream_upstream_rr_peer_flags_s` | u32     | (not used)          | n/a  |
+| 55| `ngx_stream_upstream_rr_peer_flags_s` | u32     | ssl_session_len: c_int | ok |
 | 56| `ngx_stream_upstream_rr_peers_flags_s`| u32     | tries: ngx_uint_t   | ok   |
 | 57| `ngx_stream_core_srv_conf_flags_s`    | u32     | proxy_protocol_timeout | ok|
 | 58| `ngx_stream_session_flags_s`          | u32     | status: ngx_uint_t  | ok   |
+| 59| `ngx_stream_script_engine_flags_s`    | u32     | line: ngx_str_t     | ok   |
 
 ### Confirmed C offsets (probe via `memset(0); a.field=1; scan`)
 

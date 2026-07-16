@@ -2441,14 +2441,13 @@ describe("pgrest module", () => {
       await stopNginz();
       await startNginz(`tests/${MODULE}/nginx-capacity-reload.conf`, MODULE);
 
-      const statuses = [];
-      for (let round = 0; round < 6; round++) {
-        const results = await Promise.all(Array.from({ length: 17 }, (_, i) =>
-          fetch(`${TEST_URL}/backend-${i}/users`, { headers: { Connection: "close" } })
-            .then((res) => res.status)
-        ));
-        statuses.push(...results);
-      }
+      // There are two workers with 16 backend-pool slots each. Sending 33
+      // distinct backends guarantees that one worker must reject its 17th;
+      // retrying only 17 backends can be split between workers indefinitely.
+      const statuses = await Promise.all(Array.from({ length: 33 }, (_, i) =>
+        fetch(`${TEST_URL}/backend-${i}/users`, { headers: { Connection: "close" } })
+          .then((res) => res.status)
+      ));
       expect(statuses).toContain(503);
 
       let retainedStatus = false;
@@ -2462,7 +2461,7 @@ describe("pgrest module", () => {
       expect(retainedStatus).toBe(true);
 
       await reloadNginz();
-      const afterReload = await fetch(`${TEST_URL}/backend-16/users`, {
+      const afterReload = await fetch(`${TEST_URL}/backend-32/users`, {
         headers: { Connection: "close" },
       });
       expect(afterReload.status).toBe(200);
