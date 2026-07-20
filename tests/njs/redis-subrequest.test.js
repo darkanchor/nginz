@@ -1,11 +1,24 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { startNginz, stopNginz, cleanupRuntime, TEST_URL, createRedisMock, MOCK_PORTS } from "../harness.js";
+import {
+  startNginz,
+  stopNginz,
+  cleanupRuntime,
+  TEST_URL,
+  createRedisMock,
+  MOCK_PORTS,
+  teardownModule,
+  prepareMockPorts,
+  testFetch,
+} from "../harness.js";
 
 const MODULE = "njs";
 let redisMock;
 
+
+
 describe("njs redis subrequest", () => {
   beforeAll(async () => {
+    await prepareMockPorts(MOCK_PORTS.REDIS);
     redisMock = createRedisMock(MOCK_PORTS.REDIS);
 
     // Pre-populate keys (keys include internal location prefix)
@@ -23,9 +36,7 @@ describe("njs redis subrequest", () => {
   });
 
   afterAll(async () => {
-    await stopNginz();
-    cleanupRuntime(MODULE);
-    redisMock?.stop();
+    await teardownModule(MODULE, [redisMock], [MOCK_PORTS.REDIS]);
   });
 
   // =========================================================================
@@ -34,14 +45,14 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest GET", () => {
     test("retrieves pre-populated value", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/get?key=mykey`);
+      const res = await testFetch(`/njs/redis/get?key=mykey`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe("hello-from-redis");
     });
 
     test("returns null for missing key", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/get?key=nope`);
+      const res = await testFetch(`/njs/redis/get?key=nope`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(null);
@@ -54,7 +65,7 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest SET", () => {
     test("writes value and returns ok", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/set?key=write-me`, {
+      const res = await testFetch(`/njs/redis/set?key=write-me`, {
         method: "POST",
         body: "subrequest-value",
       });
@@ -67,7 +78,7 @@ describe("njs redis subrequest", () => {
 
     test("preserves special characters", async () => {
       const raw = 'quotes " and\nnewlines';
-      const res = await fetch(`${TEST_URL}/njs/redis/set?key=special`, {
+      const res = await testFetch(`/njs/redis/set?key=special`, {
         method: "POST",
         body: raw,
       });
@@ -83,7 +94,7 @@ describe("njs redis subrequest", () => {
   describe("subrequest DEL", () => {
     test("deletes a key and returns count", async () => {
       redisMock.setValue("_redis/del/remove-me", "temp");
-      const res = await fetch(`${TEST_URL}/njs/redis/del?key=remove-me`, { method: "POST" });
+      const res = await testFetch(`/njs/redis/del?key=remove-me`, { method: "POST" });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(1);
@@ -91,7 +102,7 @@ describe("njs redis subrequest", () => {
     });
 
     test("returns 0 for non-existent key", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/del?key=no-such`, { method: "POST" });
+      const res = await testFetch(`/njs/redis/del?key=no-such`, { method: "POST" });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(0);
@@ -104,7 +115,7 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest INCR", () => {
     test("creates key with value 1", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/incr?key=fresh`, { method: "POST" });
+      const res = await testFetch(`/njs/redis/incr?key=fresh`, { method: "POST" });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(1);
@@ -113,7 +124,7 @@ describe("njs redis subrequest", () => {
 
     test("increments existing key", async () => {
       redisMock.setValue("_redis/incr/count", "5");
-      const res = await fetch(`${TEST_URL}/njs/redis/incr?key=count`, { method: "POST" });
+      const res = await testFetch(`/njs/redis/incr?key=count`, { method: "POST" });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(6);
@@ -127,7 +138,7 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest DECR", () => {
     test("creates key with value -1", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/decr?key=fresh`, { method: "POST" });
+      const res = await testFetch(`/njs/redis/decr?key=fresh`, { method: "POST" });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(-1);
@@ -136,7 +147,7 @@ describe("njs redis subrequest", () => {
 
     test("decrements existing key", async () => {
       redisMock.setValue("_redis/decr/count", "10");
-      const res = await fetch(`${TEST_URL}/njs/redis/decr?key=count`, { method: "POST" });
+      const res = await testFetch(`/njs/redis/decr?key=count`, { method: "POST" });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(9);
@@ -150,14 +161,14 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest EXISTS", () => {
     test("returns 1 for existing key", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/exists?key=yes-key`);
+      const res = await testFetch(`/njs/redis/exists?key=yes-key`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(1);
     });
 
     test("returns 0 for missing key", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/exists?key=no-key`);
+      const res = await testFetch(`/njs/redis/exists?key=no-key`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(0);
@@ -170,14 +181,14 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest TTL", () => {
     test("returns -1 for persistent key", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/ttl?key=persistent-key`);
+      const res = await testFetch(`/njs/redis/ttl?key=persistent-key`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(-1);
     });
 
     test("returns -2 for missing key", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/ttl?key=ghost`);
+      const res = await testFetch(`/njs/redis/ttl?key=ghost`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(-2);
@@ -190,7 +201,7 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest PING", () => {
     test("returns ok", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/ping`);
+      const res = await testFetch(`/njs/redis/ping`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.ok).toBe(true);
@@ -203,14 +214,14 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest STRLEN", () => {
     test("returns length of value", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/strlen?key=hello-key`);
+      const res = await testFetch(`/njs/redis/strlen?key=hello-key`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(5);
     });
 
     test("returns 0 for missing key", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/strlen?key=nope`);
+      const res = await testFetch(`/njs/redis/strlen?key=nope`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(0);
@@ -225,7 +236,7 @@ describe("njs redis subrequest", () => {
     test("fetches multiple keys via query string", async () => {
       redisMock.setValue("m1", "val1");
       redisMock.setValue("m2", "val2");
-      const res = await fetch(`${TEST_URL}/njs/redis/mget?keys=m1,m2`);
+      const res = await testFetch(`/njs/redis/mget?keys=m1,m2`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.values).toEqual(["val1", "val2"]);
@@ -233,7 +244,7 @@ describe("njs redis subrequest", () => {
 
     test("returns null for missing keys via query string", async () => {
       redisMock.setValue("m1", "val1");
-      const res = await fetch(`${TEST_URL}/njs/redis/mget?keys=m1,ghost,m3`);
+      const res = await testFetch(`/njs/redis/mget?keys=m1,ghost,m3`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.values).toEqual(["val1", null, null]);
@@ -246,7 +257,7 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest parallel", () => {
     test("fetches two keys concurrently", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/parallel?k1=p1&k2=p2`);
+      const res = await testFetch(`/njs/redis/parallel?k1=p1&k2=p2`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.k1.value).toBe("parallel-one");
@@ -260,14 +271,14 @@ describe("njs redis subrequest", () => {
 
   describe("subrequest HGET", () => {
     test("retrieves hash field", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/hget?key=h1&field=name`);
+      const res = await testFetch(`/njs/redis/hget?key=h1&field=name`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe("Alice");
     });
 
     test("returns null for missing field", async () => {
-      const res = await fetch(`${TEST_URL}/njs/redis/hget?key=h1&field=nope`);
+      const res = await testFetch(`/njs/redis/hget?key=h1&field=nope`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(null);
@@ -281,7 +292,7 @@ describe("njs redis subrequest", () => {
   describe("subrequest HSET", () => {
     test("sets a hash field and returns 1", async () => {
       redisMock.setValue("_redis/hset/h1", '{"existing":"old"}');
-      const res = await fetch(`${TEST_URL}/njs/redis/hset?key=h1&field=city`, {
+      const res = await testFetch(`/njs/redis/hset?key=h1&field=city`, {
         method: "POST",
         body: "Paris",
       });
@@ -295,7 +306,7 @@ describe("njs redis subrequest", () => {
 
     test("returns 0 for existing field", async () => {
       redisMock.setValue("_redis/hset/h2", '{"f1":"v1"}');
-      const res = await fetch(`${TEST_URL}/njs/redis/hset?key=h2&field=f1`, {
+      const res = await testFetch(`/njs/redis/hset?key=h2&field=f1`, {
         method: "POST",
         body: "updated",
       });
@@ -314,7 +325,7 @@ describe("njs redis subrequest", () => {
   describe("subrequest HDEL", () => {
     test("deletes a hash field and returns 1", async () => {
       redisMock.setValue("_redis/hdel/h1", '{"f1":"v1","f2":"v2"}');
-      const res = await fetch(`${TEST_URL}/njs/redis/hdel?key=h1&field=f1`, { method: "POST" });
+      const res = await testFetch(`/njs/redis/hdel?key=h1&field=f1`, { method: "POST" });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(1);
@@ -325,7 +336,7 @@ describe("njs redis subrequest", () => {
 
     test("returns 0 for non-existent field", async () => {
       redisMock.setValue("_redis/hdel/h2", '{"f1":"v1"}');
-      const res = await fetch(`${TEST_URL}/njs/redis/hdel?key=h2&field=ghost`, { method: "POST" });
+      const res = await testFetch(`/njs/redis/hdel?key=h2&field=ghost`, { method: "POST" });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe(0);

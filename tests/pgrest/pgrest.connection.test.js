@@ -9,11 +9,19 @@ let dnsErrorMock;
 async function runConnectionCase(configName, path = "/api/users") {
   await startNginz(`tests/${MODULE}/${configName}`, MODULE);
   try {
-    return await fetch(`${TEST_URL}${path}`);
+    return await fetchClose(`${TEST_URL}${path}`);
   } finally {
     await stopNginz();
     cleanupRuntime(MODULE);
   }
+}
+
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
 }
 
 describe("pgrest connection error handling", () => {

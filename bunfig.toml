@@ -1,3 +1,7 @@
 [test]
 preload = ["./tests/preload.js"]
 timeout = 10000
+# The harness keeps a process-global nginz instance on fixed ports (8888, mocks).
+# Parallel files race nginx listen ports / Bun mocks and stomp shared state.
+# Serialize so each suite owns the ports for the duration of its describes.
+maxConcurrency = 1

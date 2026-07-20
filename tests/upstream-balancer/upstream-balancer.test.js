@@ -60,6 +60,14 @@ function countOccurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("upstream-balancer", () => {
   let backend1;
   let backend2;
@@ -86,18 +94,18 @@ describe("upstream-balancer", () => {
   // --- Phase 1: Config parsing and basic proxying ---
 
   test("plain upstream (no sticky directives) proxies normally", async () => {
-    const res = await fetch(`${TEST_URL}/plain`);
+    const res = await fetchClose(`${TEST_URL}/plain`);
     expect(res.status).toBe(200);
     expect((await res.json()).server).toBe("backend1");
   });
 
   test("cookie upstream accepts config and proxies without a cookie (fallback next)", async () => {
-    const res = await fetch(`${TEST_URL}/cookie`);
+    const res = await fetchClose(`${TEST_URL}/cookie`);
     expect(res.status).toBe(200);
   });
 
   test("header upstream accepts config and proxies without the sticky header (fallback next)", async () => {
-    const res = await fetch(`${TEST_URL}/header`);
+    const res = await fetchClose(`${TEST_URL}/header`);
     expect(res.status).toBe(200);
   });
 
@@ -106,7 +114,7 @@ describe("upstream-balancer", () => {
   test("cookie affinity: same key routes to same backend across repeated requests", async () => {
     const servers = new Set();
     for (let i = 0; i < 5; i++) {
-      const res = await fetch(`${TEST_URL}/sticky`, {
+      const res = await fetchClose(`${TEST_URL}/sticky`, {
         headers: { Cookie: "route=stable-session-a" },
       });
       expect(res.status).toBe(200);
@@ -118,7 +126,7 @@ describe("upstream-balancer", () => {
 
   test("cookie affinity: different key is independently stable", async () => {
     const fetchServer = async (cookieVal) => {
-      const res = await fetch(`${TEST_URL}/sticky`, {
+      const res = await fetchClose(`${TEST_URL}/sticky`, {
         headers: { Cookie: `route=${cookieVal}` },
       });
       expect(res.status).toBe(200);
@@ -136,7 +144,7 @@ describe("upstream-balancer", () => {
 
   test("header affinity: same key proxies successfully on repeated requests", async () => {
     for (let i = 0; i < 3; i++) {
-      const res = await fetch(`${TEST_URL}/header`, {
+      const res = await fetchClose(`${TEST_URL}/header`, {
         headers: { "X-Sticky-Key": "client-session-42" },
       });
       expect(res.status).toBe(200);
@@ -144,7 +152,7 @@ describe("upstream-balancer", () => {
   });
 
   test("cookie present: proxies to the chosen backend (200)", async () => {
-    const res = await fetch(`${TEST_URL}/cookie`, {
+    const res = await fetchClose(`${TEST_URL}/cookie`, {
       headers: { Cookie: "route=explicit-user" },
     });
     expect(res.status).toBe(200);
@@ -152,20 +160,20 @@ describe("upstream-balancer", () => {
 
   test("cookie absent, fallback next: proxies to a backend (200)", async () => {
     // /cookie uses backend_cookie (fallback next) — missing cookie falls through to round-robin.
-    const res = await fetch(`${TEST_URL}/cookie`);
+    const res = await fetchClose(`${TEST_URL}/cookie`);
     expect(res.status).toBe(200);
   });
 
   test("cookie absent, fallback off: returns 502", async () => {
     // /fallback-off uses backend_fallback_off (fallback off) — missing cookie must fail cleanly.
-    const res = await fetch(`${TEST_URL}/fallback-off`);
+    const res = await fetchClose(`${TEST_URL}/fallback-off`);
     expect(res.status).toBe(502);
   });
 
   test("weighted sticky distribution favors the higher-weight peer", async () => {
     const counts = { backend1: 0, backend2: 0 };
     for (let i = 0; i < 64; i++) {
-      const res = await fetch(`${TEST_URL}/weighted`, {
+      const res = await fetchClose(`${TEST_URL}/weighted`, {
         headers: { Cookie: `route=weighted-key-${i}` },
       });
       expect(res.status).toBe(200);
@@ -175,14 +183,14 @@ describe("upstream-balancer", () => {
   });
 
   test("module can issue a sticky cookie and reuse it on the next request", async () => {
-    const first = await fetch(`${TEST_URL}/issue-cookie`);
+    const first = await fetchClose(`${TEST_URL}/issue-cookie`);
     expect(first.status).toBe(200);
     const firstBody = await first.json();
     const setCookie = first.headers.get("set-cookie");
     expect(setCookie).toContain("route=peer:");
 
     const issuedCookie = setCookie.split(";")[0];
-    const second = await fetch(`${TEST_URL}/issue-cookie`, {
+    const second = await fetchClose(`${TEST_URL}/issue-cookie`, {
       headers: { Cookie: issuedCookie },
     });
     expect(second.status).toBe(200);
@@ -190,7 +198,7 @@ describe("upstream-balancer", () => {
   });
 
   test("module rotates an invalid direct-peer cookie onto a live peer", async () => {
-    const res = await fetch(`${TEST_URL}/issue-cookie`, {
+    const res = await fetchClose(`${TEST_URL}/issue-cookie`, {
       headers: { Cookie: "route=peer:127.0.0.1:19999" },
     });
     expect(res.status).toBe(200);
@@ -200,7 +208,7 @@ describe("upstream-balancer", () => {
   });
 
   test("module respects custom cookie attributes when issuing affinity cookies", async () => {
-    const res = await fetch(`${TEST_URL}/issue-cookie-custom`);
+    const res = await fetchClose(`${TEST_URL}/issue-cookie-custom`);
     expect(res.status).toBe(200);
     const setCookie = res.headers.get("set-cookie");
     expect(setCookie).toContain("route=peer:");
@@ -210,18 +218,18 @@ describe("upstream-balancer", () => {
   });
 
   test("status endpoint exposes balancer counters", async () => {
-    await fetch(`${TEST_URL}/issue-cookie`);
-    await fetch(`${TEST_URL}/issue-cookie`, {
+    await fetchClose(`${TEST_URL}/issue-cookie`);
+    await fetchClose(`${TEST_URL}/issue-cookie`, {
       headers: { Cookie: "route=peer:127.0.0.1:19999" },
     });
-    await fetch(`${TEST_URL}/weighted`, {
+    await fetchClose(`${TEST_URL}/weighted`, {
       headers: { Cookie: "route=status-key" },
     });
-    await fetch(`${TEST_URL}/header`, {
+    await fetchClose(`${TEST_URL}/header`, {
       headers: { "X-Sticky-Key": "status-header-key" },
     });
 
-    const res = await fetch(`${TEST_URL}/balancer-status`);
+    const res = await fetchClose(`${TEST_URL}/balancer-status`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.module).toBe("upstream_balancer");
@@ -305,7 +313,7 @@ describe("upstream-balancer multi-worker consistency", () => {
   test("same cookie key resolves to the same backend across all workers (20 requests)", async () => {
     const servers = new Set();
     for (let i = 0; i < 20; i++) {
-      const res = await fetch(`${TEST_URL}/`, {
+      const res = await fetchClose(`${TEST_URL}/`, {
         headers: { Cookie: "route=cross-worker-stable" },
       });
       expect(res.status).toBe(200);
@@ -317,7 +325,7 @@ describe("upstream-balancer multi-worker consistency", () => {
 
   test("each distinct key is independently stable across workers", async () => {
     const fetchServer = async (key) => {
-      const res = await fetch(`${TEST_URL}/`, {
+      const res = await fetchClose(`${TEST_URL}/`, {
         headers: { Cookie: `route=${key}` },
       });
       expect(res.status).toBe(200);
@@ -361,14 +369,14 @@ describe("upstream-balancer round-robin state preservation", () => {
   test("sticky path still respects max_conns and falls through to another peer", async () => {
     const key = stickyKeyForPeer(0, 2, "max-conns");
 
-    const firstRequest = fetch(`${TEST_URL}/`, {
+    const firstRequest = fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${key}` },
     });
 
     await Bun.sleep(75);
 
     const secondStartedAt = Date.now();
-    const secondRes = await fetch(`${TEST_URL}/`, {
+    const secondRes = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${key}` },
     });
     const secondElapsedMs = Date.now() - secondStartedAt;
@@ -411,14 +419,14 @@ describe("upstream-balancer backup peer semantics", () => {
   });
 
   test("sticky maps only over primaries; fallback next may route to backup when primaries are unavailable", async () => {
-    const firstRequest = fetch(`${TEST_URL}/`, {
+    const firstRequest = fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: "route=backup-contract" },
     });
 
     await Bun.sleep(75);
 
     const secondStartedAt = Date.now();
-    const secondRes = await fetch(`${TEST_URL}/`, {
+    const secondRes = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: "route=backup-contract" },
     });
     const secondElapsedMs = Date.now() - secondStartedAt;
@@ -455,7 +463,7 @@ describe("upstream-balancer retry and failure accounting", () => {
     const key = stickyKeyForPeer(0, 2, "retry-failure");
     const errorLogPath = join(runtimeDir, "logs", "error.log");
 
-    const firstRes = await fetch(`${TEST_URL}/`, {
+    const firstRes = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${key}` },
     });
     expect(firstRes.status).toBe(200);
@@ -465,7 +473,7 @@ describe("upstream-balancer retry and failure accounting", () => {
     const firstConnectErrors = countOccurrences(afterFirst, "connect() failed");
     expect(firstConnectErrors).toBe(1);
 
-    const secondRes = await fetch(`${TEST_URL}/`, {
+    const secondRes = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${key}` },
     });
     expect(secondRes.status).toBe(200);
@@ -509,7 +517,7 @@ describe("upstream-balancer healthcheck integration", () => {
     const servers = new Set();
     // Use different keys to hit both peers via CRC32 % 2 distribution.
     for (const key of ["hc-key-a", "hc-key-b", "hc-key-c", "hc-key-d"]) {
-      const res = await fetch(`${TEST_URL}/`, {
+      const res = await fetchClose(`${TEST_URL}/`, {
         headers: { Cookie: `route=${key}` },
       });
       expect(res.status).toBe(200);
@@ -529,7 +537,7 @@ describe("upstream-balancer healthcheck integration", () => {
     // With only 1 eligible peer, every key maps to backend1.
     const servers = new Set();
     for (let i = 0; i < 8; i++) {
-      const res = await fetch(`${TEST_URL}/`, {
+      const res = await fetchClose(`${TEST_URL}/`, {
         headers: { Cookie: `route=hc-key-${i}` },
       });
       expect(res.status).toBe(200);
@@ -548,7 +556,7 @@ describe("upstream-balancer healthcheck integration", () => {
 
     const servers = new Set();
     for (let i = 0; i < 8; i++) {
-      const res = await fetch(`${TEST_URL}/`, {
+      const res = await fetchClose(`${TEST_URL}/`, {
         headers: { Cookie: `route=hc-recovering-${i}` },
       });
       expect(res.status).toBe(200);
@@ -562,7 +570,7 @@ describe("upstream-balancer healthcheck integration", () => {
 
     const servers = new Set();
     for (const key of ["hc-key-a", "hc-key-b", "hc-key-c", "hc-key-d"]) {
-      const res = await fetch(`${TEST_URL}/`, {
+      const res = await fetchClose(`${TEST_URL}/`, {
         headers: { Cookie: `route=${key}` },
       });
       expect(res.status).toBe(200);
@@ -574,20 +582,20 @@ describe("upstream-balancer healthcheck integration", () => {
   test("undrain does not bypass unhealthy or slow-start gating", async () => {
     const peer2Key = stickyKeyForPeer(1, 2, "hc-drain-peer2");
 
-    let res = await fetch(`${TEST_URL}/`, {
+    let res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${peer2Key}` },
     });
     expect(res.status).toBe(200);
     expect((await res.json()).server).toBe("backend2");
 
-    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "127.0.0.1:19003" }),
     });
     expect(res.status).toBe(200);
 
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${peer2Key}` },
     });
     expect(res.status).toBe(200);
@@ -596,14 +604,14 @@ describe("upstream-balancer healthcheck integration", () => {
     backend2.get("/probe", { status: 500, body: { status: "fail" } });
     await Bun.sleep(400);
 
-    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ undrain: "127.0.0.1:19003" }),
     });
     expect(res.status).toBe(200);
 
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${peer2Key}` },
     });
     expect(res.status).toBe(200);
@@ -612,14 +620,14 @@ describe("upstream-balancer healthcheck integration", () => {
     backend2.get("/probe", { status: 200, body: { status: "ok" } });
     await Bun.sleep(150);
 
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${peer2Key}` },
     });
     expect(res.status).toBe(200);
     expect((await res.json()).server).toBe("backend1");
 
     await Bun.sleep(350);
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${peer2Key}` },
     });
     expect(res.status).toBe(200);
@@ -654,7 +662,7 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
   });
 
   test("PATCH add appends a new peer without disturbing stable keys for unchanged order", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -666,13 +674,13 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
     });
 
     const stableKey = stickyKeyStableAcrossCounts(1, 2, 3, "append-stable-backend2");
-    let res = await fetch(`${TEST_URL}/`, {
+    let res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${stableKey}` },
     });
     expect(res.status).toBe(200);
     expect((await res.json()).server).toBe("backend2");
 
-    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -681,14 +689,14 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
     });
     expect(res.status).toBe(200);
 
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${stableKey}` },
     });
     expect(res.status).toBe(200);
     expect((await res.json()).server).toBe("backend2");
 
     const newPeerKey = stickyKeyForPeer(2, 3, "append-backend3");
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${newPeerKey}` },
     });
     expect(res.status).toBe(200);
@@ -696,7 +704,7 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
   });
 
   test("removed direct-peer cookies are treated as stale and rotated onto a live peer", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -707,14 +715,14 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
         ],
       }),
     });
-    let res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    let res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ remove: ["127.0.0.1:19002"] }),
     });
     expect(res.status).toBe(200);
 
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: "route=peer:127.0.0.1:19002" },
     });
     expect(res.status).toBe(200);
@@ -724,7 +732,7 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
   });
 
   test("draining direct-peer cookies are treated as stale and rotated onto a non-draining peer", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -734,14 +742,14 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
         ],
       }),
     });
-    let res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    let res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "127.0.0.1:19002" }),
     });
     expect(res.status).toBe(200);
 
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: "route=peer:127.0.0.1:19002" },
     });
     expect(res.status).toBe(200);
@@ -750,7 +758,7 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
   });
 
   test("draining and undraining a hashed sticky target remaps and restores deterministic selection", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -763,33 +771,33 @@ describe("upstream-balancer partial-mutation affinity regressions", () => {
 
     const peer1Key = stickyKeyForPeer(0, 2, "drain-remap-peer1");
 
-    let res = await fetch(`${TEST_URL}/`, {
+    let res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${peer1Key}` },
     });
     expect(res.status).toBe(200);
     expect((await res.json()).server).toBe("backend1");
 
-    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "127.0.0.1:19002" }),
     });
     expect(res.status).toBe(200);
 
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${peer1Key}` },
     });
     expect(res.status).toBe(200);
     expect((await res.json()).server).toBe("backend2");
 
-    res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ undrain: "127.0.0.1:19002" }),
     });
     expect(res.status).toBe(200);
 
-    res = await fetch(`${TEST_URL}/`, {
+    res = await fetchClose(`${TEST_URL}/`, {
       headers: { Cookie: `route=${peer1Key}` },
     });
     expect(res.status).toBe(200);

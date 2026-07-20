@@ -1,15 +1,26 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
-  startNginz, stopNginz, cleanupRuntime, TEST_URL,
-  createRedisMock, createPostgresMock, MOCK_PORTS,
+  startNginz,
+  stopNginz,
+  cleanupRuntime,
+  TEST_URL,
+  createRedisMock,
+  createPostgresMock,
+  MOCK_PORTS,
+  teardownModule,
+  prepareMockPorts,
+  testFetch,
 } from "../harness.js";
 
 const MODULE = "njs";
 let redisMock;
 let pgMock;
 
+
+
 describe("njs combo subrequest", () => {
   beforeAll(async () => {
+    await prepareMockPorts(MOCK_PORTS.REDIS, MOCK_PORTS.POSTGRES);
     redisMock = createRedisMock(MOCK_PORTS.REDIS);
     pgMock = createPostgresMock(MOCK_PORTS.POSTGRES);
 
@@ -65,10 +76,7 @@ describe("njs combo subrequest", () => {
   }, 30000);
 
   afterAll(async () => {
-    await stopNginz();
-    cleanupRuntime(MODULE);
-    redisMock?.stop();
-    pgMock?.stop();
+    await teardownModule(MODULE, [redisMock, pgMock], [MOCK_PORTS.REDIS, MOCK_PORTS.POSTGRES]);
   });
 
   // =========================================================================
@@ -77,7 +85,7 @@ describe("njs combo subrequest", () => {
 
   describe("redis write-then-read", () => {
     test("SET then GET returns the same value", async () => {
-      const res = await fetch(`${TEST_URL}/combo/redis-write-read`, {
+      const res = await testFetch(`/combo/redis-write-read`, {
         method: "POST", body: "hello-from-combo",
       });
       expect(res.status).toBe(200);
@@ -88,7 +96,7 @@ describe("njs combo subrequest", () => {
   });
 
   test("redis INCR twice", async () => {
-    const res = await fetch(`${TEST_URL}/combo/redis-incr-twice?key=incr-seq`, { method: "POST" });
+    const res = await testFetch(`/combo/redis-incr-twice?key=incr-seq`, { method: "POST" });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.first).toBe(1);
@@ -96,7 +104,7 @@ describe("njs combo subrequest", () => {
   });
 
   test("redis + pgrest parallel", async () => {
-    const res = await fetch(`${TEST_URL}/combo/redis-pgrest-parallel?rkey=cached-users`);
+    const res = await testFetch(`/combo/redis-pgrest-parallel?rkey=cached-users`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(JSON.parse(body.redis_value)[0].name).toBe("Cached-Alice");
@@ -104,13 +112,13 @@ describe("njs combo subrequest", () => {
   });
 
   test("conditional: cache HIT", async () => {
-    const res = await fetch(`${TEST_URL}/combo/conditional?key=cached-users`);
+    const res = await testFetch(`/combo/conditional?key=cached-users`);
     expect(res.status).toBe(200);
     expect(res.headers.get("x-cache")).toBe("HIT");
   });
 
   test("conditional: cache MISS → PGrest", async () => {
-    const res = await fetch(`${TEST_URL}/combo/conditional?key=no-such-cache`);
+    const res = await testFetch(`/combo/conditional?key=no-such-cache`);
     expect(res.status).toBe(200);
     expect(res.headers.get("x-cache")).toBe("MISS");
     const body = await res.json();
@@ -119,7 +127,7 @@ describe("njs combo subrequest", () => {
 
   describe("read-through cache", () => {
     test("MISS → PGrest → caches in Redis", async () => {
-      const res = await fetch(`${TEST_URL}/combo/read-through?key=read-through-test`);
+      const res = await testFetch(`/combo/read-through?key=read-through-test`);
       expect(res.status).toBe(200);
       expect(res.headers.get("x-cache")).toBe("MISS");
       const body = await res.json();
@@ -132,12 +140,12 @@ describe("njs combo subrequest", () => {
 
   describe("counter + data", () => {
     test("INCR + PGrest GET", async () => {
-      const r1 = await fetch(`${TEST_URL}/combo/counter-and-data?ckey=hits-2`);
+      const r1 = await testFetch(`/combo/counter-and-data?ckey=hits-2`);
       const b1 = await r1.json();
       expect(b1.hit_count).toBe(1);
       expect(b1.user_count).toBe(3);
 
-      const r2 = await fetch(`${TEST_URL}/combo/counter-and-data?ckey=hits-2`);
+      const r2 = await testFetch(`/combo/counter-and-data?ckey=hits-2`);
       const b2 = await r2.json();
       expect(b2.hit_count).toBe(2);
     });
@@ -150,7 +158,7 @@ describe("njs combo subrequest", () => {
   // 1. TTL-aware refresh
   describe("TTL-aware refresh", () => {
     test("reports TTL and current value", async () => {
-      const res = await fetch(`${TEST_URL}/combo/ttl-refresh?key=ttl-cached`);
+      const res = await testFetch(`/combo/ttl-refresh?key=ttl-cached`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.value).toBe("ttl-cached-value");
@@ -164,7 +172,7 @@ describe("njs combo subrequest", () => {
   // 2. DEL + refresh
   describe("DEL + refresh", () => {
     test("deletes old cache and refreshes from PGrest", async () => {
-      const res = await fetch(`${TEST_URL}/combo/del-refresh?key=stale-cache`);
+      const res = await testFetch(`/combo/del-refresh?key=stale-cache`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.deleted).toBe(1);
@@ -178,7 +186,7 @@ describe("njs combo subrequest", () => {
   describe("DECR rate gate", () => {
     test("allows request when quota remains", async () => {
       // Pre-set to 3, first DECR → 2, second → 1, third → 0, fourth → -1 (blocked)
-      const r1 = await fetch(`${TEST_URL}/combo/decr-gate?key=rate-limit`, { method: "POST" });
+      const r1 = await testFetch(`/combo/decr-gate?key=rate-limit`, { method: "POST" });
       const b1 = await r1.json();
       expect(b1.allowed).toBe(true);
       expect(b1.remaining).toBe(2);
@@ -187,9 +195,9 @@ describe("njs combo subrequest", () => {
 
     test("blocks request when quota exhausted", async () => {
       // After previous test: counter is at 2. DECR three more times.
-      await fetch(`${TEST_URL}/combo/decr-gate?key=rate-limit`, { method: "POST" }); // → 1
-      await fetch(`${TEST_URL}/combo/decr-gate?key=rate-limit`, { method: "POST" }); // → 0
-      const blocked = await fetch(`${TEST_URL}/combo/decr-gate?key=rate-limit`, { method: "POST" }); // → -1
+      await testFetch(`/combo/decr-gate?key=rate-limit`, { method: "POST" }); // → 1
+      await testFetch(`/combo/decr-gate?key=rate-limit`, { method: "POST" }); // → 0
+      const blocked = await testFetch(`/combo/decr-gate?key=rate-limit`, { method: "POST" }); // → -1
       expect(blocked.status).toBe(429);
       const body = await blocked.json();
       expect(body.error).toBe("rate_limited");
@@ -199,7 +207,7 @@ describe("njs combo subrequest", () => {
   // 4. Hash config → PGrest query
   describe("hash config query", () => {
     test("uses hash field to parametrize PGrest select", async () => {
-      const res = await fetch(`${TEST_URL}/combo/hash-config?hkey=query-config`);
+      const res = await testFetch(`/combo/hash-config?hkey=query-config`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.config_select).toBe("id,name");
@@ -215,7 +223,7 @@ describe("njs combo subrequest", () => {
   // 5. MGET batch + PGrest fallback
   describe("MGET batch fallback", () => {
     test("MGETs multiple keys and reports hits/misses", async () => {
-      const res = await fetch(`${TEST_URL}/combo/mget-fallback?keys=m1,m2,m3`);
+      const res = await testFetch(`/combo/mget-fallback?keys=m1,m2,m3`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.mget_values).toEqual(["val1", null, "val3"]);
@@ -229,7 +237,7 @@ describe("njs combo subrequest", () => {
   // 6. EXISTS guard → PGrest write
   describe("EXISTS guard", () => {
     test("allows write when guard key exists", async () => {
-      const res = await fetch(`${TEST_URL}/combo/exists-guard?key=guard-key`, {
+      const res = await testFetch(`/combo/exists-guard?key=guard-key`, {
         method: "POST",
         body: JSON.stringify({ name: "Guard-User", email: "guard@test.com" }),
       });
@@ -240,7 +248,7 @@ describe("njs combo subrequest", () => {
     });
 
     test("denies write when guard key is missing", async () => {
-      const res = await fetch(`${TEST_URL}/combo/exists-guard?key=no-guard`, {
+      const res = await testFetch(`/combo/exists-guard?key=no-guard`, {
         method: "POST",
         body: "{}",
       });
@@ -253,7 +261,7 @@ describe("njs combo subrequest", () => {
   // 7. PING health → PGrest
   describe("PING health gate", () => {
     test("queries PGrest when Redis is healthy", async () => {
-      const res = await fetch(`${TEST_URL}/combo/ping-gate`);
+      const res = await testFetch(`/combo/ping-gate`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.redis_healthy).toBe(true);
@@ -268,7 +276,7 @@ describe("njs combo subrequest", () => {
       redisMock.setValue("str-data", "short");
       redisMock.setValue("_redis/strlen/str-cached", "short");
 
-      const res = await fetch(`${TEST_URL}/combo/strlen-refresh?key=str-cached`);
+      const res = await testFetch(`/combo/strlen-refresh?key=str-cached`);
       expect(res.status).toBe(200);
       const body = await res.json();
       // "short" has length 5 < 10, so refresh should trigger

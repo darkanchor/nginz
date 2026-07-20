@@ -1,7 +1,30 @@
+import { spawnSync } from "bun";
 /**
  * Generic HTTP upstream mock server
  * Configurable responses for testing various scenarios
  */
+
+
+function killStaleListeners(port) {
+  try {
+    const ss = spawnSync(["ss", "-ltnp", `sport = :${port}`], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const raw = ss.stdout;
+    const text = raw == null
+      ? ""
+      : typeof raw === "string"
+        ? raw
+        : Buffer.from(raw).toString();
+    for (const match of text.matchAll(/pid=(\d+)/g)) {
+      const pid = Number(match[1]);
+      if (pid > 0 && pid !== process.pid) {
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+    }
+  } catch {}
+}
 
 export class HTTPMock {
   constructor(port = 9001) {
@@ -16,6 +39,7 @@ export class HTTPMock {
   }
 
   start() {
+    killStaleListeners(this.port);
     this.server = Bun.serve({
       port: this.port,
       fetch: (req) => this.handleRequest(req),
@@ -25,7 +49,14 @@ export class HTTPMock {
 
   stop() {
     if (this.server) {
-      this.server.stop();
+      // Force-close so the listen port is released promptly for the next suite.
+      try {
+        this.server.stop(true);
+      } catch {
+        try {
+          this.server.stop();
+        } catch {}
+      }
       this.server = null;
     }
     this.routes.clear();
@@ -407,17 +438,42 @@ export class ProxyMock extends HTTPMock {
   }
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function withBindRetry(factory, label, port) {
+  // Retry bind: sequential describes share mock ports and Bun.serve / Bun.listen
+  // can briefly reject re-bind after stop(true).
+  let lastError = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (attempt > 0) sleepSync(30 * attempt);
+    try {
+      return factory();
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error(`Failed to start ${label} on port ${port}`);
+}
+
 // Factory functions
 export function createHTTPMock(port = 9001) {
-  return new HTTPMock(port).start();
+  return withBindRetry(() => new HTTPMock(port).start(), "HTTP mock", port);
 }
 
 export function createStaticMock(port = 9002, files = {}) {
-  const mock = new StaticMock(port);
-  mock.addFiles(files);
-  return mock.start();
+  return withBindRetry(() => {
+    const mock = new StaticMock(port);
+    mock.addFiles(files);
+    return mock.start();
+  }, "static mock", port);
 }
 
 export function createProxyMock(port = 9003, targetUrl) {
-  return new ProxyMock(port, targetUrl).start();
+  return withBindRetry(
+    () => new ProxyMock(port, targetUrl).start(),
+    "proxy mock",
+    port,
+  );
 }

@@ -3,5 +3,5 @@
   "authorization_endpoint": "http://127.0.0.1:9999/authorize",
   "token_endpoint": "http://127.0.0.1:9999/token",
   "userinfo_endpoint": "http://127.0.0.1:9999/userinfo",
-  "jwks_uri": "/home/kaiwu/Documents/gitea/nginz/tests/oidc/jwks.json"
+  "jwks_uri": "tests/oidc/jwks.json"
 }

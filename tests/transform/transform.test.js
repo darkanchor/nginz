@@ -96,16 +96,24 @@ afterAll(async () => {
   cleanupRuntime(MODULE_NAME);
 });
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("transform_response directive", () => {
   test("extracts nested object with $.data path", async () => {
-    const res = await fetch(`${TEST_URL}/extract-object`);
+    const res = await fetchClose(`${TEST_URL}/extract-object`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({ value: 42, name: "test" });
   });
 
   test("extracts array with $.items path", async () => {
-    const res = await fetch(`${TEST_URL}/extract-array`);
+    const res = await fetchClose(`${TEST_URL}/extract-array`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toBeArray();
@@ -114,7 +122,7 @@ describe("transform_response directive", () => {
   });
 
   test("extracts nested value with $.data.value path", async () => {
-    const res = await fetch(`${TEST_URL}/extract-nested`);
+    const res = await fetchClose(`${TEST_URL}/extract-nested`);
     expect(res.status).toBe(200);
     const text = await res.text();
     // Parse as number since cJSON may add trailing characters
@@ -122,14 +130,14 @@ describe("transform_response directive", () => {
   });
 
   test("extracts array element with $.items.0 path", async () => {
-    const res = await fetch(`${TEST_URL}/extract-element`);
+    const res = await fetchClose(`${TEST_URL}/extract-element`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({ id: 1, name: "first" });
   });
 
   test("passes through response without transform directive", async () => {
-    const res = await fetch(`${TEST_URL}/passthrough`);
+    const res = await fetchClose(`${TEST_URL}/passthrough`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({
@@ -139,7 +147,7 @@ describe("transform_response directive", () => {
   });
 
   test("passes through when path does not exist", async () => {
-    const res = await fetch(`${TEST_URL}/invalid-path`);
+    const res = await fetchClose(`${TEST_URL}/invalid-path`);
     expect(res.status).toBe(200);
     const body = await res.json();
     // Original response passed through on transform failure
@@ -150,53 +158,53 @@ describe("transform_response directive", () => {
   });
 
   test("passes through non-JSON responses", async () => {
-    const res = await fetch(`${TEST_URL}/non-json`);
+    const res = await fetchClose(`${TEST_URL}/non-json`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toBe("plain text response");
   });
 
   test("transforms JSON responses with charset content-type", async () => {
-    const res = await fetch(`${TEST_URL}/json-charset`);
+    const res = await fetchClose(`${TEST_URL}/json-charset`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({ name: "charset-json", count: 7 });
   });
 
   test("extracts string values as JSON strings", async () => {
-    const res = await fetch(`${TEST_URL}/extract-string`);
+    const res = await fetchClose(`${TEST_URL}/extract-string`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toBe('"hello world"');
   });
 
   test("passes through invalid JSON bodies unchanged", async () => {
-    const res = await fetch(`${TEST_URL}/invalid-json-transform`);
+    const res = await fetchClose(`${TEST_URL}/invalid-json-transform`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toBe('{"data":');
   });
 
   test("transforms a response exactly at the configured buffer limit", async () => {
-    const res = await fetch(`${TEST_URL}/limit-exact`);
+    const res = await fetchClose(`${TEST_URL}/limit-exact`);
     expect(res.status).toBe(200);
     expect(await res.json()).toBe("x".repeat(117));
   });
 
   test("rejects a known response one byte above the configured buffer limit", async () => {
-    const res = await fetch(`${TEST_URL}/limit-over`);
+    const res = await fetchClose(`${TEST_URL}/limit-over`);
     expect(res.status).toBe(502);
     expect(await res.text()).toBe("");
   });
 
   test("does not transform JSON-like media types", async () => {
-    const res = await fetch(`${TEST_URL}/json-lookalike`);
+    const res = await fetchClose(`${TEST_URL}/json-lookalike`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ data: { leaked: true } });
   });
 
   test("matches the JSON media type case-insensitively", async () => {
-    const res = await fetch(`${TEST_URL}/json-case`);
+    const res = await fetchClose(`${TEST_URL}/json-case`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ case: "ok" });
   });

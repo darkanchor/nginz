@@ -8,6 +8,14 @@ import {
 
 const MODULE = "graphql";
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("graphql module", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
@@ -20,7 +28,7 @@ describe("graphql module", () => {
 
   describe("valid queries", () => {
     test("allows simple query under depth limit", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -34,7 +42,7 @@ describe("graphql module", () => {
 
     test("allows query at exact depth limit", async () => {
       // depth limit is 5 on /graphql
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -45,7 +53,7 @@ describe("graphql module", () => {
     });
 
     test("allows query with arguments", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -56,7 +64,7 @@ describe("graphql module", () => {
     });
 
     test("allows mutation queries", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -67,7 +75,7 @@ describe("graphql module", () => {
     });
 
     test("allows query with variables", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -79,7 +87,7 @@ describe("graphql module", () => {
     });
 
     test("allows query with operationName", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -94,7 +102,7 @@ describe("graphql module", () => {
   describe("depth limiting", () => {
     test("rejects query exceeding depth limit", async () => {
       // depth limit is 5 on /graphql, this is 6 levels deep
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -124,7 +132,7 @@ describe("graphql module", () => {
         }
       }`;
 
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: deepQuery }),
@@ -134,7 +142,7 @@ describe("graphql module", () => {
 
     test("shallow endpoint rejects depth 3", async () => {
       // /graphql-shallow has max_depth 2
-      const res = await fetch(`${TEST_URL}/graphql-shallow`, {
+      const res = await fetchClose(`${TEST_URL}/graphql-shallow`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -145,7 +153,7 @@ describe("graphql module", () => {
     });
 
     test("shallow endpoint allows depth 2", async () => {
-      const res = await fetch(`${TEST_URL}/graphql-shallow`, {
+      const res = await fetchClose(`${TEST_URL}/graphql-shallow`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -158,7 +166,7 @@ describe("graphql module", () => {
 
   describe("introspection control", () => {
     test("blocks __schema query when introspection disabled", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -172,7 +180,7 @@ describe("graphql module", () => {
     });
 
     test("blocks __type query when introspection disabled", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -185,7 +193,7 @@ describe("graphql module", () => {
     });
 
     test("allows __schema when introspection enabled", async () => {
-      const res = await fetch(`${TEST_URL}/graphql-introspection`, {
+      const res = await fetchClose(`${TEST_URL}/graphql-introspection`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -196,7 +204,7 @@ describe("graphql module", () => {
     });
 
     test("allows __type when introspection enabled", async () => {
-      const res = await fetch(`${TEST_URL}/graphql-introspection`, {
+      const res = await fetchClose(`${TEST_URL}/graphql-introspection`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -207,7 +215,7 @@ describe("graphql module", () => {
     });
 
     test("blocks introspection in nested field", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -218,7 +226,7 @@ describe("graphql module", () => {
     });
 
     test("does not treat introspection keywords inside strings as introspection", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -231,7 +239,7 @@ describe("graphql module", () => {
 
   describe("request handling", () => {
     test("rejects a request body above the configured module limit", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: `{ ${"field ".repeat(128)} }` }),
@@ -240,14 +248,14 @@ describe("graphql module", () => {
     });
 
     test("passes through GET requests without validation", async () => {
-      const res = await fetch(`${TEST_URL}/graphql?query={user{name}}`);
+      const res = await fetchClose(`${TEST_URL}/graphql?query={user{name}}`);
       // GET requests should pass through (GraphQL validation is for POST only)
       // The upstream will handle or reject GET as needed
       expect([200, 405]).toContain(res.status);
     });
 
     test("rejects invalid JSON body", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "not valid json {{{",
@@ -256,7 +264,7 @@ describe("graphql module", () => {
     });
 
     test("rejects missing query field", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -267,7 +275,7 @@ describe("graphql module", () => {
     });
 
     test("rejects empty query string", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -278,7 +286,7 @@ describe("graphql module", () => {
     });
 
     test("handles query with comments", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -297,7 +305,7 @@ describe("graphql module", () => {
     });
 
     test("handles query with string literals containing braces", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -308,7 +316,7 @@ describe("graphql module", () => {
     });
 
     test("handles block strings without counting braces or introspection text", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: '{ search(term: """{ __schema }""") { name } }' }),
@@ -317,7 +325,7 @@ describe("graphql module", () => {
     });
 
     test("rejects fragment syntax that the depth policy cannot safely expand", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: "query { user { ...UserFields } } fragment UserFields on User { name }" }),
@@ -327,7 +335,7 @@ describe("graphql module", () => {
     });
 
     test("rejects query with extra closing brace", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -341,7 +349,7 @@ describe("graphql module", () => {
     });
 
     test("rejects non-string query field", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -357,7 +365,7 @@ describe("graphql module", () => {
 
   describe("disabled mode", () => {
     test("passes any query when graphql disabled", async () => {
-      const res = await fetch(`${TEST_URL}/graphql-disabled`, {
+      const res = await fetchClose(`${TEST_URL}/graphql-disabled`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -368,7 +376,7 @@ describe("graphql module", () => {
     });
 
     test("passes introspection when graphql disabled", async () => {
-      const res = await fetch(`${TEST_URL}/graphql-disabled`, {
+      const res = await fetchClose(`${TEST_URL}/graphql-disabled`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -379,7 +387,7 @@ describe("graphql module", () => {
     });
 
     test("passes invalid JSON when graphql disabled", async () => {
-      const res = await fetch(`${TEST_URL}/graphql-disabled`, {
+      const res = await fetchClose(`${TEST_URL}/graphql-disabled`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "not json",
@@ -391,7 +399,7 @@ describe("graphql module", () => {
 
   describe("error response format", () => {
     test("returns GraphQL-formatted error for depth violation", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -408,7 +416,7 @@ describe("graphql module", () => {
     });
 
     test("returns GraphQL-formatted error for introspection violation", async () => {
-      const res = await fetch(`${TEST_URL}/graphql`, {
+      const res = await fetchClose(`${TEST_URL}/graphql`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

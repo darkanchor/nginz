@@ -11,6 +11,14 @@ import {
 const MODULE = "consul";
 let consulMock;
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("consul module", () => {
   beforeAll(async () => {
     // Start Consul mock
@@ -57,7 +65,7 @@ describe("consul module", () => {
 
   describe("service discovery", () => {
     test("fetches service instances by name from URI", async () => {
-      const res = await fetch(`${TEST_URL}/services/api-service`);
+      const res = await fetchClose(`${TEST_URL}/services/api-service`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -73,7 +81,7 @@ describe("consul module", () => {
     });
 
     test("fetches service with fixed name from config", async () => {
-      const res = await fetch(`${TEST_URL}/api-service`);
+      const res = await fetchClose(`${TEST_URL}/api-service`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -82,7 +90,7 @@ describe("consul module", () => {
     });
 
     test("returns empty array for non-existent service", async () => {
-      const res = await fetch(`${TEST_URL}/services/non-existent`);
+      const res = await fetchClose(`${TEST_URL}/services/non-existent`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -90,7 +98,7 @@ describe("consul module", () => {
     });
 
     test("fetches another service", async () => {
-      const res = await fetch(`${TEST_URL}/services/backend-service`);
+      const res = await fetchClose(`${TEST_URL}/services/backend-service`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -107,7 +115,7 @@ describe("consul module", () => {
       }]);
       consulMock.setHealthBehavior({ rawBody, chunked: true });
       try {
-        const res = await fetch(`${TEST_URL}/services/chunked-service`);
+        const res = await fetchClose(`${TEST_URL}/services/chunked-service`);
         expect(res.status).toBe(200);
         const body = await res.json();
         expect(body.services).toEqual([{
@@ -122,21 +130,21 @@ describe("consul module", () => {
     });
 
     test("renders responses larger than the old 8 KiB scratch buffer safely", async () => {
-      const res = await fetch(`${TEST_URL}/services/large-service`);
+      const res = await fetchClose(`${TEST_URL}/services/large-service`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.services).toHaveLength(80);
       expect(body.services[0].id).toBe('instance-0-"quoted"');
       expect(body.services[0].tags[1]).toBe("tag-0-\\escaped");
 
-      const followup = await fetch(`${TEST_URL}/services/api-service`);
+      const followup = await fetchClose(`${TEST_URL}/services/api-service`);
       expect(followup.status).toBe(200);
     });
 
     test("applies configured tag filter and forwards dc/token query metadata", async () => {
       consulMock.clearLog();
 
-      const res = await fetch(`${TEST_URL}/api-primary`);
+      const res = await fetchClose(`${TEST_URL}/api-primary`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -155,7 +163,7 @@ describe("consul module", () => {
     test("filters out critical instances when passing-only query is used", async () => {
       consulMock.setServiceHealth("api-service", "api-2", "critical");
 
-      const res = await fetch(`${TEST_URL}/services/api-service`);
+      const res = await fetchClose(`${TEST_URL}/services/api-service`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -166,7 +174,7 @@ describe("consul module", () => {
     });
 
     test("exposes healthy service count variable on service responses", async () => {
-      const res = await fetch(`${TEST_URL}/services/api-service`);
+      const res = await fetchClose(`${TEST_URL}/services/api-service`);
       expect(res.status).toBe(200);
       expect(res.headers.get("x-consul-service-healthy-count")).toBe("2");
       expect(res.headers.get("x-consul-lookup-error")).toBeNull();
@@ -175,7 +183,7 @@ describe("consul module", () => {
 
   describe("KV store", () => {
     test("fetches value by key from URI", async () => {
-      const res = await fetch(`${TEST_URL}/kv/config/app/timeout`);
+      const res = await fetchClose(`${TEST_URL}/kv/config/app/timeout`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -183,7 +191,7 @@ describe("consul module", () => {
     });
 
     test("fetches value with fixed key from config", async () => {
-      const res = await fetch(`${TEST_URL}/config/timeout`);
+      const res = await fetchClose(`${TEST_URL}/config/timeout`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -191,7 +199,7 @@ describe("consul module", () => {
     });
 
     test("fetches another KV value", async () => {
-      const res = await fetch(`${TEST_URL}/kv/config/app/retries`);
+      const res = await fetchClose(`${TEST_URL}/kv/config/app/retries`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -199,7 +207,7 @@ describe("consul module", () => {
     });
 
     test("returns null for non-existent key", async () => {
-      const res = await fetch(`${TEST_URL}/kv/config/non-existent`);
+      const res = await fetchClose(`${TEST_URL}/kv/config/non-existent`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -210,7 +218,7 @@ describe("consul module", () => {
     });
 
     test("preserves empty string KV values instead of converting them to null", async () => {
-      const res = await fetch(`${TEST_URL}/config/empty`);
+      const res = await fetchClose(`${TEST_URL}/config/empty`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -220,7 +228,7 @@ describe("consul module", () => {
     });
 
     test("returns JSON-safe escaped KV values", async () => {
-      const res = await fetch(`${TEST_URL}/config/json`);
+      const res = await fetchClose(`${TEST_URL}/config/json`);
       expect(res.status).toBe(200);
 
       const text = await res.text();
@@ -231,7 +239,7 @@ describe("consul module", () => {
     });
 
     test("exposes KV hit variables on successful lookups", async () => {
-      const res = await fetch(`${TEST_URL}/config/timeout`);
+      const res = await fetchClose(`${TEST_URL}/config/timeout`);
       expect(res.status).toBe(200);
       expect(res.headers.get("x-consul-kv-found")).toBe("1");
       expect(res.headers.get("x-consul-kv-value")).toBe("30");
@@ -241,7 +249,7 @@ describe("consul module", () => {
     test("exposes lookup_error on upstream failure", async () => {
       consulMock.setKVError("config/app/error", 500, '{"error":"boom"}');
 
-      const res = await fetch(`${TEST_URL}/config/error`);
+      const res = await fetchClose(`${TEST_URL}/config/error`);
       expect(res.status).toBe(502);
       expect(res.headers.get("x-consul-lookup-error")).toBe("consul_error");
       expect(res.headers.get("x-consul-kv-found")).toBe("0");
@@ -253,7 +261,7 @@ describe("consul module", () => {
 
   describe("catalog", () => {
     test("lists all registered services", async () => {
-      const res = await fetch(`${TEST_URL}/catalog`);
+      const res = await fetchClose(`${TEST_URL}/catalog`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -266,7 +274,7 @@ describe("consul module", () => {
 
   describe("error handling", () => {
     test("only allows GET requests", async () => {
-      const res = await fetch(`${TEST_URL}/services/api-service`, {
+      const res = await fetchClose(`${TEST_URL}/services/api-service`, {
         method: "POST",
       });
       expect(res.status).toBe(405);

@@ -1,7 +1,13 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { existsSync, readFileSync, unlinkSync } from "fs";
 import { join } from "path";
-import { startNginz, stopNginz, cleanupRuntime as cleanupHarnessRuntime, TEST_URL } from "../harness.js";
+import {
+  startNginz,
+  stopNginz,
+  cleanupRuntime as cleanupHarnessRuntime,
+  ensurePortFree,
+  TEST_URL,
+} from "../harness.js";
 
 const MODULE = "acme";
 const DOMAIN = "live-acme.test";
@@ -127,7 +133,9 @@ function stopContainer(name) {
 }
 
 function triggerAcmeFlow() {
-  return fetch(`${TEST_URL}/.well-known/acme-trigger`).then(async (res) => {
+  return fetchClose(`${TEST_URL}/.well-known/acme-trigger`, {
+    headers: { Connection: "close" },
+  }).then(async (res) => {
     const body = await res.text();
     try {
       return JSON.parse(body);
@@ -142,7 +150,9 @@ async function waitForRunnerReady(timeout = 10000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     try {
-      const res = await fetch(`${TEST_URL}/ready`);
+      const res = await fetchClose(`${TEST_URL}/ready`, {
+        headers: { Connection: "close" },
+      });
       if (res.status === 200 && (await res.text()).includes("ready ok")) {
         return;
       }
@@ -171,7 +181,7 @@ async function waitForPebbleReady(timeout = 10000) {
   throw new Error("Timeout waiting for Pebble");
 }
 
-async function triggerUntilIssued({ maxSteps = 24 } = {}) {
+async function triggerUntilIssued({ maxSteps = 48, stepDelayMs = 100 } = {}) {
   const accountKeyPath = join(STORAGE_DIR, "account.key");
   const certPath = join(STORAGE_DIR, "certs", DOMAIN, "fullchain.pem");
   const keyPath = join(STORAGE_DIR, "certs", DOMAIN, "privkey.pem");
@@ -185,7 +195,7 @@ async function triggerUntilIssued({ maxSteps = 24 } = {}) {
     if (issuedArtifactsReady({ accountKeyPath, certPath, keyPath })) {
       return last;
     }
-    await Bun.sleep(50);
+    await Bun.sleep(stepDelayMs);
     if (issuedArtifactsReady({ accountKeyPath, certPath, keyPath })) {
       return last;
     }
@@ -232,12 +242,23 @@ function issuedArtifactsReady({ accountKeyPath, certPath, keyPath }) {
   );
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("acme module live Pebble integration", () => {
   beforeAll(async () => {
     await stopNginz();
     ensureDockerAvailable();
     ensureDockerImageAvailable(CHALLTESTSRV_IMAGE);
     ensureDockerImageAvailable(PEBBLE_IMAGE);
+    // Unit ACME mock / prior pebble containers also bind these host ports.
+    await ensurePortFree(14000);
+    await ensurePortFree(8053);
     startChalltestsrv();
     startPebble();
     await waitForPebbleReady();
@@ -258,7 +279,7 @@ describe("acme module live Pebble integration", () => {
     const certPath = join(STORAGE_DIR, "certs", DOMAIN, "fullchain.pem");
     const keyPath = join(STORAGE_DIR, "certs", DOMAIN, "privkey.pem");
 
-    const final = await triggerUntilIssued({ maxSteps: 32 });
+    const final = await triggerUntilIssued({ maxSteps: 48, stepDelayMs: 100 });
 
     if (!issuedArtifactsReady({ accountKeyPath, certPath, keyPath })) {
       expect(["complete", "started"]).toContain(final.status);
@@ -271,7 +292,7 @@ describe("acme module live Pebble integration", () => {
 
     const errorLog = readRunnerLog(join(process.cwd(), "tests", MODULE, "runtime", "logs", "error.log"));
     expect(errorLog).not.toContain("header already sent");
-  });
+  }, 60000);
 
   test("rejects Pebble when its private CA is not explicitly trusted", async () => {
     await assertTlsRejected("nginx.live-untrusted.conf");

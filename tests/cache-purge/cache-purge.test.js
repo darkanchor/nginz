@@ -58,7 +58,7 @@ function expectConfigTestFailure(configName, expectedMessage) {
 }
 
 async function purge(targets) {
-  return fetch(`${TEST_URL}/cache-purge`, {
+  return fetchClose(`${TEST_URL}/cache-purge`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ targets }),
@@ -70,7 +70,7 @@ async function getWorkerEvents(channel = "cache", since = null) {
   if (since != null) {
     params.set("since", String(since));
   }
-  const res = await fetch(`${TEST_URL}/worker-events?${params.toString()}`);
+  const res = await fetchClose(`${TEST_URL}/worker-events?${params.toString()}`);
   expect(res.status).toBe(200);
   return res.json();
 }
@@ -89,6 +89,14 @@ async function waitForWorkerEvents(predicate, channel = "cache", timeout = 4000,
   throw new Error(`Timed out waiting for worker-events on channel ${channel}`);
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("cache-purge Phase 1 - API contract", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
@@ -100,7 +108,7 @@ describe("cache-purge Phase 1 - API contract", () => {
   });
 
   test("GET returns 405 method not allowed", async () => {
-    const res = await fetch(`${TEST_URL}/cache-purge`);
+    const res = await fetchClose(`${TEST_URL}/cache-purge`);
     expect(res.status).toBe(405);
     const body = await res.json();
     expect(body.module).toBe("cache_purge");
@@ -108,13 +116,13 @@ describe("cache-purge Phase 1 - API contract", () => {
   });
 
   test("HEAD returns 405 method not allowed", async () => {
-    const res = await fetch(`${TEST_URL}/cache-purge`, { method: "HEAD" });
+    const res = await fetchClose(`${TEST_URL}/cache-purge`, { method: "HEAD" });
     expect(res.status).toBe(405);
     expect(await res.text()).toBe("");
   });
 
   test("POST without JSON content-type returns 415", async () => {
-    const res = await fetch(`${TEST_URL}/cache-purge`, {
+    const res = await fetchClose(`${TEST_URL}/cache-purge`, {
       method: "POST",
       body: '{"targets":["tag1"]}',
     });
@@ -122,7 +130,7 @@ describe("cache-purge Phase 1 - API contract", () => {
   });
 
   test("POST with missing body returns 400", async () => {
-    const res = await fetch(`${TEST_URL}/cache-purge`, {
+    const res = await fetchClose(`${TEST_URL}/cache-purge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
     });
@@ -132,7 +140,7 @@ describe("cache-purge Phase 1 - API contract", () => {
   });
 
   test("POST with invalid JSON returns 400", async () => {
-    const res = await fetch(`${TEST_URL}/cache-purge`, {
+    const res = await fetchClose(`${TEST_URL}/cache-purge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "not json",
@@ -141,7 +149,7 @@ describe("cache-purge Phase 1 - API contract", () => {
   });
 
   test("POST with non-array targets returns 400", async () => {
-    const res = await fetch(`${TEST_URL}/cache-purge`, {
+    const res = await fetchClose(`${TEST_URL}/cache-purge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: '{"targets":"user-123"}',
@@ -152,7 +160,7 @@ describe("cache-purge Phase 1 - API contract", () => {
   });
 
   test("POST with non-string target item returns 400", async () => {
-    const res = await fetch(`${TEST_URL}/cache-purge`, {
+    const res = await fetchClose(`${TEST_URL}/cache-purge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ targets: ["user-123", 42] }),
@@ -290,7 +298,7 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
 
   test("purges an existing tag and returns correct counts", async () => {
     // Register tag via cache-tags header filter
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const res = await purge(["user-123"]);
     expect(res.status).toBe(200);
@@ -313,7 +321,7 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
 
   test("batch purge with mixed hit/miss targets", async () => {
     // Re-register tag
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const res = await purge(["user-123", "no-such-tag"]);
     expect(res.status).toBe(200);
@@ -326,7 +334,7 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
   test("re-registers a purged tag and allows it to be purged again", async () => {
     await purge(["user-123"]);
 
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const firstPurge = await purge(["user-123"]);
     expect(firstPurge.status).toBe(200);
@@ -335,7 +343,7 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
     expect(firstBody.purged).toBeGreaterThan(0);
     expect(firstBody.missing).toBe(0);
 
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const secondPurge = await purge(["user-123"]);
     expect(secondPurge.status).toBe(200);
@@ -347,7 +355,7 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
 
   test("duplicate targets in one batch are accounted for deterministically", async () => {
     await purge(["user-123"]);
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const res = await purge(["user-123", "user-123"]);
     expect(res.status).toBe(200);
@@ -364,7 +372,7 @@ describe("cache-purge Phase 2 - Exact invalidation", () => {
   });
 
   test("other routes remain available", async () => {
-    const res = await fetch(`${TEST_URL}/`);
+    const res = await fetchClose(`${TEST_URL}/`);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
   });
@@ -381,7 +389,7 @@ describe("cache-purge Phase 2 - Prefix invalidation", () => {
   });
 
   test("prefix purge removes all matching tags with stable accounting", async () => {
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const res = await purge(["user-"]);
     expect(res.status).toBe(200);
@@ -408,7 +416,7 @@ describe("cache-purge Phase 2 - Prefix invalidation", () => {
   });
 
   test("duplicate prefix targets remain deterministic", async () => {
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const res = await purge(["user-", "user-"]);
     expect(res.status).toBe(200);
@@ -440,7 +448,7 @@ describe("cache-purge Phase 2 - shared metadata with 2 workers", () => {
   });
 
   test("exact invalidation works against shared tag metadata with worker_processes 2", async () => {
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const res = await purge(["user-123", "product-456"]);
     expect(res.status).toBe(200);
@@ -464,7 +472,7 @@ describe("cache-purge Phase 2 - shared metadata with 2 workers", () => {
 
   test("purging one tag does not remove sibling tags from shared metadata", async () => {
     await purge(["user-123", "product-456"]);
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const firstRes = await purge(["user-123"]);
     expect(firstRes.status).toBe(200);
@@ -483,7 +491,7 @@ describe("cache-purge Phase 2 - shared metadata with 2 workers", () => {
 
   test("shared metadata can be repopulated after a 2-worker purge", async () => {
     await purge(["user-123", "product-456"]);
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const firstPurge = await purge(["user-123", "product-456"]);
     expect(firstPurge.status).toBe(200);
@@ -493,7 +501,7 @@ describe("cache-purge Phase 2 - shared metadata with 2 workers", () => {
     expect(firstBody.missing).toBe(0);
 
     await Promise.all(
-      Array.from({ length: 8 }, () => fetch(`${TEST_URL}/api`)),
+      Array.from({ length: 8 }, () => fetchClose(`${TEST_URL}/api`)),
     );
 
     const secondPurge = await purge(["user-123", "product-456"]);
@@ -523,7 +531,7 @@ describe("cache-purge Phase 2 - prefix invalidation with 2 workers", () => {
   });
 
   test("prefix invalidation works against shared tag metadata with worker_processes 2", async () => {
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
 
     const res = await purge(["user-"]);
     expect(res.status).toBe(200);
@@ -553,11 +561,11 @@ describe("cache-purge S1 - saturated metadata survives graceful reload", () => {
 
   test("purges pre-reload metadata after the shared tag table reaches capacity", async () => {
     for (let i = 0; i < 257; i += 1) {
-      const res = await fetch(`${TEST_URL}/api?tag=cap-${i}`);
+      const res = await fetchClose(`${TEST_URL}/api?tag=cap-${i}`);
       expect(res.status).toBe(200);
     }
 
-    const beforeRes = await fetch(`${TEST_URL}/cache-tags`);
+    const beforeRes = await fetchClose(`${TEST_URL}/cache-tags`);
     expect(beforeRes.status).toBe(200);
     const before = await beforeRes.json();
     expect(before.tags).toHaveLength(256);
@@ -565,7 +573,7 @@ describe("cache-purge S1 - saturated metadata survives graceful reload", () => {
 
     await reloadNginz();
 
-    const afterRes = await fetch(`${TEST_URL}/cache-tags`);
+    const afterRes = await fetchClose(`${TEST_URL}/cache-tags`);
     expect(afterRes.status).toBe(200);
     const after = await afterRes.json();
     expect(after.tags).toHaveLength(256);
@@ -592,7 +600,7 @@ describe("cache-purge Phase 3 - allowlist authorization", () => {
     });
 
     test("allowlisted caller can purge successfully", async () => {
-      await fetch(`${TEST_URL}/api`);
+      await fetchClose(`${TEST_URL}/api`);
 
       const res = await purge(["user-123"]);
       expect(res.status).toBe(200);
@@ -634,7 +642,7 @@ describe("cache-purge Phase 3 - worker-events notifications", () => {
   });
 
   test("successful purge emits one event per successful target", async () => {
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
     const before = await getWorkerEvents();
 
     const res = await purge(["user-123", "product-456"]);
@@ -671,7 +679,7 @@ describe("cache-purge Phase 3 - worker-events notifications", () => {
   });
 
   test("mixed hit-miss purge emits notifications only for mutated targets", async () => {
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
     const before = await getWorkerEvents();
 
     const res = await purge(["user-123", "missing-tag"]);
@@ -707,7 +715,7 @@ describe("cache-purge S1 - worker-events publish outcome", () => {
 
   test("reports accepted publishes and retained-history eviction separately", async () => {
     for (let i = 0; i < 4; i += 1) {
-      const res = await fetch(`${TEST_URL}/api?tag=event-${i}`);
+      const res = await fetchClose(`${TEST_URL}/api?tag=event-${i}`);
       expect(res.status).toBe(200);
     }
 
@@ -721,7 +729,7 @@ describe("cache-purge S1 - worker-events publish outcome", () => {
       failed: 0,
     });
 
-    const tagRes = await fetch(`${TEST_URL}/api?tag=event-overflow`);
+    const tagRes = await fetchClose(`${TEST_URL}/api?tag=event-overflow`);
     expect(tagRes.status).toBe(200);
     const overflowRes = await purge(["event-overflow"]);
     expect(overflowRes.status).toBe(200);
@@ -743,7 +751,7 @@ describe("cache-purge S1 - worker-events publish outcome", () => {
     expect(afterReload.dropped_events).toBe(1);
     expect(afterReload.events).toHaveLength(4);
 
-    const afterReloadTag = await fetch(`${TEST_URL}/api?tag=event-after-reload`);
+    const afterReloadTag = await fetchClose(`${TEST_URL}/api?tag=event-after-reload`);
     expect(afterReloadTag.status).toBe(200);
     const afterReloadPurge = await purge(["event-after-reload"]);
     expect(afterReloadPurge.status).toBe(200);
@@ -773,7 +781,7 @@ describe("cache-purge Phase 3 - escaped worker-events payloads", () => {
 
   test("worker-events payload stays valid JSON for quoted tag values", async () => {
     const quotedTag = 'user-"quoted';
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
     const before = await getWorkerEvents();
 
     const res = await purge([quotedTag]);
@@ -807,7 +815,7 @@ describe("cache-purge Phase 3 - prefix worker-events notifications", () => {
   });
 
   test("prefix purge emits one event per mutated tag entry", async () => {
-    await fetch(`${TEST_URL}/api`);
+    await fetchClose(`${TEST_URL}/api`);
     const before = await getWorkerEvents();
 
     const res = await purge(["user-"]);

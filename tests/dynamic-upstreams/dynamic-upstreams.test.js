@@ -19,7 +19,7 @@ async function getWorkerEvents(channel = "upstreams", since = null) {
   if (since != null) {
     params.set("since", String(since));
   }
-  const res = await fetch(`${TEST_URL}/worker-events?${params.toString()}`);
+  const res = await fetchClose(`${TEST_URL}/worker-events?${params.toString()}`);
   expect(res.status).toBe(200);
   return res.json();
 }
@@ -43,7 +43,7 @@ async function waitForDynamicState(predicate, timeout = 4000) {
 async function waitForDynamicRouteState(route, predicate, timeout = 4000) {
   const started = Date.now();
   while (Date.now() - started < timeout) {
-    const res = await fetch(`${TEST_URL}${route}`);
+    const res = await fetchClose(`${TEST_URL}${route}`);
     expect(res.status).toBe(200);
     const body = await res.json();
     if (predicate(body)) {
@@ -52,6 +52,14 @@ async function waitForDynamicRouteState(route, predicate, timeout = 4000) {
     await Bun.sleep(75);
   }
   throw new Error("Timed out waiting for dynamic-upstreams state");
+}
+
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
 }
 
 describe("dynamic-upstreams Phase 1 — read-only introspection", () => {
@@ -65,7 +73,7 @@ describe("dynamic-upstreams Phase 1 — read-only introspection", () => {
   });
 
   test("GET returns real JSON for static upstream peers", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`);
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
 
@@ -85,8 +93,8 @@ describe("dynamic-upstreams Phase 1 — read-only introspection", () => {
   });
 
   test("HEAD returns consistent headers without body", async () => {
-    const get_res = await fetch(`${TEST_URL}/dynamic-upstreams`);
-    const head_res = await fetch(`${TEST_URL}/dynamic-upstreams`, { method: "HEAD" });
+    const get_res = await fetchClose(`${TEST_URL}/dynamic-upstreams`);
+    const head_res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, { method: "HEAD" });
     expect(head_res.status).toBe(200);
     expect(head_res.headers.get("content-type")).toContain("application/json");
     expect(await head_res.text()).toBe("");
@@ -96,14 +104,14 @@ describe("dynamic-upstreams Phase 1 — read-only introspection", () => {
   });
 
   test("unsupported methods return 405", async () => {
-    const post_res = await fetch(`${TEST_URL}/dynamic-upstreams`, { method: "POST", body: "{}" });
+    const post_res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, { method: "POST", body: "{}" });
     expect(post_res.status).toBe(405);
-    const delete_res = await fetch(`${TEST_URL}/dynamic-upstreams`, { method: "DELETE" });
+    const delete_res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, { method: "DELETE" });
     expect(delete_res.status).toBe(405);
   });
 
   test("keeps neighboring routes working normally", async () => {
-    const res = await fetch(`${TEST_URL}/`);
+    const res = await fetchClose(`${TEST_URL}/`);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
   });
@@ -126,7 +134,7 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
         { address: "127.0.0.1:19003", weight: 1 },
       ],
     };
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -140,13 +148,13 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
 
   test("GET returns active snapshot after PUT", async () => {
     const put_payload = { peers: [{ address: "127.0.0.1:19004", weight: 1 }] };
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(put_payload),
     });
 
-    const get_res = await fetch(`${TEST_URL}/dynamic-upstreams`);
+    const get_res = await fetchClose(`${TEST_URL}/dynamic-upstreams`);
     expect(get_res.status).toBe(200);
     const body = await get_res.json();
     expect(body.generation).toBeGreaterThan(0);
@@ -156,15 +164,15 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
 
   test("PUT with invalid JSON returns 400 and preserves snapshot", async () => {
     // First set a known state
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 1 }] }),
     });
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
     // Try invalid JSON
-    const bad_res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const bad_res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: "not json",
@@ -172,13 +180,13 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
     expect(bad_res.status).toBe(400);
 
     // Snapshot unchanged
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(after.generation).toBe(before.generation);
     expect(after.peer_count).toBe(before.peer_count);
   });
 
   test("PUT with empty peers array returns 400", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ peers: [] }),
@@ -187,7 +195,7 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
   });
 
   test("PUT with hostname address (not IP) returns 400", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ peers: [{ address: "localhost:8080" }] }),
@@ -196,9 +204,9 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
   });
 
   test("PUT with duplicate peer addresses returns 400", async () => {
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -210,7 +218,7 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
     });
     expect(res.status).toBe(400);
 
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(after.generation).toBe(before.generation);
     expect(after.peer_count).toBe(before.peer_count);
   });
@@ -229,7 +237,7 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
 
     const reader = (async () => {
       for (let i = 0; i < 18; i++) {
-        const res = await fetch(`${TEST_URL}/dynamic-upstreams`);
+        const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`);
         expect(res.status).toBe(200);
         const body = await res.json();
         expect(body.peer_count).toBe(body.peers.length);
@@ -241,7 +249,7 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
     })();
 
     for (const payload of payloads) {
-      const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+      const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -251,7 +259,7 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
 
     await reader;
 
-    const final = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const final = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(final.peers).toEqual([{ address: "127.0.0.1:19003", weight: 1 }]);
   });
 
@@ -260,7 +268,7 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
       peers: [{ address: "127.0.0.1:19004", weight: 1 }],
     })}${" ".repeat(8192)}`;
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams-spill`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams-spill`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: payload,
@@ -270,7 +278,7 @@ describe("dynamic-upstreams Phase 2 — snapshot replacement", () => {
     const body = await res.json();
     expect(body.status).toBe("ok");
 
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams-spill`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams-spill`)).json();
     expect(state.peers).toEqual([{ address: "127.0.0.1:19004", weight: 1 }]);
   });
 });
@@ -286,7 +294,7 @@ describe("dynamic-upstreams Phase 3 — operational fields and worker-events fan
   });
 
   test("GET exposes operational timestamp/error fields", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`);
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.last_error_code).toBe(0);
@@ -295,13 +303,13 @@ describe("dynamic-upstreams Phase 3 — operational fields and worker-events fan
   });
 
   test("PUT without application/json content-type returns 415 and records last error", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002" }] }),
     });
     expect(res.status).toBe(415);
 
-    const body = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const body = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(body.last_error_code).toBe(415);
     expect(body.last_error_at_msec).toBeGreaterThan(0);
     expect(body.last_success_at_msec).toBe(0);
@@ -310,7 +318,7 @@ describe("dynamic-upstreams Phase 3 — operational fields and worker-events fan
   test("successful PUT updates success metadata and emits worker-events notification across workers", async () => {
     const before = await getWorkerEvents();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -324,7 +332,7 @@ describe("dynamic-upstreams Phase 3 — operational fields and worker-events fan
     const putBody = await res.json();
     expect(putBody.status).toBe("ok");
 
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(state.generation).toBeGreaterThan(0);
     expect(state.peer_count).toBe(2);
     expect(state.last_error_code).toBe(0);
@@ -347,16 +355,16 @@ describe("dynamic-upstreams Phase 3 — operational fields and worker-events fan
   });
 
   test("invalid JSON records last failure without replacing the active snapshot", async () => {
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: "{not-json",
     });
     expect(res.status).toBe(400);
 
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(after.generation).toBe(before.generation);
     expect(after.peer_count).toBe(before.peer_count);
     expect(after.last_error_code).toBe(4001);
@@ -388,13 +396,13 @@ describe("dynamic-upstreams Phase 3 — static source polling", () => {
     expect(state.last_success_at_msec).toBeGreaterThan(0);
 
     await Bun.sleep(400);
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(after.generation).toBe(state.generation);
     expect(after.peers[0].address).toBe("127.0.0.1:19002");
   });
 
   test("changing the source file activates a new generation and emits a worker-events notification", async () => {
-    const beforeState = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const beforeState = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     const beforeEvents = await getWorkerEvents();
 
     writeFileSync(
@@ -427,7 +435,7 @@ describe("dynamic-upstreams Phase 3 — static source polling", () => {
   });
 
   test("invalid source JSON preserves the last good snapshot and records the refresh error", async () => {
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     writeFileSync(REFRESH_SOURCE_FILE, "{bad-json");
 
     const after = await waitForDynamicState(
@@ -484,7 +492,7 @@ describe("dynamic-upstreams Phase 3 — health-aware activation", () => {
   });
 
   test("PUT activates only the currently healthy subset", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -496,7 +504,7 @@ describe("dynamic-upstreams Phase 3 — health-aware activation", () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const body = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(body.peer_count).toBe(1);
     expect(body.peers).toEqual([{ address: "127.0.0.1:19002", weight: 1 }]);
     expect(body.last_error_code).toBe(0);
@@ -506,7 +514,7 @@ describe("dynamic-upstreams Phase 3 — health-aware activation", () => {
     backend2.get("/probe", { status: 200, body: { status: "ok" } });
     await Bun.sleep(500);
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -587,7 +595,7 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
     expect(requests.length).toBeGreaterThanOrEqual(2);
     expect(requests.length).toBeLessThanOrEqual(5);
 
-    const observed = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const observed = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(observed.generation).toBe(stable.generation);
     expect(observed.peers).toEqual(stable.peers);
   });
@@ -604,12 +612,12 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
   });
 
   test("unchanged consul membership is a no-op refresh", async () => {
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     const beforeEvents = await getWorkerEvents();
 
     await Bun.sleep(450);
 
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     const events = await getWorkerEvents("upstreams", beforeEvents.newest_generation);
 
     expect(after.generation).toBe(before.generation);
@@ -623,7 +631,7 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
   });
 
   test("slow consul does not block another worker-0 timer", async () => {
-    const beforeStatic = await (await fetch(`${TEST_URL}/dynamic-upstreams-static`)).json();
+    const beforeStatic = await (await fetchClose(`${TEST_URL}/dynamic-upstreams-static`)).json();
     consulMock.setHealthBehavior({ delayMs: 6000 });
 
     writeFileSync(
@@ -643,7 +651,7 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
   });
 
   test("consul source keeps the last good snapshot on timeout", async () => {
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     consulMock.setHealthBehavior({ delayMs: 6000 });
 
     const after = await waitForDynamicState(
@@ -657,7 +665,7 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
   });
 
   test("consul source records error and keeps last good state on consul failure", async () => {
-    const snapshot = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const snapshot = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     const prev_gen = snapshot.generation;
     const prev_peers = snapshot.peers;
 
@@ -665,7 +673,7 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
     consulMock.stop();
     await Bun.sleep(500);
 
-    const body = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const body = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     // Generation must not regress — last good snapshot stays active
     expect(body.generation).toBe(prev_gen);
     expect(body.last_error_code).toBeGreaterThan(0);
@@ -679,7 +687,7 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
   });
 
   test("consul source keeps the last good snapshot on malformed JSON", async () => {
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     consulMock.setHealthBehavior({ rawBody: "{bad-json", headers: { "Content-Type": "application/json" } });
 
     const after = await waitForDynamicState(
@@ -694,7 +702,7 @@ describe("dynamic-upstreams Phase 3 — consul source", () => {
 
   test("consul source reconciles an empty healthy result to an empty upstream snapshot", async () => {
     consulMock.clearServices();
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
     const body = await waitForDynamicState(
       (s) => s.peer_count === 0 && s.generation > before.generation,
@@ -721,7 +729,7 @@ describe("dynamic-upstreams Phase 4 — cold-start journal persistence", () => {
   });
 
   test("GET response includes restored_from_journal and restore_error_code fields", async () => {
-    const body = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const body = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(typeof body.restored_from_journal).toBe("boolean");
     expect(typeof body.restore_error_code).toBe("number");
   });
@@ -729,7 +737,7 @@ describe("dynamic-upstreams Phase 4 — cold-start journal persistence", () => {
   test("successful PUT writes journal file to disk", async () => {
     const { existsSync } = await import("fs");
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -760,7 +768,7 @@ describe("dynamic-upstreams Phase 4 — cold-start journal persistence", () => {
 
   test("cold restart restores snapshot from journal before first refresh", async () => {
     // PUT a known snapshot and let it journal
-    const putRes = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const putRes = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 3 }] }),
@@ -810,7 +818,7 @@ describe("dynamic-upstreams Phase 4 — cold-start journal persistence", () => {
     await stopNginz();
     await startNginz(`tests/${MODULE}/nginx-journal.conf`, MODULE);
 
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     // No snapshot restored from corrupt journal
     expect(state.restored_from_journal).toBe(false);
     expect(state.restore_error_code).toBeGreaterThan(0);
@@ -828,20 +836,20 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("GET response includes drain_count field", async () => {
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(typeof state.drain_count).toBe("number");
     expect(state.drain_count).toBe(0);
   });
 
   test("PATCH drain adds address to drain table and updates drain_count", async () => {
     // First activate a snapshot so there is a managed store
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 1 }] }),
     });
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "127.0.0.1:19002" }),
@@ -854,13 +862,13 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
     expect(body.drain_count).toBe(1);
 
     // GET reflects the updated drain_count
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(state.drain_count).toBe(1);
   });
 
   test("PATCH drain emits peer_draining event", async () => {
     const beforeEvents = await getWorkerEvents("upstreams");
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "127.0.0.1:19002" }),
@@ -881,7 +889,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH drain is idempotent for already-draining address", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "127.0.0.1:19002" }),
@@ -893,7 +901,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
 
   test("PATCH undrain removes address and updates drain_count", async () => {
     const beforeEvents = await getWorkerEvents("upstreams");
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ undrain: "127.0.0.1:19002" }),
@@ -904,7 +912,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
     expect(body.action).toBe("undrain");
     expect(body.drain_count).toBe(0);
 
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(state.drain_count).toBe(0);
 
     const events = await waitForWorkerEvents(
@@ -921,7 +929,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH undrain is idempotent for non-draining address", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ undrain: "127.0.0.1:19002" }),
@@ -932,7 +940,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH rejects missing drain/undrain field", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ peers: [] }),
@@ -941,7 +949,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH rejects requests that specify both drain and undrain", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -953,7 +961,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH rejects address longer than 64 bytes", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "a".repeat(65) }),
@@ -962,7 +970,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH rejects invalid JSON", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: "not-json",
@@ -971,7 +979,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH drain rejects an address that is not part of the current upstream", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "127.0.0.1:19999" }),
@@ -980,7 +988,7 @@ describe("dynamic-upstreams Phase 5 — per-peer drain API", () => {
   });
 
   test("PATCH rejects missing Content-Type", async () => {
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       body: JSON.stringify({ drain: "127.0.0.1:19002" }),
     });
@@ -999,7 +1007,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
   });
 
   test("PATCH add appends new peers in request order and preserves unchanged relative order", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1009,9 +1017,9 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
         ],
       }),
     });
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1030,7 +1038,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
     expect(body.generation).toBeGreaterThan(before.generation);
     expect(body.peer_count).toBe(4);
 
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(state.peers.map((peer) => peer.address)).toEqual([
       "127.0.0.1:19002",
       "127.0.0.1:19003",
@@ -1041,7 +1049,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
   });
 
   test("PATCH replace can swap one peer in-place while preserving slot order", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1052,7 +1060,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
       }),
     });
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1072,7 +1080,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
     expect(body.removed).toBe(1);
     expect(body.peer_count).toBe(2);
 
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(state.peers.map((peer) => peer.address)).toEqual([
       "127.0.0.1:19002",
       "127.0.0.1:19004",
@@ -1081,7 +1089,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
   });
 
   test("PATCH remove keeps the remaining peers in their previous relative order", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1093,7 +1101,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
       }),
     });
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ remove: ["127.0.0.1:19003"] }),
@@ -1105,7 +1113,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
     expect(body.removed).toBe(1);
     expect(body.peer_count).toBe(2);
 
-    const state = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const state = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(state.peers.map((peer) => peer.address)).toEqual([
       "127.0.0.1:19002",
       "127.0.0.1:19004",
@@ -1113,7 +1121,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
   });
 
   test("PATCH no-op replace returns changed=false and preserves the current generation", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1123,9 +1131,9 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
         ],
       }),
     });
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1142,14 +1150,14 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
   });
 
   test("PATCH rejects mixed drain and membership operations and preserves last good state", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ peers: [{ address: "127.0.0.1:19002", weight: 1 }] }),
     });
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1159,13 +1167,13 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
     });
     expect(res.status).toBe(400);
 
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(after.generation).toBe(before.generation);
     expect(after.peers).toEqual(before.peers);
   });
 
   test("PATCH rejects duplicate adds against the current snapshot and keeps the last good generation", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1175,9 +1183,9 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
         ],
       }),
     });
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1186,13 +1194,13 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
     });
     expect(res.status).toBe(409);
 
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(after.generation).toBe(before.generation);
     expect(after.peers).toEqual(before.peers);
   });
 
   test("PATCH rejects remove+add of the same current address because it would reorder an existing peer", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1202,9 +1210,9 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
         ],
       }),
     });
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1214,13 +1222,13 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
     });
     expect(res.status).toBe(409);
 
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(after.generation).toBe(before.generation);
     expect(after.peers).toEqual(before.peers);
   });
 
   test("PATCH rejects replace that reuses an address removed earlier in the same patch", async () => {
-    await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1231,9 +1239,9 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
         ],
       }),
     });
-    const before = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const before = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
 
-    const res = await fetch(`${TEST_URL}/dynamic-upstreams`, {
+    const res = await fetchClose(`${TEST_URL}/dynamic-upstreams`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1243,7 +1251,7 @@ describe("dynamic-upstreams Phase 7 — immutable PATCH membership semantics", (
     });
     expect(res.status).toBe(409);
 
-    const after = await (await fetch(`${TEST_URL}/dynamic-upstreams`)).json();
+    const after = await (await fetchClose(`${TEST_URL}/dynamic-upstreams`)).json();
     expect(after.generation).toBe(before.generation);
     expect(after.peers).toEqual(before.peers);
   });
@@ -1267,20 +1275,20 @@ describe("dynamic-upstreams Phase 5 — drain state is scoped per upstream", () 
   test("draining one managed upstream does not exclude the same address in another upstream", async () => {
     const routeHeaders = { "x-route": "scope-test" };
 
-    const beforeBlue = await fetch(`${TEST_URL}/blue`, { headers: routeHeaders });
-    const beforeGreen = await fetch(`${TEST_URL}/green`, { headers: routeHeaders });
+    const beforeBlue = await fetchClose(`${TEST_URL}/blue`, { headers: routeHeaders });
+    const beforeGreen = await fetchClose(`${TEST_URL}/green`, { headers: routeHeaders });
     expect(beforeBlue.status).toBe(200);
     expect(beforeGreen.status).toBe(200);
 
-    const patchRes = await fetch(`${TEST_URL}/dynamic-upstreams-blue`, {
+    const patchRes = await fetchClose(`${TEST_URL}/dynamic-upstreams-blue`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ drain: "127.0.0.1:19002" }),
     });
     expect(patchRes.status).toBe(200);
 
-    const afterBlue = await fetch(`${TEST_URL}/blue`, { headers: routeHeaders });
-    const afterGreen = await fetch(`${TEST_URL}/green`, { headers: routeHeaders });
+    const afterBlue = await fetchClose(`${TEST_URL}/blue`, { headers: routeHeaders });
+    const afterGreen = await fetchClose(`${TEST_URL}/green`, { headers: routeHeaders });
     expect(afterBlue.status).toBe(502);
     expect(afterGreen.status).toBe(200);
   });

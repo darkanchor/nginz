@@ -1,7 +1,30 @@
+import { spawnSync } from "bun";
 /**
  * Mock Redis server using RESP (Redis Serialization Protocol)
  * Supports basic commands: PING, GET, SET, DEL, EXISTS, INCR, EXPIRE, TTL
  */
+
+
+function killStaleListeners(port) {
+  try {
+    const ss = spawnSync(["ss", "-ltnp", `sport = :${port}`], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const raw = ss.stdout;
+    const text = raw == null
+      ? ""
+      : typeof raw === "string"
+        ? raw
+        : Buffer.from(raw).toString();
+    for (const match of text.matchAll(/pid=(\d+)/g)) {
+      const pid = Number(match[1]);
+      if (pid > 0 && pid !== process.pid) {
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+    }
+  } catch {}
+}
 
 export class RedisMock {
   constructor(port = 6379) {
@@ -13,6 +36,7 @@ export class RedisMock {
   }
 
   start() {
+    killStaleListeners(this.port);
     this.server = Bun.listen({
       hostname: "127.0.0.1",
       port: this.port,
@@ -28,7 +52,14 @@ export class RedisMock {
 
   stop() {
     if (this.server) {
-      this.server.stop();
+      // Force-close so the listen port is released promptly for the next suite.
+      try {
+        this.server.stop(true);
+      } catch {
+        try {
+          this.server.stop();
+        } catch {}
+      }
       this.server = null;
     }
     this.store.clear();
@@ -357,6 +388,21 @@ export class RedisMock {
   }
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 export function createRedisMock(port = 6379) {
-  return new RedisMock(port).start();
+  // Retry bind: sequential describes share remapped mock ports and Bun.listen
+  // can briefly reject re-bind after stop(true).
+  let lastError = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (attempt > 0) sleepSync(30 * attempt);
+    try {
+      return new RedisMock(port).start();
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error(`Failed to start Redis mock on port ${port}`);
 }

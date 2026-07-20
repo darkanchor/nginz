@@ -12,6 +12,14 @@ import {
 
 const MODULE = "cache-tags";
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("cache-tags module", () => {
   let mocks;
   let backend;
@@ -63,14 +71,14 @@ describe("cache-tags module", () => {
   });
 
   test("health check", async () => {
-    const res = await fetch(`${TEST_URL}/health`);
+    const res = await fetchClose(`${TEST_URL}/health`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text.trim()).toBe("ok");
   });
 
   test("backend returns Cache-Tag header via proxy", async () => {
-    const res = await fetch(`${TEST_URL}/api/test`);
+    const res = await fetchClose(`${TEST_URL}/api/test`);
     expect(res.status).toBe(200);
     expect(res.headers.get("Cache-Tag")).toBe("product,api");
     expect(res.headers.get("x-cache-tags-last-purged")).toBeNull();
@@ -80,14 +88,14 @@ describe("cache-tags module", () => {
 
   describe("/cache/purge endpoint", () => {
     test("returns JSON response", async () => {
-      const res = await fetch(`${TEST_URL}/cache/purge`);
+      const res = await fetchClose(`${TEST_URL}/cache/purge`);
       expect(res.status).toBe(200);
       const contentType = res.headers.get("content-type");
       expect(contentType).toContain("application/json");
     });
 
     test("lists tags when no tag parameter", async () => {
-      const res = await fetch(`${TEST_URL}/cache/purge`);
+      const res = await fetchClose(`${TEST_URL}/cache/purge`);
       const json = await res.json();
       expect(json).toHaveProperty("tags");
       expect(Array.isArray(json.tags)).toBe(true);
@@ -97,9 +105,9 @@ describe("cache-tags module", () => {
     });
 
     test("allows DELETE requests for purge operations", async () => {
-      await fetch(`${TEST_URL}/api/delete-method-${Date.now()}`);
+      await fetchClose(`${TEST_URL}/api/delete-method-${Date.now()}`);
 
-      const res = await fetch(`${TEST_URL}/cache/purge?tag=api`, {
+      const res = await fetchClose(`${TEST_URL}/cache/purge?tag=api`, {
         method: "DELETE",
       });
 
@@ -113,7 +121,7 @@ describe("cache-tags module", () => {
     });
 
     test("rejects POST requests", async () => {
-      const res = await fetch(`${TEST_URL}/cache/purge?tag=api`, {
+      const res = await fetchClose(`${TEST_URL}/cache/purge?tag=api`, {
         method: "POST",
       });
 
@@ -127,11 +135,11 @@ describe("cache-tags module", () => {
   describe("tag capture", () => {
     test("captures tags from proxied response headers", async () => {
       // Make requests to populate tags
-      await fetch(`${TEST_URL}/api/item1`);
-      await fetch(`${TEST_URL}/products/list`);
+      await fetchClose(`${TEST_URL}/api/item1`);
+      await fetchClose(`${TEST_URL}/products/list`);
 
       // Check tags were captured
-      const res = await fetch(`${TEST_URL}/cache/purge`);
+      const res = await fetchClose(`${TEST_URL}/cache/purge`);
       const json = await res.json();
 
       expect(json.tags.length).toBeGreaterThan(0);
@@ -144,9 +152,9 @@ describe("cache-tags module", () => {
 
     test("multiple tags per response are captured", async () => {
       // /api/ returns "product,api" tags
-      await fetch(`${TEST_URL}/api/multi`);
+      await fetchClose(`${TEST_URL}/api/multi`);
 
-      const res = await fetch(`${TEST_URL}/cache/purge`);
+      const res = await fetchClose(`${TEST_URL}/cache/purge`);
       const json = await res.json();
 
       const productTag = json.tags.find((t) => t.tag === "product");
@@ -157,9 +165,9 @@ describe("cache-tags module", () => {
     });
 
     test("trims surrounding whitespace around tags", async () => {
-      await fetch(`${TEST_URL}/spaced/trimmed`);
+      await fetchClose(`${TEST_URL}/spaced/trimmed`);
 
-      const res = await fetch(`${TEST_URL}/cache/purge`);
+      const res = await fetchClose(`${TEST_URL}/cache/purge`);
       const json = await res.json();
 
       const spacedTag = json.tags.find((t) => t.tag === "spaced-tag");
@@ -171,18 +179,18 @@ describe("cache-tags module", () => {
     test("same URI with same tag is not duplicated", async () => {
       // Make unique request and get initial count
       const uniqueUri = `/api/dedup-${Date.now()}`;
-      await fetch(`${TEST_URL}${uniqueUri}`);
+      await fetchClose(`${TEST_URL}${uniqueUri}`);
 
-      let res = await fetch(`${TEST_URL}/cache/purge`);
+      let res = await fetchClose(`${TEST_URL}/cache/purge`);
       let json = await res.json();
       const apiTag = json.tags.find((t) => t.tag === "api");
       const initialCount = apiTag ? apiTag.uris : 0;
 
       // Request same URI again
-      await fetch(`${TEST_URL}${uniqueUri}`);
+      await fetchClose(`${TEST_URL}${uniqueUri}`);
 
       // Count should not increase for same URI
-      res = await fetch(`${TEST_URL}/cache/purge`);
+      res = await fetchClose(`${TEST_URL}/cache/purge`);
       json = await res.json();
       const apiTagAfter = json.tags.find((t) => t.tag === "api");
       expect(apiTagAfter.uris).toBe(initialCount);
@@ -192,29 +200,29 @@ describe("cache-tags module", () => {
   describe("purge by tag", () => {
     test("purge removes tag and returns count", async () => {
       // Make request to create category tag
-      await fetch(`${TEST_URL}/categories/all`);
+      await fetchClose(`${TEST_URL}/categories/all`);
 
       // Verify category tag exists
-      let res = await fetch(`${TEST_URL}/cache/purge`);
+      let res = await fetchClose(`${TEST_URL}/cache/purge`);
       let json = await res.json();
       const categoryTag = json.tags.find((t) => t.tag === "category");
       expect(categoryTag).toBeDefined();
 
       // Purge the category tag
-      res = await fetch(`${TEST_URL}/cache/purge?tag=category`);
+      res = await fetchClose(`${TEST_URL}/cache/purge?tag=category`);
       json = await res.json();
       expect(json.tag).toBe("category");
       expect(json.purged).toBeGreaterThanOrEqual(1);
 
       // Verify tag is gone
-      res = await fetch(`${TEST_URL}/cache/purge`);
+      res = await fetchClose(`${TEST_URL}/cache/purge`);
       json = await res.json();
       const removedTag = json.tags.find((t) => t.tag === "category");
       expect(removedTag).toBeUndefined();
     });
 
     test("purge non-existent tag returns zero", async () => {
-      const res = await fetch(`${TEST_URL}/cache/purge?tag=nonexistent`);
+      const res = await fetchClose(`${TEST_URL}/cache/purge?tag=nonexistent`);
       const json = await res.json();
       expect(json.tag).toBe("nonexistent");
       expect(json.purged).toBe(0);
@@ -224,14 +232,14 @@ describe("cache-tags module", () => {
     });
 
     test("purge uses exact tag matching only", async () => {
-      await fetch(`${TEST_URL}/products/exact-match`);
+      await fetchClose(`${TEST_URL}/products/exact-match`);
 
-      const res = await fetch(`${TEST_URL}/cache/purge?tag=prod*`);
+      const res = await fetchClose(`${TEST_URL}/cache/purge?tag=prod*`);
       const json = await res.json();
       expect(json.tag).toBe("prod*");
       expect(json.purged).toBe(0);
 
-      const listRes = await fetch(`${TEST_URL}/cache/purge`);
+      const listRes = await fetchClose(`${TEST_URL}/cache/purge`);
       const listJson = await listRes.json();
       const productTag = listJson.tags.find((t) => t.tag === "product");
       expect(productTag).toBeDefined();
@@ -239,20 +247,20 @@ describe("cache-tags module", () => {
 
     test("purge one tag does not affect others", async () => {
       // Populate multiple tags
-      await fetch(`${TEST_URL}/api/preserve1`);
-      await fetch(`${TEST_URL}/categories/preserve2`);
+      await fetchClose(`${TEST_URL}/api/preserve1`);
+      await fetchClose(`${TEST_URL}/categories/preserve2`);
 
       // Get initial state
-      let res = await fetch(`${TEST_URL}/cache/purge`);
+      let res = await fetchClose(`${TEST_URL}/cache/purge`);
       let json = await res.json();
       const apiTagBefore = json.tags.find((t) => t.tag === "api");
       expect(apiTagBefore).toBeDefined();
 
       // Purge category only
-      await fetch(`${TEST_URL}/cache/purge?tag=category`);
+      await fetchClose(`${TEST_URL}/cache/purge?tag=category`);
 
       // api tag should still exist
-      res = await fetch(`${TEST_URL}/cache/purge`);
+      res = await fetchClose(`${TEST_URL}/cache/purge`);
       json = await res.json();
       const apiTagAfter = json.tags.find((t) => t.tag === "api");
       expect(apiTagAfter).toBeDefined();
@@ -261,10 +269,10 @@ describe("cache-tags module", () => {
 
   describe("catalog tag (shared between products and categories)", () => {
     test("catalog tag captures URIs from multiple locations", async () => {
-      await fetch(`${TEST_URL}/products/cat1`);
-      await fetch(`${TEST_URL}/categories/cat2`);
+      await fetchClose(`${TEST_URL}/products/cat1`);
+      await fetchClose(`${TEST_URL}/categories/cat2`);
 
-      const res = await fetch(`${TEST_URL}/cache/purge`);
+      const res = await fetchClose(`${TEST_URL}/cache/purge`);
       const json = await res.json();
 
       const catalogTag = json.tags.find((t) => t.tag === "catalog");
@@ -278,15 +286,15 @@ describe("cache-tags module", () => {
         `/products/${sharedPrefix}-${i}`
       );
 
-      await Promise.all(uris.map((uri) => fetch(`${TEST_URL}${uri}`)));
+      await Promise.all(uris.map((uri) => fetchClose(`${TEST_URL}${uri}`)));
 
-      const listRes = await fetch(`${TEST_URL}/cache/purge`);
+      const listRes = await fetchClose(`${TEST_URL}/cache/purge`);
       const listJson = await listRes.json();
       const productTag = listJson.tags.find((t) => t.tag === "product");
       expect(productTag).toBeDefined();
       expect(productTag.uris).toBeGreaterThanOrEqual(uris.length);
 
-      const purgeRes = await fetch(`${TEST_URL}/cache/purge?tag=product`, {
+      const purgeRes = await fetchClose(`${TEST_URL}/cache/purge?tag=product`, {
         method: "DELETE",
       });
       const purgeJson = await purgeRes.json();
@@ -296,17 +304,17 @@ describe("cache-tags module", () => {
   });
 
   test("reports URI-capacity rejection without losing existing tag mappings", async () => {
-    const beforeRes = await fetch(`${TEST_URL}/cache/purge`);
+    const beforeRes = await fetchClose(`${TEST_URL}/cache/purge`);
     const before = await beforeRes.json();
     const beforeRejected = before.capture_rejections.uri_capacity;
     const prefix = `capacity-${Date.now()}`;
 
     for (let i = 0; i < 80; i += 1) {
-      const res = await fetch(`${TEST_URL}/api/${prefix}-${i}`);
+      const res = await fetchClose(`${TEST_URL}/api/${prefix}-${i}`);
       expect(res.status).toBe(200);
     }
 
-    const afterRes = await fetch(`${TEST_URL}/cache/purge`);
+    const afterRes = await fetchClose(`${TEST_URL}/cache/purge`);
     const after = await afterRes.json();
     const apiTag = after.tags.find((tag) => tag.tag === "api");
     expect(apiTag).toBeDefined();
@@ -317,7 +325,7 @@ describe("cache-tags module", () => {
   });
 
   test("preserves saturated shared metadata and counters across graceful reload", async () => {
-    const beforeRes = await fetch(`${TEST_URL}/cache/purge`);
+    const beforeRes = await fetchClose(`${TEST_URL}/cache/purge`);
     const before = await beforeRes.json();
     const beforeApi = before.tags.find((tag) => tag.tag === "api");
     expect(beforeApi).toBeDefined();
@@ -325,7 +333,7 @@ describe("cache-tags module", () => {
 
     await reloadNginz();
 
-    const afterRes = await fetch(`${TEST_URL}/cache/purge`);
+    const afterRes = await fetchClose(`${TEST_URL}/cache/purge`);
     const after = await afterRes.json();
     const afterApi = after.tags.find((tag) => tag.tag === "api");
     expect(afterApi).toBeDefined();
@@ -339,9 +347,9 @@ describe("cache-tags module", () => {
       await startNginz(`tests/${MODULE}/nginx-custom-header.conf`, MODULE);
 
       try {
-        await fetch(`${TEST_URL}/custom/example`);
+        await fetchClose(`${TEST_URL}/custom/example`);
 
-        const res = await fetch(`${TEST_URL}/cache/purge`);
+        const res = await fetchClose(`${TEST_URL}/cache/purge`);
         const json = await res.json();
 
         const customTag = json.tags.find((t) => t.tag === "custom");

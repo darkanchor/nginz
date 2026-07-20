@@ -1,9 +1,32 @@
+import { spawnSync } from "bun";
 /**
  * Mock ACME (Let's Encrypt) server
  * Implements RFC 8555 ACME protocol for testing certificate automation
  */
 
 import { randomBytes } from "crypto";
+
+
+function killStaleListeners(port) {
+  try {
+    const ss = spawnSync(["ss", "-ltnp", `sport = :${port}`], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const raw = ss.stdout;
+    const text = raw == null
+      ? ""
+      : typeof raw === "string"
+        ? raw
+        : Buffer.from(raw).toString();
+    for (const match of text.matchAll(/pid=(\d+)/g)) {
+      const pid = Number(match[1]);
+      if (pid > 0 && pid !== process.pid) {
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+    }
+  } catch {}
+}
 
 export class ACMEMock {
   constructor(port = 14000) {
@@ -26,6 +49,7 @@ export class ACMEMock {
   }
 
   start() {
+    killStaleListeners(this.port);
     this.server = Bun.serve({
       port: this.port,
       fetch: (req) => this.handleRequest(req),
@@ -35,7 +59,14 @@ export class ACMEMock {
 
   stop() {
     if (this.server) {
-      this.server.stop();
+      // Force-close so the listen port is released promptly for the next suite.
+      try {
+        this.server.stop(true);
+      } catch {
+        try {
+          this.server.stop();
+        } catch {}
+      }
       this.server = null;
     }
     this.accounts.clear();
@@ -513,6 +544,21 @@ Mock issuer certificate
   }
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 export function createACMEMock(port = 14000) {
-  return new ACMEMock(port).start();
+  // Retry bind: sequential describes share mock ports and Bun.serve
+  // can briefly reject re-bind after stop(true).
+  let lastError = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (attempt > 0) sleepSync(30 * attempt);
+    try {
+      return new ACMEMock(port).start();
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError ?? new Error(`Failed to start ACME mock on port ${port}`);
 }

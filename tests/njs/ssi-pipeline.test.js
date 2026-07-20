@@ -1,5 +1,15 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { startNginz, stopNginz, cleanupRuntime, TEST_URL, createPostgresMock, MOCK_PORTS } from "../harness.js";
+import {
+  startNginz,
+  stopNginz,
+  cleanupRuntime,
+  TEST_URL,
+  createPostgresMock,
+  MOCK_PORTS,
+  teardownModule,
+  prepareMockPorts,
+  testFetch,
+} from "../harness.js";
 import net from "net";
 
 const MODULE = "njs";
@@ -68,8 +78,10 @@ async function runKeepAlive(port) {
   });
 }
 
+
 describe("ssi keepalive raw", () => {
   beforeAll(async () => {
+    await prepareMockPorts(MOCK_PORTS.POSTGRES);
     pgMock = createPostgresMock(MOCK_PORTS.POSTGRES);
     pgMock.setQueryHandler(/users/i, (q) => {
       if (/SELECT.*count/i.test(q)) return { columns: ["count"], rows: [["3"]] };
@@ -79,7 +91,9 @@ describe("ssi keepalive raw", () => {
     pgMock.setQueryHandler(/^SET\s|^RESET\s/i, () => ({ columns: [], rows: [] }));
     await startNginz("tests/njs/ssi-pgrest.conf", MODULE);
   }, 30000);
-  afterAll(async () => { await stopNginz(); cleanupRuntime(MODULE); pgMock?.stop(); });
+  afterAll(async () => {
+    await teardownModule(MODULE, [pgMock], [MOCK_PORTS.POSTGRES]);
+  });
 
   test("3 SSI requests on one keepalive TCP connection", async () => {
     const port = 8888;

@@ -158,6 +158,14 @@ function signedUpstreamResponse(body, overrides = {}) {
   });
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("wechatpay module", () => {
   beforeAll(async () => {
     upstreamMock = createHTTPMock(MOCK_PORTS.HTTP);
@@ -180,7 +188,7 @@ describe("wechatpay module", () => {
     test("encrypts request bodies and decrypts them back", async () => {
       const plaintext = "wechatpay secret payload";
 
-      const encryptRes = await fetch(`${TEST_URL}/encrypt`, {
+      const encryptRes = await fetchClose(`${TEST_URL}/encrypt`, {
         method: "POST",
         body: plaintext,
       });
@@ -198,7 +206,7 @@ describe("wechatpay module", () => {
       ).toString("utf8");
       expect(nodePlaintext).toBe(plaintext);
 
-      const decryptRes = await fetch(`${TEST_URL}/decrypt`, {
+      const decryptRes = await fetchClose(`${TEST_URL}/decrypt`, {
         method: "POST",
         body: ciphertext,
       });
@@ -207,7 +215,7 @@ describe("wechatpay module", () => {
     });
 
     test("returns 400 for invalid OAEP ciphertext", async () => {
-      const res = await fetch(`${TEST_URL}/decrypt`, {
+      const res = await fetchClose(`${TEST_URL}/decrypt`, {
         method: "POST",
         body: "not-valid-base64-or-rsa",
       });
@@ -218,7 +226,7 @@ describe("wechatpay module", () => {
   describe("access verification", () => {
     test("rejects signed request bodies above wechatpay_body_max_size", async () => {
       const body = "x".repeat(128);
-      const res = await fetch(`${TEST_URL}/notify-bounded`, {
+      const res = await fetchClose(`${TEST_URL}/notify-bounded`, {
         method: "POST",
         headers: buildWechatpayHeaders(body),
         body,
@@ -248,7 +256,7 @@ describe("wechatpay module", () => {
         signature: "invalid-signature",
       });
 
-      const res = await fetch(`${TEST_URL}/notify`, {
+      const res = await fetchClose(`${TEST_URL}/notify`, {
         method: "POST",
         headers,
         body,
@@ -261,7 +269,7 @@ describe("wechatpay module", () => {
       const body = JSON.stringify({ event: "payment.succeeded", id: "evt-1" });
       const headers = buildWechatpayHeaders(body);
 
-      const res = await fetch(`${TEST_URL}/notify`, {
+      const res = await fetchClose(`${TEST_URL}/notify`, {
         method: "POST",
         headers,
         body,
@@ -337,7 +345,7 @@ describe("wechatpay module", () => {
       });
       const headers = buildWechatpayHeaders(body);
 
-      const res = await fetch(`${TEST_URL}/notify-spill`, {
+      const res = await fetchClose(`${TEST_URL}/notify-spill`, {
         method: "POST",
         headers,
         body,
@@ -352,7 +360,7 @@ describe("wechatpay module", () => {
       const headers = buildWechatpayHeaders(body);
       delete headers["Request-ID"];
 
-      const res = await fetch(`${TEST_URL}/notify`, {
+      const res = await fetchClose(`${TEST_URL}/notify`, {
         method: "POST",
         headers,
         body,
@@ -367,7 +375,7 @@ describe("wechatpay module", () => {
         serial: "WRONGSERIAL999",
       });
 
-      const res = await fetch(`${TEST_URL}/notify`, {
+      const res = await fetchClose(`${TEST_URL}/notify`, {
         method: "POST",
         headers,
         body,
@@ -382,7 +390,7 @@ describe("wechatpay module", () => {
         timestamp: String(Math.floor(Date.now() / 1000) - 301),
       });
 
-      const res = await fetch(`${TEST_URL}/notify`, {
+      const res = await fetchClose(`${TEST_URL}/notify`, {
         method: "POST",
         headers,
         body,
@@ -395,11 +403,11 @@ describe("wechatpay module", () => {
       const body = JSON.stringify({ event: "payment.succeeded", id: "evt-replay" });
       const headers = buildWechatpayHeaders(body, { nonce: "one-time-replay-nonce" });
 
-      const first = await fetch(`${TEST_URL}/notify`, { method: "POST", headers, body });
+      const first = await fetchClose(`${TEST_URL}/notify`, { method: "POST", headers, body });
       expect(first.status).toBe(200);
       const replayHeaders = { ...headers, Connection: "close" };
       const replays = await Promise.all(Array.from({ length: 12 }, () =>
-        fetch(`${TEST_URL}/notify`, { method: "POST", headers: replayHeaders, body })
+        fetchClose(`${TEST_URL}/notify`, { method: "POST", headers: replayHeaders, body })
       ));
       for (const replay of replays) expect(replay.status).toBe(401);
     });
@@ -418,7 +426,7 @@ describe("wechatpay module", () => {
       });
       const headers = buildWechatpayHeaders(body);
 
-      const res = await fetch(`${TEST_URL}/notify-aes`, {
+      const res = await fetchClose(`${TEST_URL}/notify-aes`, {
         method: "POST",
         headers,
         body,
@@ -437,7 +445,7 @@ describe("wechatpay module", () => {
       const responseBody = "x".repeat(128);
       upstreamMock.post("/proxy-bounded", async () => signedUpstreamResponse(responseBody));
 
-      const res = await fetch(`${TEST_URL}/proxy-bounded`, {
+      const res = await fetchClose(`${TEST_URL}/proxy-bounded`, {
         method: "POST",
         body: "small",
       });
@@ -459,7 +467,7 @@ describe("wechatpay module", () => {
         { status: 200, headers: signed.headers },
       ));
 
-      const res = await fetch(`${TEST_URL}/proxy-bounded`, { method: "POST", body: "small" });
+      const res = await fetchClose(`${TEST_URL}/proxy-bounded`, { method: "POST", body: "small" });
       expect(res.status).toBe(502);
     });
 
@@ -481,7 +489,7 @@ describe("wechatpay module", () => {
       });
 
       const requestBody = JSON.stringify({ amount: 88, currency: "CNY" });
-      const res = await fetch(`${TEST_URL}/proxy?foo=bar`, {
+      const res = await fetchClose(`${TEST_URL}/proxy?foo=bar`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -518,7 +526,7 @@ describe("wechatpay module", () => {
         });
       });
 
-      const res = await fetch(`${TEST_URL}/proxy-bad`, {
+      const res = await fetchClose(`${TEST_URL}/proxy-bad`, {
         method: "POST",
         headers: {
           "Content-Type": "text/plain",
@@ -559,7 +567,7 @@ describe("wechatpay module", () => {
         );
       });
 
-      const res = await fetch(`${TEST_URL}/proxy`, {
+      const res = await fetchClose(`${TEST_URL}/proxy`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ amount: 66 }),
@@ -580,7 +588,7 @@ describe("wechatpay module", () => {
         });
       });
 
-      const res = await fetch(`${TEST_URL}/proxy-bad`, {
+      const res = await fetchClose(`${TEST_URL}/proxy-bad`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ amount: 12 }),
@@ -597,7 +605,7 @@ describe("wechatpay module", () => {
           "\r\n" +
           "ok",
         async () => {
-          const res = await fetch(`${TEST_URL}/proxy-raw`, {
+          const res = await fetchClose(`${TEST_URL}/proxy-raw`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ amount: 1 }),
@@ -619,7 +627,7 @@ describe("wechatpay module", () => {
         });
       });
 
-      const res = await fetch(`${TEST_URL}/proxy`, {
+      const res = await fetchClose(`${TEST_URL}/proxy`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -654,7 +662,7 @@ describe("wechatpay module", () => {
         currency: "CNY",
         note: "x".repeat(6000),
       });
-      const res = await fetch(`${TEST_URL}/proxy-spill?foo=bar`, {
+      const res = await fetchClose(`${TEST_URL}/proxy-spill?foo=bar`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

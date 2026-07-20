@@ -20,7 +20,7 @@ async function beginFlow(path = "/protected", overrides = null) {
     oidcMock.setNextTokenOverrides(overrides);
   }
 
-  const step1 = await fetch(`${TEST_URL}${path}`, { redirect: "manual" });
+  const step1 = await fetchClose(`${TEST_URL}${path}`, { redirect: "manual" });
   expect(step1.status).toBe(302);
 
   const authUrl = step1.headers.get("location");
@@ -63,6 +63,14 @@ async function createSession(path = "/protected", overrides = null) {
   return { flow, callbackRes, sessionValue, setCookie };
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("oidc module", () => {
   beforeAll(async () => {
     oidcMock = createOIDCMock(9999);
@@ -84,7 +92,7 @@ describe("oidc module", () => {
     });
 
     test("redirects unauthenticated request using discovery-backed authorize endpoint", async () => {
-      const res = await fetch(`${TEST_URL}/protected`, { redirect: "manual" });
+      const res = await fetchClose(`${TEST_URL}/protected`, { redirect: "manual" });
       expect(res.status).toBe(302);
 
       const location = new URL(res.headers.get("location"));
@@ -99,7 +107,7 @@ describe("oidc module", () => {
     });
 
     test("sets encrypted state cookie on redirect", async () => {
-      const res = await fetch(`${TEST_URL}/protected`, { redirect: "manual" });
+      const res = await fetchClose(`${TEST_URL}/protected`, { redirect: "manual" });
       expect(res.status).toBe(302);
 
       const setCookie = res.headers.get("set-cookie");
@@ -109,7 +117,7 @@ describe("oidc module", () => {
     });
 
     test("omits PKCE parameters when disabled", async () => {
-      const res = await fetch(`${TEST_URL}/no-pkce`, { redirect: "manual" });
+      const res = await fetchClose(`${TEST_URL}/no-pkce`, { redirect: "manual" });
       const location = res.headers.get("location");
       expect(location).not.toContain("code_challenge=");
       expect(location).not.toContain("code_challenge_method=");
@@ -118,14 +126,14 @@ describe("oidc module", () => {
 
   describe("callback validation", () => {
     test("callback without code returns error", async () => {
-      const res = await fetch(`${TEST_URL}/callback?state=abc123`, { redirect: "manual" });
+      const res = await fetchClose(`${TEST_URL}/callback?state=abc123`, { redirect: "manual" });
       expect(res.status).toBe(400);
       expect(await res.text()).toContain("Missing authorization code");
     });
 
     test("callback with mismatched state returns error", async () => {
       const flow = await beginFlow();
-      const res = await fetch(`${TEST_URL}/callback?code=abc123&state=wrong-state`, {
+      const res = await fetchClose(`${TEST_URL}/callback?code=abc123&state=wrong-state`, {
         redirect: "manual",
         headers: { Cookie: `oidc_state=${flow.stateCookieValue}` },
       });
@@ -139,8 +147,7 @@ describe("oidc module", () => {
       const authUrl = new URL(flow.authUrl);
       const state = authUrl.searchParams.get("state");
 
-      const res = await fetch(
-        `${TEST_URL}/callback?error=access_denied&error_description=user_cancelled&state=${state}`,
+      const res = await fetchClose(`${TEST_URL}/callback?error=access_denied&error_description=user_cancelled&state=${state}`,
         {
           redirect: "manual",
           headers: { Cookie: `oidc_state=${flow.stateCookieValue}` },
@@ -163,7 +170,7 @@ describe("oidc module", () => {
     test("signed session grants access to protected resource", async () => {
       const { sessionValue } = await createSession();
 
-      const res = await fetch(`${TEST_URL}/protected`, {
+      const res = await fetchClose(`${TEST_URL}/protected`, {
         headers: { Cookie: `oidc_session=${sessionValue}` },
       });
 
@@ -223,7 +230,7 @@ describe("oidc module", () => {
     test("claim headers are populated from validated session claims", async () => {
       const { sessionValue } = await createSession("/claims");
 
-      const res = await fetch(`${TEST_URL}/claims`, {
+      const res = await fetchClose(`${TEST_URL}/claims`, {
         headers: { Cookie: `oidc_session=${sessionValue}` },
       });
 
@@ -236,7 +243,7 @@ describe("oidc module", () => {
 
   describe("subrequest hardening", () => {
     test("auth_request fails closed without redirect when session is missing", async () => {
-      const res = await fetch(`${TEST_URL}/auth-gate`, { redirect: "manual" });
+      const res = await fetchClose(`${TEST_URL}/auth-gate`, { redirect: "manual" });
       expect(res.status).toBe(401);
       expect(res.headers.get("location")).toBeNull();
     });
@@ -244,7 +251,7 @@ describe("oidc module", () => {
     test("auth_request grants access when a valid session cookie is present", async () => {
       const { sessionValue } = await createSession();
 
-      const res = await fetch(`${TEST_URL}/auth-gate`, {
+      const res = await fetchClose(`${TEST_URL}/auth-gate`, {
         headers: { Cookie: `oidc_session=${sessionValue}` },
       });
 
@@ -253,7 +260,7 @@ describe("oidc module", () => {
     });
 
     test("SSI include fails closed without trying browser redirect flow", async () => {
-      const res = await fetch(`${TEST_URL}/ssi-protected`, { redirect: "manual" });
+      const res = await fetchClose(`${TEST_URL}/ssi-protected`, { redirect: "manual" });
       expect(res.status).toBe(200);
       expect(res.headers.get("location")).toBeNull();
       expect(await res.text()).toContain("401 Authorization Required");
@@ -262,7 +269,7 @@ describe("oidc module", () => {
     test("SSI include can render protected content with a valid session", async () => {
       const { sessionValue } = await createSession();
 
-      const res = await fetch(`${TEST_URL}/ssi-protected`, {
+      const res = await fetchClose(`${TEST_URL}/ssi-protected`, {
         headers: { Cookie: `oidc_session=${sessionValue}` },
       });
 
@@ -271,7 +278,7 @@ describe("oidc module", () => {
     });
 
     test("mirror subrequest returns parent response cleanly", async () => {
-      const res = await fetch(`${TEST_URL}/mirror-protected`, { redirect: "manual" });
+      const res = await fetchClose(`${TEST_URL}/mirror-protected`, { redirect: "manual" });
       expect(res.status).toBe(200);
       expect(res.headers.get("location")).toBeNull();
       expect(await res.text()).toBe("oidc-mirror-ok");
@@ -280,13 +287,13 @@ describe("oidc module", () => {
 
   describe("public endpoints", () => {
     test("public endpoint allows access without OIDC", async () => {
-      const res = await fetch(`${TEST_URL}/public`);
+      const res = await fetchClose(`${TEST_URL}/public`);
       expect(res.status).toBe(200);
       expect((await res.json()).status).toBe("public_content");
     });
 
     test("health endpoint works", async () => {
-      const res = await fetch(`${TEST_URL}/`);
+      const res = await fetchClose(`${TEST_URL}/`);
       expect(res.status).toBe(200);
       expect((await res.json()).status).toBe("ok");
     });

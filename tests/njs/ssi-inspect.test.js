@@ -1,14 +1,24 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
-  startNginz, stopNginz, cleanupRuntime, TEST_URL,
-  createPostgresMock, MOCK_PORTS,
+  startNginz,
+  stopNginz,
+  cleanupRuntime,
+  TEST_URL,
+  createPostgresMock,
+  MOCK_PORTS,
+  teardownModule,
+  prepareMockPorts,
+  testFetch,
 } from "../harness.js";
 
 const MODULE = "njs";
 let pgMock;
 
+
+
 describe("ssi raw response inspect", () => {
   beforeAll(async () => {
+    await prepareMockPorts(MOCK_PORTS.POSTGRES);
     pgMock = createPostgresMock(MOCK_PORTS.POSTGRES);
     pgMock.setQueryHandler(/users/i, (query) => {
       if (/SELECT.*count/i.test(query)) return { columns: ["count"], rows: [["3"]] };
@@ -20,14 +30,12 @@ describe("ssi raw response inspect", () => {
   }, 30000);
 
   afterAll(async () => {
-    await stopNginz();
-    cleanupRuntime(MODULE);
-    pgMock?.stop();
+    await teardownModule(MODULE, [pgMock], [MOCK_PORTS.POSTGRES]);
   });
 
   for (let i = 1; i <= 3; i++) {
     test(`SSI request ${i}`, async () => {
-      const res = await fetch(`${TEST_URL}/ssi/users`);
+      const res = await testFetch(`/ssi/users`);
       const headers = Object.fromEntries(res.headers.entries());
       const body = await res.text();
       expect(res.status).toBe(200);

@@ -14,6 +14,14 @@ function createToken(payload, secret, alg = "HS256") {
   return `${data}.${base64url(createHmac(algo, secret).update(data).digest())}`;
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("JWT Config Cascade", () => {
   beforeAll(async () => {
     await startNginz("tests/jwt/nginx.cascade.conf", MODULE);
@@ -30,7 +38,7 @@ describe("JWT Config Cascade", () => {
 
   test("inherits jwt_secret from http level", async () => {
     const token = createToken({ sub: "cascade-user", role: "user" }, "cascade-secret-hs256");
-    const res = await fetch(`${TEST_URL}/inherit-all`, {
+    const res = await fetchClose(`${TEST_URL}/inherit-all`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -38,7 +46,7 @@ describe("JWT Config Cascade", () => {
 
   test("inherits jwt_claim from http level", async () => {
     const token = createToken({ sub: "cascade-sub", role: "user" }, "cascade-secret-hs256");
-    const res = await fetch(`${TEST_URL}/inherit-all`, {
+    const res = await fetchClose(`${TEST_URL}/inherit-all`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -51,7 +59,7 @@ describe("JWT Config Cascade", () => {
       role: "user",
       exp: Math.floor(Date.now() / 1000) - 3600,
     }, "cascade-secret-hs256");
-    const res = await fetch(`${TEST_URL}/inherit-all`, {
+    const res = await fetchClose(`${TEST_URL}/inherit-all`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200); // expired but validate_exp is off
@@ -64,7 +72,7 @@ describe("JWT Config Cascade", () => {
       role: "user",
       exp: Math.floor(Date.now() / 1000) - 30,
     }, "cascade-secret-hs256");
-    const res = await fetch(`${TEST_URL}/inherit-all`, {
+    const res = await fetchClose(`${TEST_URL}/inherit-all`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -80,7 +88,7 @@ describe("JWT Config Cascade", () => {
       role: "user",
       exp: Math.floor(Date.now() / 1000) - 3600,
     }, "cascade-secret-hs256");
-    const res = await fetch(`${TEST_URL}/override-exp`, {
+    const res = await fetchClose(`${TEST_URL}/override-exp`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401); // validate_exp=on at location level
@@ -88,7 +96,7 @@ describe("JWT Config Cascade", () => {
 
   test("location overrides jwt_require_claim", async () => {
     const token = createToken({ sub: "user-1", role: "user" }, "cascade-secret-hs256");
-    const res = await fetch(`${TEST_URL}/override-require`, {
+    const res = await fetchClose(`${TEST_URL}/override-require`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401); // requires role=admin at location level
@@ -100,7 +108,7 @@ describe("JWT Config Cascade", () => {
 
   test("explicit secret uses location-level secret", async () => {
     const token = createToken({ sub: "explicit-sub", name: "Bob" }, "override-secret-hs256");
-    const res = await fetch(`${TEST_URL}/explicit-secret`, {
+    const res = await fetchClose(`${TEST_URL}/explicit-secret`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -109,7 +117,7 @@ describe("JWT Config Cascade", () => {
 
   test("explicit secret rejects http-level secret (location override)", async () => {
     const token = createToken({ sub: "bad", name: "Eve" }, "cascade-secret-hs256");
-    const res = await fetch(`${TEST_URL}/explicit-secret`, {
+    const res = await fetchClose(`${TEST_URL}/explicit-secret`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -120,7 +128,7 @@ describe("JWT Config Cascade", () => {
   // =====================================================================
 
   test("public endpoint accessible without token", async () => {
-    const res = await fetch(`${TEST_URL}/public`);
+    const res = await fetchClose(`${TEST_URL}/public`);
     expect(res.status).toBe(200);
   });
 });

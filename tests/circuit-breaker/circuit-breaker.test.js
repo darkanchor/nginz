@@ -19,6 +19,14 @@ function configureDefaultUpstream() {
   upstream.get("/*", { body: { status: "ok" }, status: 200 });
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("circuit-breaker module", () => {
   beforeAll(async () => {
     mocks = createMockManager();
@@ -42,7 +50,7 @@ describe("circuit-breaker module", () => {
 
   describe("closed state", () => {
     test("allows requests when circuit is closed", async () => {
-      const res = await fetch(`${TEST_URL}/protected`);
+      const res = await fetchClose(`${TEST_URL}/protected`);
       expect(res.status).toBe(200);
       expect(res.headers.get("X-Circuit-Admission")).toBe("allow");
       expect(res.headers.get("X-Circuit-Entries")).toBe("1");
@@ -50,7 +58,7 @@ describe("circuit-breaker module", () => {
     });
 
     test("forwards requests to upstream", async () => {
-      await fetch(`${TEST_URL}/protected`);
+      await fetchClose(`${TEST_URL}/protected`);
       const requests = upstream.getRequests();
       expect(requests.length).toBeGreaterThanOrEqual(1);
     });
@@ -68,22 +76,22 @@ describe("circuit-breaker module", () => {
         return { status: 200, body: { status: "ok", requestNumber } };
       });
 
-      const res1 = await fetch(`${TEST_URL}/protected`);
+      const res1 = await fetchClose(`${TEST_URL}/protected`);
       expect(res1.status).toBe(500);
 
-      const res2 = await fetch(`${TEST_URL}/protected`);
+      const res2 = await fetchClose(`${TEST_URL}/protected`);
       expect(res2.status).toBe(200);
 
-      const res3 = await fetch(`${TEST_URL}/protected`);
+      const res3 = await fetchClose(`${TEST_URL}/protected`);
       expect(res3.status).toBe(500);
 
       upstream.clearLog();
-      const res4 = await fetch(`${TEST_URL}/protected`);
+      const res4 = await fetchClose(`${TEST_URL}/protected`);
       expect(res4.status).toBe(500);
       expect(upstream.getRequests().length).toBe(1);
 
       upstream.clearLog();
-      const res5 = await fetch(`${TEST_URL}/protected`);
+      const res5 = await fetchClose(`${TEST_URL}/protected`);
       expect(res5.status).toBe(200);
       expect(upstream.getRequests().length).toBe(1);
     });
@@ -92,12 +100,12 @@ describe("circuit-breaker module", () => {
       upstream.get("/protected", { status: 404, body: { status: "missing" } });
 
       for (let i = 0; i < 5; i++) {
-        const res = await fetch(`${TEST_URL}/protected`);
+        const res = await fetchClose(`${TEST_URL}/protected`);
         expect(res.status).toBe(404);
       }
 
       upstream.clearLog();
-      const res = await fetch(`${TEST_URL}/protected`);
+      const res = await fetchClose(`${TEST_URL}/protected`);
       expect(res.status).toBe(404);
       expect(upstream.getRequests().length).toBe(1);
     });
@@ -110,12 +118,12 @@ describe("circuit-breaker module", () => {
 
       // Trigger failures to open circuit (threshold = 3 for /protected)
       for (let i = 0; i < 4; i++) {
-        await fetch(`${TEST_URL}/protected`);
+        await fetchClose(`${TEST_URL}/protected`);
       }
 
       // Circuit should be open now, returning 503 without hitting upstream
       upstream.clearLog();
-      const res = await fetch(`${TEST_URL}/protected`);
+      const res = await fetchClose(`${TEST_URL}/protected`);
       expect(res.status).toBe(503);
 
       // Verify no request reached upstream (circuit breaker blocked it)
@@ -128,14 +136,14 @@ describe("circuit-breaker module", () => {
       upstream.setFailureRate(1.0);
 
       for (let i = 0; i < 3; i++) {
-        await fetch(`${TEST_URL}/fast`);
+        await fetchClose(`${TEST_URL}/fast`);
       }
 
       upstream.setFailureRate(0);
       upstream.clearLog();
 
       // Should return 503 immediately
-      const res = await fetch(`${TEST_URL}/fast`);
+      const res = await fetchClose(`${TEST_URL}/fast`);
       expect(res.status).toBe(503);
     });
 
@@ -143,14 +151,14 @@ describe("circuit-breaker module", () => {
       upstream.setFailureRate(1.0);
 
       await Promise.all(
-        Array.from({ length: 8 }, () => fetch(`${TEST_URL}/protected`))
+        Array.from({ length: 8 }, () => fetchClose(`${TEST_URL}/protected`))
       );
 
       upstream.setFailureRate(0);
       upstream.clearLog();
 
       const blockedResponses = await Promise.all(
-        Array.from({ length: 12 }, () => fetch(`${TEST_URL}/protected`))
+        Array.from({ length: 12 }, () => fetchClose(`${TEST_URL}/protected`))
       );
 
       for (const res of blockedResponses) {
@@ -164,7 +172,7 @@ describe("circuit-breaker module", () => {
     test("preserves an open two-worker circuit across graceful reload", async () => {
       upstream.setFailureRate(1.0);
       for (let i = 0; i < 3; i += 1) {
-        const res = await fetch(`${TEST_URL}/protected`);
+        const res = await fetchClose(`${TEST_URL}/protected`);
         expect(res.status).toBe(500);
       }
 
@@ -172,7 +180,7 @@ describe("circuit-breaker module", () => {
       upstream.setFailureRate(0);
       upstream.clearLog();
 
-      const blocked = await fetch(`${TEST_URL}/protected`);
+      const blocked = await fetchClose(`${TEST_URL}/protected`);
       expect(blocked.status).toBe(503);
       expect(blocked.headers.get("X-Circuit-State")).toBe("open");
       expect(upstream.getRequests()).toHaveLength(0);
@@ -185,21 +193,21 @@ describe("circuit-breaker module", () => {
       upstream.setFailureRate(1.0);
 
       for (let i = 0; i < 3; i++) {
-        await fetch(`${TEST_URL}/fast`);
+        await fetchClose(`${TEST_URL}/fast`);
       }
 
       // Verify circuit is open
       upstream.setFailureRate(0);
       upstream.clearLog();
 
-      const openRes = await fetch(`${TEST_URL}/fast`);
+      const openRes = await fetchClose(`${TEST_URL}/fast`);
       expect(openRes.status).toBe(503);
 
       // Wait for timeout (1s + buffer)
       await Bun.sleep(1200);
 
       // Circuit should be half-open, allowing a test request
-      const halfOpenRes = await fetch(`${TEST_URL}/fast`);
+      const halfOpenRes = await fetchClose(`${TEST_URL}/fast`);
       expect(halfOpenRes.status).toBe(200);
     });
 
@@ -208,7 +216,7 @@ describe("circuit-breaker module", () => {
       upstream.setFailureRate(1.0);
 
       for (let i = 0; i < 3; i++) {
-        await fetch(`${TEST_URL}/fast`);
+        await fetchClose(`${TEST_URL}/fast`);
       }
 
       upstream.setFailureRate(0);
@@ -217,19 +225,19 @@ describe("circuit-breaker module", () => {
       await Bun.sleep(1200);
 
       // Send successful request (half-open allows 1)
-      const res1 = await fetch(`${TEST_URL}/fast`);
+      const res1 = await fetchClose(`${TEST_URL}/fast`);
       expect(res1.status).toBe(200);
 
       // Circuit should be closed now (success_threshold = 1 for /fast)
       // Next request should also succeed
-      const res2 = await fetch(`${TEST_URL}/fast`);
+      const res2 = await fetchClose(`${TEST_URL}/fast`);
       expect(res2.status).toBe(200);
     });
 
     test("admits only one concurrent half-open recovery probe", async () => {
       upstream.setFailureRate(1.0);
       for (let i = 0; i < 3; i += 1) {
-        await fetch(`${TEST_URL}/fast`);
+        await fetchClose(`${TEST_URL}/fast`);
       }
 
       await Bun.sleep(1200);
@@ -238,7 +246,7 @@ describe("circuit-breaker module", () => {
       upstream.clearLog();
 
       const responses = await Promise.all(
-        Array.from({ length: 12 }, () => fetch(`${TEST_URL}/fast`)),
+        Array.from({ length: 12 }, () => fetchClose(`${TEST_URL}/fast`)),
       );
       const statuses = responses.map((response) => response.status);
       expect(statuses.filter((status) => status === 200)).toHaveLength(1);
@@ -251,46 +259,46 @@ describe("circuit-breaker module", () => {
       upstream.setFailureRate(1.0);
 
       for (let i = 0; i < 3; i++) {
-        await fetch(`${TEST_URL}/fast`);
+        await fetchClose(`${TEST_URL}/fast`);
       }
 
       // Wait for timeout
       await Bun.sleep(1200);
 
       // Still failing - this should re-open the circuit immediately
-      const halfOpenRes = await fetch(`${TEST_URL}/fast`);
+      const halfOpenRes = await fetchClose(`${TEST_URL}/fast`);
       expect(halfOpenRes.status).toBe(500); // Upstream error
 
       // Circuit should be open again
       upstream.setFailureRate(0);
       upstream.clearLog();
 
-      const openRes = await fetch(`${TEST_URL}/fast`);
+      const openRes = await fetchClose(`${TEST_URL}/fast`);
       expect(openRes.status).toBe(503);
     });
 
     test("raw millisecond timeout transitions to half-open", async () => {
       upstream.setFailureRate(1.0);
 
-      const failureRes = await fetch(`${TEST_URL}/millis`);
+      const failureRes = await fetchClose(`${TEST_URL}/millis`);
       expect(failureRes.status).toBe(500);
 
       upstream.setFailureRate(0);
       upstream.clearLog();
 
-      const openRes = await fetch(`${TEST_URL}/millis`);
+      const openRes = await fetchClose(`${TEST_URL}/millis`);
       expect(openRes.status).toBe(503);
 
       await Bun.sleep(350);
 
-      const recoveredRes = await fetch(`${TEST_URL}/millis`);
+      const recoveredRes = await fetchClose(`${TEST_URL}/millis`);
       expect(recoveredRes.status).toBe(200);
     });
   });
 
   describe("circuit state variable", () => {
     test("exposes $ngz_circuit_state variable", async () => {
-      const res = await fetch(`${TEST_URL}/state`);
+      const res = await fetchClose(`${TEST_URL}/state`);
       expect(res.status).toBe(200);
 
       const body = await res.text();
@@ -298,13 +306,13 @@ describe("circuit-breaker module", () => {
     });
 
     test("shows closed state initially", async () => {
-      const res = await fetch(`${TEST_URL}/state`);
+      const res = await fetchClose(`${TEST_URL}/state`);
       const body = await res.text();
       expect(body).toContain("closed");
     });
 
     test("sets X-Circuit-State header", async () => {
-      const res = await fetch(`${TEST_URL}/state`);
+      const res = await fetchClose(`${TEST_URL}/state`);
       const state = res.headers.get("X-Circuit-State");
       expect(state).toBe("closed");
     });
@@ -313,10 +321,10 @@ describe("circuit-breaker module", () => {
       upstream.setFailureRate(1.0);
 
       for (let i = 0; i < 3; i++) {
-        await fetch(`${TEST_URL}/protected`);
+        await fetchClose(`${TEST_URL}/protected`);
       }
 
-      const res = await fetch(`${TEST_URL}/protected`);
+      const res = await fetchClose(`${TEST_URL}/protected`);
       expect(res.status).toBe(503);
       expect(res.headers.get("X-Circuit-State")).toBe("open");
     });
@@ -324,7 +332,7 @@ describe("circuit-breaker module", () => {
 
   describe("non-circuit-breaker endpoints", () => {
     test("regular endpoints work normally", async () => {
-      const res = await fetch(`${TEST_URL}/`);
+      const res = await fetchClose(`${TEST_URL}/`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toBe("ok\n");

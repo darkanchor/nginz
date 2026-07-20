@@ -20,7 +20,7 @@ async function waitForStatus(path, status, timeout = 4000) {
   const started = Date.now();
 
   while (Date.now() - started < timeout) {
-    const res = await fetch(`${TEST_URL}${path}`);
+    const res = await fetchClose(`${TEST_URL}${path}`);
     if (res.status === status) {
       return res;
     }
@@ -31,7 +31,7 @@ async function waitForStatus(path, status, timeout = 4000) {
 }
 
 async function getHealthSnapshot() {
-  const res = await fetch(`${TEST_URL}/health`);
+  const res = await fetchClose(`${TEST_URL}/health`);
   expect(res.status).toBeGreaterThanOrEqual(200);
   expect(res.status).toBeLessThan(600);
   return res.json();
@@ -52,7 +52,7 @@ async function waitForHealthSnapshot(predicate, timeout = 4000) {
 }
 
 async function getWorkerEvents(channel = "health") {
-  const res = await fetch(`${TEST_URL}/worker-events?channel=${encodeURIComponent(channel)}`);
+  const res = await fetchClose(`${TEST_URL}/worker-events?channel=${encodeURIComponent(channel)}`);
   expect(res.status).toBe(200);
   return res.json();
 }
@@ -76,10 +76,18 @@ async function fetchMany(path, count, batchSize = 8) {
   while (completed < count) {
     const size = Math.min(batchSize, count - completed);
     const responses = await Promise.all(
-      Array.from({ length: size }, () => fetch(`${TEST_URL}${path}`)),
+      Array.from({ length: size }, () => fetchClose(`${TEST_URL}${path}`)),
     );
     completed += responses.length;
   }
+}
+
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
 }
 
 describe("healthcheck module", () => {
@@ -119,7 +127,7 @@ describe("healthcheck module", () => {
 
     // Ordinary responses enter the healthcheck LOG handler and take the zone's
     // slab mutex. The health endpoint then reads the same zone after LOG phase.
-    const response = await fetch(`${TEST_URL}/`);
+    const response = await fetchClose(`${TEST_URL}/`);
     expect(response.status).toBe(200);
     await response.arrayBuffer();
     await Bun.sleep(100);
@@ -131,7 +139,7 @@ describe("healthcheck module", () => {
   test("actively probes the configured target and exposes probe state on /health", async () => {
     await Bun.sleep(250);
 
-    const res = await fetch(`${TEST_URL}/health`);
+    const res = await fetchClose(`${TEST_URL}/health`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
 
@@ -149,7 +157,7 @@ describe("healthcheck module", () => {
   test("health variables reflect healthy shared probe state", async () => {
     await Bun.sleep(250);
 
-    const res = await fetch(`${TEST_URL}/health-vars`);
+    const res = await fetchClose(`${TEST_URL}/health-vars`);
     expect(res.status).toBe(200);
     expect(res.headers.get("x-health-readiness")).toBe("1");
     expect(res.headers.get("x-health-liveness")).toBe("1");
@@ -162,11 +170,11 @@ describe("healthcheck module", () => {
     const before = await getHealthSnapshot();
 
     await Promise.all([
-      fetch(`${TEST_URL}/health`),
-      fetch(`${TEST_URL}/healthz`),
-      fetch(`${TEST_URL}/ready`),
-      fetch(`${TEST_URL}/health`),
-      fetch(`${TEST_URL}/ready`),
+      fetchClose(`${TEST_URL}/health`),
+      fetchClose(`${TEST_URL}/healthz`),
+      fetchClose(`${TEST_URL}/ready`),
+      fetchClose(`${TEST_URL}/health`),
+      fetchClose(`${TEST_URL}/ready`),
     ]);
 
     const after = await getHealthSnapshot();
@@ -200,7 +208,7 @@ describe("healthcheck module", () => {
     const unhealthyRes = await waitForStatus("/ready", 503);
     expect(await unhealthyRes.json()).toEqual({ status: "not_ready" });
 
-    const unhealthyHealth = await fetch(`${TEST_URL}/health`);
+    const unhealthyHealth = await fetchClose(`${TEST_URL}/health`);
     expect(unhealthyHealth.status).toBe(503);
     const unhealthyBody = await unhealthyHealth.json();
     expect(unhealthyBody.probe_healthy).toBe(false);
@@ -208,7 +216,7 @@ describe("healthcheck module", () => {
     expect(unhealthyBody.probe_last_status).toBe(500);
 
     const concurrentReadyResponses = await Promise.all(
-      Array.from({ length: 12 }, () => fetch(`${TEST_URL}/ready`))
+      Array.from({ length: 12 }, () => fetchClose(`${TEST_URL}/ready`))
     );
     for (const res of concurrentReadyResponses) {
       expect(res.status).toBe(503);
@@ -220,7 +228,7 @@ describe("healthcheck module", () => {
     const recoveredRes = await waitForStatus("/ready", 200);
     expect(await recoveredRes.json()).toEqual({ status: "ready" });
 
-    const recoveredHealth = await fetch(`${TEST_URL}/health`);
+    const recoveredHealth = await fetchClose(`${TEST_URL}/health`);
     expect(recoveredHealth.status).toBe(200);
     const recoveredBody = await recoveredHealth.json();
     expect(recoveredBody.probe_healthy).toBe(true);
@@ -232,7 +240,7 @@ describe("healthcheck module", () => {
     probe.get("/probe", { status: 500, body: { status: "down" } });
     await waitForStatus("/ready", 503);
 
-    const res = await fetch(`${TEST_URL}/health-vars`);
+    const res = await fetchClose(`${TEST_URL}/health-vars`);
     expect(res.status).toBe(200);
     expect(res.headers.get("x-health-readiness")).toBe("0");
     expect(res.headers.get("x-health-liveness")).toBe("1");
@@ -261,13 +269,13 @@ describe("healthcheck module", () => {
     probe.get("/probe", { status: 500, body: { status: "down" } });
     await waitForStatus("/ready", 503);
 
-    const liveness = await fetch(`${TEST_URL}/healthz`);
+    const liveness = await fetchClose(`${TEST_URL}/healthz`);
     expect(liveness.status).toBe(200);
     expect(await liveness.json()).toEqual({ status: "alive" });
   });
 
   test("normal endpoints still work", async () => {
-    const res = await fetch(`${TEST_URL}/`);
+    const res = await fetchClose(`${TEST_URL}/`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("Hello World");
   });
@@ -276,7 +284,7 @@ describe("healthcheck module", () => {
     test("/health includes upstream section with backend probe state", async () => {
       await Bun.sleep(300);
 
-      const res = await fetch(`${TEST_URL}/health`);
+      const res = await fetchClose(`${TEST_URL}/health`);
       expect(res.status).toBe(200);
       const body = await res.json();
 
@@ -333,7 +341,7 @@ describe("healthcheck module", () => {
       );
 
       // Service-level readiness depends only on health_probe, not upstream probes
-      const ready = await fetch(`${TEST_URL}/ready`);
+      const ready = await fetchClose(`${TEST_URL}/ready`);
       expect(ready.status).toBe(200);
       expect(await ready.json()).toEqual({ status: "ready" });
     });
@@ -347,7 +355,7 @@ describe("healthcheck module", () => {
     test("/health includes probe_last_checked_ms and probe_last_started_ms", async () => {
       await Bun.sleep(300);
 
-      const res = await fetch(`${TEST_URL}/health`);
+      const res = await fetchClose(`${TEST_URL}/health`);
       expect(res.status).toBe(200);
       const body = await res.json();
 
@@ -361,7 +369,7 @@ describe("healthcheck module", () => {
     test("/health includes upstreams_summary with aggregate counts", async () => {
       await Bun.sleep(300);
 
-      const res = await fetch(`${TEST_URL}/health`);
+      const res = await fetchClose(`${TEST_URL}/health`);
       expect(res.status).toBe(200);
       const body = await res.json();
 
@@ -391,7 +399,7 @@ describe("healthcheck module", () => {
     test("upstream probe response includes timestamp fields", async () => {
       await Bun.sleep(300);
 
-      const res = await fetch(`${TEST_URL}/health`);
+      const res = await fetchClose(`${TEST_URL}/health`);
       const body = await res.json();
       const u = body.upstreams[0];
 
@@ -603,7 +611,7 @@ describe("healthcheck module", () => {
 
     test("/health returns valid JSON with all expected fields", async () => {
       await Bun.sleep(300);
-      const res = await fetch(`${TEST_URL}/health`);
+      const res = await fetchClose(`${TEST_URL}/health`);
       expect(res.status).toBe(200);
       const body = await res.json();
 
@@ -618,7 +626,7 @@ describe("healthcheck module", () => {
 
     test("upstream probe entries have all expected fields", async () => {
       await Bun.sleep(300);
-      const res = await fetch(`${TEST_URL}/health`);
+      const res = await fetchClose(`${TEST_URL}/health`);
       const body = await res.json();
       const u = body.upstreams[0];
 
@@ -649,7 +657,7 @@ describe("healthcheck module", () => {
 
     test("/metrics returns Prometheus text format", async () => {
       await Bun.sleep(300);
-      const res = await fetch(`${TEST_URL}/metrics`);
+      const res = await fetchClose(`${TEST_URL}/metrics`);
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/plain");
 
@@ -665,7 +673,7 @@ describe("healthcheck module", () => {
 
     test("/metrics includes upstream probe metrics", async () => {
       await Bun.sleep(300);
-      const res = await fetch(`${TEST_URL}/metrics`);
+      const res = await fetchClose(`${TEST_URL}/metrics`);
       const text = await res.text();
 
       expect(text).toContain("nginz_health_upstream_probe_healthy");
@@ -702,7 +710,7 @@ describe("healthcheck module", () => {
 
     test("/metrics includes peer probe metrics", async () => {
       await Bun.sleep(300);
-      const res = await fetch(`${TEST_URL}/metrics`);
+      const res = await fetchClose(`${TEST_URL}/metrics`);
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toContain("text/plain");
 

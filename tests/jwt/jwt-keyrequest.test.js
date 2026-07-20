@@ -41,6 +41,14 @@ function createHS256Token(payload, secret, extraHeader = {}) {
 
 const FAR_FUTURE = 9999999999;
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("JWT — Key Request (Subrequest)", () => {
   beforeAll(async () => {
     compressedServer = Bun.serve({
@@ -90,7 +98,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("accepts token signed with key fetched via subrequest", async () => {
     const token = createHS256Token({ sub: "test-user", exp: FAR_FUTURE }, SUBREQ_SECRET, { kid: "subreq-key" });
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -100,7 +108,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("strict kid rejects a missing kid when inherited and local key sources coexist", async () => {
     const token = createHS256Token({ sub: "missing-kid", exp: FAR_FUTURE }, SUBREQ_SECRET);
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -108,20 +116,20 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("rejects token with wrong secret (subrequest-loaded key mismatch)", async () => {
     const token = createHS256Token({ sub: "test-user", exp: FAR_FUTURE }, "wrong-secret-for-testing!!");
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
   });
 
   test("rejects request without token on subrequest-protected location", async () => {
-    const res = await fetch(`${TEST_URL}/protected`);
+    const res = await fetchClose(`${TEST_URL}/protected`);
     expect(res.status).toBe(401);
   });
 
   test("accepts token on variable-based key_request URL", async () => {
     const token = createHS256Token({ sub: "test-var", exp: FAR_FUTURE }, SUBREQ_SECRET, { kid: "subreq-key" });
-    const res = await fetch(`${TEST_URL}/protected-var`, {
+    const res = await fetchClose(`${TEST_URL}/protected-var`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -131,7 +139,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("accepts token from the first of multiple jwt_key_request sources", async () => {
     const token = createHS256Token({ sub: "multi-a", exp: FAR_FUTURE }, SUBREQ_SECRET_A, { kid: "kid-a" });
-    const res = await fetch(`${TEST_URL}/protected-multi`, {
+    const res = await fetchClose(`${TEST_URL}/protected-multi`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -140,7 +148,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("accepts token from the second of multiple jwt_key_request sources", async () => {
     const token = createHS256Token({ sub: "multi-b", exp: FAR_FUTURE }, SUBREQ_SECRET_B, { kid: "kid-b" });
-    const res = await fetch(`${TEST_URL}/protected-multi`, {
+    const res = await fetchClose(`${TEST_URL}/protected-multi`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -153,7 +161,7 @@ describe("JWT — Key Request (Subrequest)", () => {
   // declaration or subrequest completion order, because all keys are tried.
   test("accumulates keys from all three jwt_key_request sources (first source)", async () => {
     const token = createHS256Token({ sub: "triple-a", exp: FAR_FUTURE }, SUBREQ_SECRET_A, { kid: "kid-a" });
-    const res = await fetch(`${TEST_URL}/protected-triple`, {
+    const res = await fetchClose(`${TEST_URL}/protected-triple`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -162,7 +170,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("accumulates keys from all three jwt_key_request sources (second source)", async () => {
     const token = createHS256Token({ sub: "triple-b", exp: FAR_FUTURE }, SUBREQ_SECRET_B, { kid: "kid-b" });
-    const res = await fetch(`${TEST_URL}/protected-triple`, {
+    const res = await fetchClose(`${TEST_URL}/protected-triple`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -171,7 +179,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("accumulates keys from all three jwt_key_request sources (third/last source)", async () => {
     const token = createHS256Token({ sub: "triple-c", exp: FAR_FUTURE }, SUBREQ_SECRET_C, { kid: "kid-c" });
-    const res = await fetch(`${TEST_URL}/protected-triple`, {
+    const res = await fetchClose(`${TEST_URL}/protected-triple`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -180,7 +188,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("preserves declaration-order accumulation under parallel completion (first source retained)", async () => {
     const token = createHS256Token({ sub: "order-a", exp: FAR_FUTURE }, ORDER_SECRET_A, { kid: "order-a-kid-0" });
-    const res = await fetch(`${TEST_URL}/protected-order`, {
+    const res = await fetchClose(`${TEST_URL}/protected-order`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -189,7 +197,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("preserves declaration-order accumulation under parallel completion (last source trimmed by MAX_KEYS)", async () => {
     const token = createHS256Token({ sub: "order-c", exp: FAR_FUTURE }, ORDER_SECRET_C, { kid: "order-c-kid-0" });
-    const res = await fetch(`${TEST_URL}/protected-order`, {
+    const res = await fetchClose(`${TEST_URL}/protected-order`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -197,7 +205,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("accepts token on keyval-format jwt_key_request", async () => {
     const token = createHS256Token({ sub: "keyval-user", exp: FAR_FUTURE }, SUBREQ_KEYVAL_SECRET, { kid: "keyval-kid" });
-    const res = await fetch(`${TEST_URL}/protected-keyval`, {
+    const res = await fetchClose(`${TEST_URL}/protected-keyval`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -206,7 +214,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("rejects malformed subrequest body", async () => {
     const token = createHS256Token({ sub: "bad-body", exp: FAR_FUTURE }, SUBREQ_SECRET, { kid: "subreq-key" });
-    const res = await fetch(`${TEST_URL}/protected-bad-body`, {
+    const res = await fetchClose(`${TEST_URL}/protected-bad-body`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -214,7 +222,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("rejects compressed subrequest response", async () => {
     const token = createHS256Token({ sub: "compressed", exp: FAR_FUTURE }, "compressed-secret-hs256-32bytes!!", { kid: "compressed-kid" });
-    const res = await fetch(`${TEST_URL}/protected-compressed`, {
+    const res = await fetchClose(`${TEST_URL}/protected-compressed`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -222,7 +230,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("child location accepts token from inherited parent key_request source", async () => {
     const token = createHS256Token({ sub: "inherit-a", exp: FAR_FUTURE }, DUP_SECRET_VALID, { kid: "dup-kid" });
-    const res = await fetch(`${TEST_URL}/inherit-parent/child`, {
+    const res = await fetchClose(`${TEST_URL}/inherit-parent/child`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -231,7 +239,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("child location accepts token from child-added key_request source", async () => {
     const token = createHS256Token({ sub: "inherit-b", exp: FAR_FUTURE }, DUP_SECRET_VALID, { kid: "dup-kid" });
-    const res = await fetch(`${TEST_URL}/inherit-parent/child`, {
+    const res = await fetchClose(`${TEST_URL}/inherit-parent/child`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -240,7 +248,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("duplicate kid works when valid subrequest source is declared after invalid one", async () => {
     const token = createHS256Token({ sub: "dup-a", exp: FAR_FUTURE }, DUP_SECRET_VALID, { kid: "dup-kid" });
-    const res = await fetch(`${TEST_URL}/protected-dup-a`, {
+    const res = await fetchClose(`${TEST_URL}/protected-dup-a`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -249,7 +257,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("duplicate kid works when valid subrequest source is declared before invalid one", async () => {
     const token = createHS256Token({ sub: "dup-b", exp: FAR_FUTURE }, DUP_SECRET_VALID, { kid: "dup-kid" });
-    const res = await fetch(`${TEST_URL}/protected-dup-b`, {
+    const res = await fetchClose(`${TEST_URL}/protected-dup-b`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -258,7 +266,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("mixed key_file and jwt_key_request accepts token from subrequest-loaded source", async () => {
     const token = createHS256Token({ sub: "mixed-a", exp: FAR_FUTURE }, DUP_SECRET_VALID, { kid: "dup-kid" });
-    const res = await fetch(`${TEST_URL}/protected-mixed-a`, {
+    const res = await fetchClose(`${TEST_URL}/protected-mixed-a`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -267,7 +275,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("mixed key_file and jwt_key_request accepts token from local key_file source", async () => {
     const token = createHS256Token({ sub: "mixed-b", exp: FAR_FUTURE }, DUP_SECRET_VALID, { kid: "dup-kid" });
-    const res = await fetch(`${TEST_URL}/protected-mixed-b`, {
+    const res = await fetchClose(`${TEST_URL}/protected-mixed-b`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -276,7 +284,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("inherited-only location accepts token from http-scope key_request source", async () => {
     const token = createHS256Token({ sub: "http-scope", exp: FAR_FUTURE }, HTTP_SCOPE_SECRET, { kid: "http-kid" });
-    const res = await fetch(`${TEST_URL}/matrix-inherited`, {
+    const res = await fetchClose(`${TEST_URL}/matrix-inherited`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -285,7 +293,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("inherited-only location accepts token from server-scope variable key_request source", async () => {
     const token = createHS256Token({ sub: "server-scope", exp: FAR_FUTURE }, SERVER_SCOPE_SECRET, { kid: "server-kid" });
-    const res = await fetch(`${TEST_URL}/matrix-inherited`, {
+    const res = await fetchClose(`${TEST_URL}/matrix-inherited`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -294,7 +302,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("override location still accepts token from http-scope inherited key_request source", async () => {
     const token = createHS256Token({ sub: "override-http", exp: FAR_FUTURE }, HTTP_SCOPE_SECRET, { kid: "http-kid" });
-    const res = await fetch(`${TEST_URL}/matrix-override`, {
+    const res = await fetchClose(`${TEST_URL}/matrix-override`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -303,7 +311,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("override location still accepts token from server-scope inherited variable key_request source", async () => {
     const token = createHS256Token({ sub: "override-server", exp: FAR_FUTURE }, SERVER_SCOPE_SECRET, { kid: "server-kid" });
-    const res = await fetch(`${TEST_URL}/matrix-override`, {
+    const res = await fetchClose(`${TEST_URL}/matrix-override`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -312,7 +320,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("override location accepts token from location-scope key_request source", async () => {
     const token = createHS256Token({ sub: "override-location", exp: FAR_FUTURE }, LOCATION_SCOPE_SECRET, { kid: "location-kid" });
-    const res = await fetch(`${TEST_URL}/matrix-override`, {
+    const res = await fetchClose(`${TEST_URL}/matrix-override`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -321,7 +329,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("rejects token with wrong secret on variable-based key_request URL", async () => {
     const token = createHS256Token({ sub: "test-var", exp: FAR_FUTURE }, "wrong-secret-for-testing!!");
-    const res = await fetch(`${TEST_URL}/protected-var`, {
+    const res = await fetchClose(`${TEST_URL}/protected-var`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -332,32 +340,32 @@ describe("JWT — Key Request (Subrequest)", () => {
       sub: "expired-user",
       exp: Math.floor(Date.now() / 1000) - 3600,
     }, SUBREQ_SECRET);
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
   });
 
   test("public endpoint accessible without token", async () => {
-    const res = await fetch(`${TEST_URL}/public`);
+    const res = await fetchClose(`${TEST_URL}/public`);
     expect(res.status).toBe(200);
   });
 
   test("nested subrequest probe shows jwt_key_request is skipped inside subrequests", async () => {
-    const res = await fetch(`${TEST_URL}/nested-probe`);
+    const res = await fetchClose(`${TEST_URL}/nested-probe`);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("200");
   });
 
   test("nested subrequest probe fails closed when inner jwt location opts into preaccess", async () => {
-    const res = await fetch(`${TEST_URL}/nested-probe-preaccess`);
+    const res = await fetchClose(`${TEST_URL}/nested-probe-preaccess`);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("401");
   });
 
   test("preaccess jwt_key_request route accepts valid token from query-variable token source", async () => {
     const token = createHS256Token({ sub: "nested-preaccess", exp: FAR_FUTURE }, SUBREQ_SECRET, { kid: "subreq-key" });
-    const res = await fetch(`${TEST_URL}/protected-sub-inner-preaccess?token=${encodeURIComponent(token)}`);
+    const res = await fetchClose(`${TEST_URL}/protected-sub-inner-preaccess?token=${encodeURIComponent(token)}`);
     expect(res.status).toBe(200);
     expect((await res.text()).trim()).toBe("KEYREQUEST SUB INNER PREACCESS OK");
   });
@@ -365,20 +373,20 @@ describe("JWT — Key Request (Subrequest)", () => {
   // Missing/empty variable URL behavior
   test("empty variable URL rejects token (no keys loaded)", async () => {
     const token = createHS256Token({ sub: "empty-var", exp: FAR_FUTURE }, SUBREQ_SECRET);
-    const res = await fetch(`${TEST_URL}/protected-empty-var-url`, {
+    const res = await fetchClose(`${TEST_URL}/protected-empty-var-url`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
   });
 
   test("empty variable URL rejects request without token", async () => {
-    const res = await fetch(`${TEST_URL}/protected-empty-var-url`);
+    const res = await fetchClose(`${TEST_URL}/protected-empty-var-url`);
     expect(res.status).toBe(401);
   });
 
   test("missing variable URL (header not sent) rejects token", async () => {
     const token = createHS256Token({ sub: "missing-var", exp: FAR_FUTURE }, SUBREQ_SECRET);
-    const res = await fetch(`${TEST_URL}/protected-missing-var-url`, {
+    const res = await fetchClose(`${TEST_URL}/protected-missing-var-url`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -386,7 +394,7 @@ describe("JWT — Key Request (Subrequest)", () => {
 
   test("invalid runtime URI rejects when ngx_http_subrequest creation fails", async () => {
     const token = createHS256Token({ sub: "invalid-uri", exp: FAR_FUTURE }, SUBREQ_SECRET);
-    const res = await fetch(`${TEST_URL}/protected-invalid-var-url`, {
+    const res = await fetchClose(`${TEST_URL}/protected-invalid-var-url`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);

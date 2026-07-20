@@ -26,6 +26,14 @@ function createTokenWithHeader(payload, secret, header, alg = "HS256") {
 
 // ── Suite ──────────────────────────────────────────────────────────────
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("JWT — Claim Variable Extraction", () => {
   beforeAll(async () => {
     await startNginz("tests/jwt/nginx.claims.conf", MODULE);
@@ -45,7 +53,7 @@ describe("JWT — Claim Variable Extraction", () => {
       { sub: "user-123", iss: "my-issuer", name: "Alice", role: "admin" },
       "my-claim-test-secret-hs256"
     );
-    const res = await fetch(`${TEST_URL}/claim-sub`, {
+    const res = await fetchClose(`${TEST_URL}/claim-sub`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -60,7 +68,7 @@ describe("JWT — Claim Variable Extraction", () => {
       { sub: "user-456" },
       "my-claim-test-secret-hs256"
     );
-    const res = await fetch(`${TEST_URL}/claim-sub`, {
+    const res = await fetchClose(`${TEST_URL}/claim-sub`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -76,7 +84,7 @@ describe("JWT — Claim Variable Extraction", () => {
       { sub: "int-user", iat },
       "my-int-claim-secret-hs256"
     );
-    const res = await fetch(`${TEST_URL}/claim-int`, {
+    const res = await fetchClose(`${TEST_URL}/claim-int`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -88,7 +96,7 @@ describe("JWT — Claim Variable Extraction", () => {
       { sub: "nested-user", profile: { name: "Nested Alice" }, roles: ["admin", "user"] },
       "my-claim-test-secret-hs256"
     );
-    const res = await fetch(`${TEST_URL}/claim-nested`, {
+    const res = await fetchClose(`${TEST_URL}/claim-nested`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -101,7 +109,7 @@ describe("JWT — Claim Variable Extraction", () => {
       { sub: "nested-missing", profile: {} },
       "my-claim-test-secret-hs256"
     );
-    const res = await fetch(`${TEST_URL}/claim-nested`, {
+    const res = await fetchClose(`${TEST_URL}/claim-nested`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -115,7 +123,7 @@ describe("JWT — Claim Variable Extraction", () => {
       "my-claim-test-secret-hs256",
       { kid: "kid-123", typ: "JWT" }
     );
-    const res = await fetch(`${TEST_URL}/header-values`, {
+    const res = await fetchClose(`${TEST_URL}/header-values`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -128,7 +136,7 @@ describe("JWT — Claim Variable Extraction", () => {
       { sub: "header-missing" },
       "my-claim-test-secret-hs256"
     );
-    const res = await fetch(`${TEST_URL}/header-values`, {
+    const res = await fetchClose(`${TEST_URL}/header-values`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -142,7 +150,7 @@ describe("JWT — Claim Variable Extraction", () => {
       "my-claim-test-secret-hs256",
       { meta: { inner: "nested-header" } }
     );
-    const res = await fetch(`${TEST_URL}/header-nested`, {
+    const res = await fetchClose(`${TEST_URL}/header-nested`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -156,7 +164,7 @@ describe("JWT — Claim Variable Extraction", () => {
   test("$jwt_claims returns full payload JSON", async () => {
     const payload = { sub: "json-user", email: "json@test.com", exp: Math.floor(Date.now() / 1000) + 3600 };
     const token = createToken(payload, "my-claims-json-secret-hs256");
-    const res = await fetch(`${TEST_URL}/claims-json`, {
+    const res = await fetchClose(`${TEST_URL}/claims-json`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -168,7 +176,7 @@ describe("JWT — Claim Variable Extraction", () => {
   });
 
   test("$jwt_claims not set when no token", async () => {
-    const res = await fetch(`${TEST_URL}/claims-json`);
+    const res = await fetchClose(`${TEST_URL}/claims-json`);
     expect(res.status).toBe(401);
   });
 
@@ -182,7 +190,7 @@ describe("JWT — Claim Variable Extraction", () => {
       { sub: "time-user", exp: before + 3600 },
       "my-nowtime-secret-hs256"
     );
-    const res = await fetch(`${TEST_URL}/nowtime`, {
+    const res = await fetchClose(`${TEST_URL}/nowtime`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);

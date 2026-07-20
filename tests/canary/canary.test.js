@@ -14,6 +14,14 @@ let mocks;
 let stableUpstream;
 let canaryUpstream;
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("canary module", () => {
   beforeAll(async () => {
     mocks = createMockManager();
@@ -53,7 +61,7 @@ describe("canary module", () => {
 
       // Make 100 requests to get a statistical distribution
       for (let i = 0; i < 100; i++) {
-        const res = await fetch(`${TEST_URL}/api/test`);
+        const res = await fetchClose(`${TEST_URL}/api/test`);
         const body = await res.json();
         versions[body.version]++;
       }
@@ -69,7 +77,7 @@ describe("canary module", () => {
       const versions = { stable: 0, canary: 0 };
 
       for (let i = 0; i < 200; i++) {
-        const res = await fetch(`${TEST_URL}/api/test`);
+        const res = await fetchClose(`${TEST_URL}/api/test`);
         const body = await res.json();
         versions[body.version]++;
       }
@@ -83,7 +91,7 @@ describe("canary module", () => {
 
   describe("header-based routing", () => {
     test("routes to canary when X-Canary header is true", async () => {
-      const res = await fetch(`${TEST_URL}/api-header/test`, {
+      const res = await fetchClose(`${TEST_URL}/api-header/test`, {
         headers: { "X-Canary": "true" },
       });
       const body = await res.json();
@@ -91,13 +99,13 @@ describe("canary module", () => {
     });
 
     test("routes to stable when X-Canary header is absent", async () => {
-      const res = await fetch(`${TEST_URL}/api-header/test`);
+      const res = await fetchClose(`${TEST_URL}/api-header/test`);
       const body = await res.json();
       expect(body.version).toBe("stable");
     });
 
     test("routes to stable when X-Canary header has wrong value", async () => {
-      const res = await fetch(`${TEST_URL}/api-header/test`, {
+      const res = await fetchClose(`${TEST_URL}/api-header/test`, {
         headers: { "X-Canary": "false" },
       });
       const body = await res.json();
@@ -105,7 +113,7 @@ describe("canary module", () => {
     });
 
     test("header matching is case-insensitive", async () => {
-      const res = await fetch(`${TEST_URL}/api-header/test`, {
+      const res = await fetchClose(`${TEST_URL}/api-header/test`, {
         headers: { "x-canary": "TRUE" },
       });
       const body = await res.json();
@@ -117,7 +125,7 @@ describe("canary module", () => {
     test("header takes priority over percentage", async () => {
       // With header, should always go to canary
       for (let i = 0; i < 10; i++) {
-        const res = await fetch(`${TEST_URL}/api-combined/test`, {
+        const res = await fetchClose(`${TEST_URL}/api-combined/test`, {
           headers: { "X-Canary": "true" },
         });
         const body = await res.json();
@@ -129,7 +137,7 @@ describe("canary module", () => {
       const versions = { stable: 0, canary: 0 };
 
       for (let i = 0; i < 100; i++) {
-        const res = await fetch(`${TEST_URL}/api-combined/test`);
+        const res = await fetchClose(`${TEST_URL}/api-combined/test`);
         const body = await res.json();
         versions[body.version]++;
       }
@@ -143,7 +151,7 @@ describe("canary module", () => {
       const versions = { stable: 0, canary: 0 };
 
       for (let i = 0; i < 100; i++) {
-        const res = await fetch(`${TEST_URL}/api-combined/test`, {
+        const res = await fetchClose(`${TEST_URL}/api-combined/test`, {
           headers: { "X-Canary": "false" },
         });
         const body = await res.json();
@@ -158,7 +166,7 @@ describe("canary module", () => {
   describe("percentage boundaries", () => {
     test("0 percent always routes to stable", async () => {
       for (let i = 0; i < 20; i++) {
-        const res = await fetch(`${TEST_URL}/api-zero/test`);
+        const res = await fetchClose(`${TEST_URL}/api-zero/test`);
         const body = await res.json();
         expect(body.version).toBe("stable");
       }
@@ -166,7 +174,7 @@ describe("canary module", () => {
 
     test("100 percent always routes to canary", async () => {
       for (let i = 0; i < 20; i++) {
-        const res = await fetch(`${TEST_URL}/api-full/test`);
+        const res = await fetchClose(`${TEST_URL}/api-full/test`);
         const body = await res.json();
         expect(body.version).toBe("canary");
       }
@@ -176,7 +184,7 @@ describe("canary module", () => {
   describe("disabled location", () => {
     test("always routes to stable when canary not enabled", async () => {
       for (let i = 0; i < 20; i++) {
-        const res = await fetch(`${TEST_URL}/api-disabled/test`);
+        const res = await fetchClose(`${TEST_URL}/api-disabled/test`);
         const body = await res.json();
         expect(body.version).toBe("stable");
       }
@@ -185,7 +193,7 @@ describe("canary module", () => {
 
   describe("$ngz_canary variable", () => {
     test("variable returns 0 or 1", async () => {
-      const res = await fetch(`${TEST_URL}/debug`);
+      const res = await fetchClose(`${TEST_URL}/debug`);
       const body = await res.text();
       expect(body).toMatch(/^canary=[01]\n$/);
     });
@@ -194,7 +202,7 @@ describe("canary module", () => {
       let canaryCount = 0;
 
       for (let i = 0; i < 100; i++) {
-        const res = await fetch(`${TEST_URL}/debug`);
+        const res = await fetchClose(`${TEST_URL}/debug`);
         const body = await res.text();
         if (body === "canary=1\n") {
           canaryCount++;
@@ -208,7 +216,7 @@ describe("canary module", () => {
 
     test("variable decision is stable within a single request", async () => {
       for (let i = 0; i < 20; i++) {
-        const res = await fetch(`${TEST_URL}/debug-double`);
+        const res = await fetchClose(`${TEST_URL}/debug-double`);
         const body = await res.text();
         expect(body).toMatch(/^[01],[01]\n$/);
 

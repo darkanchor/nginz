@@ -16,6 +16,14 @@ function createToken(payload, secret, alg = "HS256") {
   return `${data}.${base64url(sig)}`;
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("JWT — Phase Selection", () => {
   beforeAll(async () => {
     await startNginz("tests/jwt/nginx.phase.conf", MODULE);
@@ -27,18 +35,18 @@ describe("JWT — Phase Selection", () => {
   });
 
   test("access phase route rejects missing token", async () => {
-    const res = await fetch(`${TEST_URL}/phase-access`);
+    const res = await fetchClose(`${TEST_URL}/phase-access`);
     expect(res.status).toBe(401);
   });
 
   test("preaccess phase route rejects missing token", async () => {
-    const res = await fetch(`${TEST_URL}/phase-preaccess`);
+    const res = await fetchClose(`${TEST_URL}/phase-preaccess`);
     expect(res.status).toBe(401);
   });
 
   test("access phase route accepts valid token", async () => {
     const token = createToken({ sub: "phase-access-user" }, "phase-secret-hs256");
-    const res = await fetch(`${TEST_URL}/phase-access`, {
+    const res = await fetchClose(`${TEST_URL}/phase-access`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -46,7 +54,7 @@ describe("JWT — Phase Selection", () => {
 
   test("preaccess phase route accepts valid token", async () => {
     const token = createToken({ sub: "phase-preaccess-user" }, "phase-secret-hs256");
-    const res = await fetch(`${TEST_URL}/phase-preaccess`, {
+    const res = await fetchClose(`${TEST_URL}/phase-preaccess`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);

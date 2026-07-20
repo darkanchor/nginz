@@ -165,6 +165,14 @@ ${locations}
 `);
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("waf module", () => {
   beforeAll(async () => {
     const { stagingDir, stagedPaths } = stageWafFixtures();
@@ -213,14 +221,14 @@ describe("waf module", () => {
   // Clean requests should pass
   describe("clean requests", () => {
     test("normal request passes", async () => {
-      const res = await fetch(`${TEST_URL}/api?name=john&age=25`);
+      const res = await fetchClose(`${TEST_URL}/api?name=john&age=25`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("api response");
     });
 
     test("request to clean endpoint passes", async () => {
-      const res = await fetch(`${TEST_URL}/clean`);
+      const res = await fetchClose(`${TEST_URL}/clean`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("clean response");
@@ -234,7 +242,7 @@ describe("waf module", () => {
   // SQL Injection tests
   describe("SQL injection detection", () => {
     test("blocks SQLi in query string - OR 1=1", async () => {
-      const res = await fetch(`${TEST_URL}/api?id=1' OR '1'='1`);
+      const res = await fetchClose(`${TEST_URL}/api?id=1' OR '1'='1`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -242,7 +250,7 @@ describe("waf module", () => {
     });
 
     test("blocks URL-encoded SQLi", async () => {
-      const res = await fetch(`${TEST_URL}/api?id=%27%20OR%20%271%27=%271`);
+      const res = await fetchClose(`${TEST_URL}/api?id=%27%20OR%20%271%27=%271`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -250,7 +258,7 @@ describe("waf module", () => {
     });
 
     test("blocks union select attack", async () => {
-      const res = await fetch(`${TEST_URL}/api?q=1 UNION SELECT * FROM users`);
+      const res = await fetchClose(`${TEST_URL}/api?q=1 UNION SELECT * FROM users`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -258,7 +266,7 @@ describe("waf module", () => {
     });
 
     test("blocks comment-based attack", async () => {
-      const res = await fetch(`${TEST_URL}/api?user=admin'--`);
+      const res = await fetchClose(`${TEST_URL}/api?user=admin'--`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -266,7 +274,7 @@ describe("waf module", () => {
     });
 
     test("blocks SQL keywords with space", async () => {
-      const res = await fetch(`${TEST_URL}/api?q=SELECT * FROM users`);
+      const res = await fetchClose(`${TEST_URL}/api?q=SELECT * FROM users`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -274,7 +282,7 @@ describe("waf module", () => {
     });
 
     test("blocks sleep-based attack", async () => {
-      const res = await fetch(`${TEST_URL}/api?id=1; SLEEP(5)`);
+      const res = await fetchClose(`${TEST_URL}/api?id=1; SLEEP(5)`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -285,7 +293,7 @@ describe("waf module", () => {
   // XSS tests
   describe("XSS detection", () => {
     test("blocks script tag", async () => {
-      const res = await fetch(`${TEST_URL}/api?q=<script>alert(1)</script>`);
+      const res = await fetchClose(`${TEST_URL}/api?q=<script>alert(1)</script>`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -293,7 +301,7 @@ describe("waf module", () => {
     });
 
     test("blocks URL-encoded script tag", async () => {
-      const res = await fetch(`${TEST_URL}/api?q=%3Cscript%3Ealert(1)%3C/script%3E`);
+      const res = await fetchClose(`${TEST_URL}/api?q=%3Cscript%3Ealert(1)%3C/script%3E`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -301,7 +309,7 @@ describe("waf module", () => {
     });
 
     test("blocks onerror event handler", async () => {
-      const res = await fetch(`${TEST_URL}/api?img=<img src=x onerror=alert(1)>`);
+      const res = await fetchClose(`${TEST_URL}/api?img=<img src=x onerror=alert(1)>`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -309,7 +317,7 @@ describe("waf module", () => {
     });
 
     test("blocks javascript protocol", async () => {
-      const res = await fetch(`${TEST_URL}/api?url=javascript:alert(1)`);
+      const res = await fetchClose(`${TEST_URL}/api?url=javascript:alert(1)`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -317,7 +325,7 @@ describe("waf module", () => {
     });
 
     test("blocks document.cookie access", async () => {
-      const res = await fetch(`${TEST_URL}/api?code=document.cookie`);
+      const res = await fetchClose(`${TEST_URL}/api?code=document.cookie`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -325,7 +333,7 @@ describe("waf module", () => {
     });
 
     test("blocks eval function", async () => {
-      const res = await fetch(`${TEST_URL}/api?code=eval(x)`);
+      const res = await fetchClose(`${TEST_URL}/api?code=eval(x)`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -333,7 +341,7 @@ describe("waf module", () => {
     });
 
     test("blocks entity-obfuscated javascript protocol", async () => {
-      const res = await fetch(`${TEST_URL}/api?url=javas%26%23x09%3Bcript%3Aalert(1)`);
+      const res = await fetchClose(`${TEST_URL}/api?url=javas%26%23x09%3Bcript%3Aalert(1)`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("xss");
@@ -343,7 +351,7 @@ describe("waf module", () => {
   // Detect mode tests
   describe("detect mode", () => {
     test("SQLi passes in detect mode", async () => {
-      const res = await fetch(`${TEST_URL}/detect?id=1' OR '1'='1`);
+      const res = await fetchClose(`${TEST_URL}/detect?id=1' OR '1'='1`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("detect response");
@@ -352,14 +360,14 @@ describe("waf module", () => {
     });
 
     test("XSS passes in detect mode", async () => {
-      const res = await fetch(`${TEST_URL}/detect?q=<script>alert(1)</script>`);
+      const res = await fetchClose(`${TEST_URL}/detect?q=<script>alert(1)</script>`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("detect response");
     });
 
     test("nested child location inherits detect mode", async () => {
-      const res = await fetch(`${TEST_URL}/detect-parent/child?q=<script>alert(1)</script>`);
+      const res = await fetchClose(`${TEST_URL}/detect-parent/child?q=<script>alert(1)</script>`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("detect child response");
@@ -369,14 +377,14 @@ describe("waf module", () => {
   // WAF disabled tests
   describe("WAF disabled", () => {
     test("SQLi passes when WAF disabled", async () => {
-      const res = await fetch(`${TEST_URL}/disabled?id=1' OR '1'='1`);
+      const res = await fetchClose(`${TEST_URL}/disabled?id=1' OR '1'='1`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("disabled response");
     });
 
     test("XSS passes when WAF disabled", async () => {
-      const res = await fetch(`${TEST_URL}/disabled?q=<script>alert(1)</script>`);
+      const res = await fetchClose(`${TEST_URL}/disabled?q=<script>alert(1)</script>`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("disabled response");
@@ -386,28 +394,28 @@ describe("waf module", () => {
   // Selective detection tests
   describe("selective detection", () => {
     test("SQLi-only blocks SQLi", async () => {
-      const res = await fetch(`${TEST_URL}/sqli-only?id=1' OR '1'='1`);
+      const res = await fetchClose(`${TEST_URL}/sqli-only?id=1' OR '1'='1`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("sqli");
     });
 
     test("SQLi-only allows XSS", async () => {
-      const res = await fetch(`${TEST_URL}/sqli-only?q=<script>alert(1)</script>`);
+      const res = await fetchClose(`${TEST_URL}/sqli-only?q=<script>alert(1)</script>`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("sqli-only response");
     });
 
     test("XSS-only blocks XSS", async () => {
-      const res = await fetch(`${TEST_URL}/xss-only?q=<script>alert(1)</script>`);
+      const res = await fetchClose(`${TEST_URL}/xss-only?q=<script>alert(1)</script>`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("xss");
     });
 
     test("XSS-only allows SQLi", async () => {
-      const res = await fetch(`${TEST_URL}/xss-only?id=1' OR '1'='1`);
+      const res = await fetchClose(`${TEST_URL}/xss-only?id=1' OR '1'='1`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("xss-only response");
@@ -450,7 +458,7 @@ describe("waf module", () => {
     });
 
     test("clean POST body passes", async () => {
-      const res = await fetch(`${TEST_URL}/body`, {
+      const res = await fetchClose(`${TEST_URL}/body`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "username=john&email=john@example.com",
@@ -486,27 +494,27 @@ describe("waf module", () => {
   // Case insensitivity tests
   describe("case insensitivity", () => {
     test("blocks uppercase SQLi", async () => {
-      const res = await fetch(`${TEST_URL}/api?q=UNION SELECT * FROM users`);
+      const res = await fetchClose(`${TEST_URL}/api?q=UNION SELECT * FROM users`);
       expect(res.status).toBe(403);
     });
 
     test("blocks mixed case SQLi", async () => {
-      const res = await fetch(`${TEST_URL}/api?q=UnIoN sElEcT * FROM users`);
+      const res = await fetchClose(`${TEST_URL}/api?q=UnIoN sElEcT * FROM users`);
       expect(res.status).toBe(403);
     });
 
     test("blocks uppercase XSS", async () => {
-      const res = await fetch(`${TEST_URL}/api?q=<SCRIPT>alert(1)</SCRIPT>`);
+      const res = await fetchClose(`${TEST_URL}/api?q=<SCRIPT>alert(1)</SCRIPT>`);
       expect(res.status).toBe(403);
     });
 
     test("blocks mixed case XSS", async () => {
-      const res = await fetch(`${TEST_URL}/api?q=<ScRiPt>alert(1)</ScRiPt>`);
+      const res = await fetchClose(`${TEST_URL}/api?q=<ScRiPt>alert(1)</ScRiPt>`);
       expect(res.status).toBe(403);
     });
 
     test("blocks concat-style SQLi missed by simple keyword rules", async () => {
-      const res = await fetch(`${TEST_URL}/api?id=1'%20%7C%7C%201%20--`);
+      const res = await fetchClose(`${TEST_URL}/api?id=1'%20%7C%7C%201%20--`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("sqli");
@@ -515,7 +523,7 @@ describe("waf module", () => {
 
   describe("native rule-file subset", () => {
     test("blocks based on ARGS rule from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules?token=native-subset-needle`);
+      const res = await fetchClose(`${TEST_URL}/rules?token=native-subset-needle`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.error).toBe("waf_blocked");
@@ -526,7 +534,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_URI rule from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules/blocked-path`);
+      const res = await fetchClose(`${TEST_URL}/rules/blocked-path`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
@@ -544,7 +552,7 @@ describe("waf module", () => {
     });
 
     test("rule-file matches respect detect mode", async () => {
-      const res = await fetch(`${TEST_URL}/rules-detect?token=native-subset-needle`);
+      const res = await fetchClose(`${TEST_URL}/rules-detect?token=native-subset-needle`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("rules detect response");
@@ -554,7 +562,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_HEADERS rule from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-headers`, {
+      const res = await fetchClose(`${TEST_URL}/rules-headers`, {
         headers: { "X-Native-Header": "blocked-header-value" },
       });
       expect(res.status).toBe(403);
@@ -563,7 +571,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_COOKIES rule from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-cookies`, {
+      const res = await fetchClose(`${TEST_URL}/rules-cookies`, {
         headers: { Cookie: "waf_cookie=native-cookie-hit" },
       });
       expect(res.status).toBe(403);
@@ -572,7 +580,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_METHOD rule from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-method`, {
+      const res = await fetchClose(`${TEST_URL}/rules-method`, {
         method: "DELETE",
       });
       expect(res.status).toBe(403);
@@ -581,21 +589,21 @@ describe("waf module", () => {
     });
 
     test("blocks based on REMOTE_ADDR rule from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-ip`);
+      const res = await fetchClose(`${TEST_URL}/rules-ip`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("blocks based on @rx operator from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-regex/regex-path-12345`);
+      const res = await fetchClose(`${TEST_URL}/rules-regex/regex-path-12345`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("blocks based on equals-style operator from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-equals`, {
+      const res = await fetchClose(`${TEST_URL}/rules-equals`, {
         method: "PATCH",
       });
       expect(res.status).toBe(403);
@@ -604,7 +612,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_HEADERS selector rule", async () => {
-      const res = await fetch(`${TEST_URL}/rules-header-selector`, {
+      const res = await fetchClose(`${TEST_URL}/rules-header-selector`, {
         headers: { "X-Scoped-Header": "scoped-header-hit" },
       });
       expect(res.status).toBe(403);
@@ -613,7 +621,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on REQUEST_COOKIES selector rule", async () => {
-      const res = await fetch(`${TEST_URL}/rules-cookie-selector`, {
+      const res = await fetchClose(`${TEST_URL}/rules-cookie-selector`, {
         headers: { Cookie: "scoped_cookie=scoped-cookie-hit" },
       });
       expect(res.status).toBe(403);
@@ -622,49 +630,49 @@ describe("waf module", () => {
     });
 
     test("blocks based on ARGS selector rule", async () => {
-      const res = await fetch(`${TEST_URL}/rules-arg-selector?scoped_arg=scoped-arg-hit&other=ok`);
+      const res = await fetchClose(`${TEST_URL}/rules-arg-selector?scoped_arg=scoped-arg-hit&other=ok`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("uses per-rule status action when blocking", async () => {
-      const res = await fetch(`${TEST_URL}/rules-status/status-path`);
+      const res = await fetchClose(`${TEST_URL}/rules-status/status-path`);
       expect(res.status).toBe(406);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("blocks based on @beginsWith operator from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-begins-with/rules-prefix-hit/path`);
+      const res = await fetchClose(`${TEST_URL}/rules-begins-with/rules-prefix-hit/path`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("blocks based on @endsWith operator from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-ends-with/path/suffix-hit`);
+      const res = await fetchClose(`${TEST_URL}/rules-ends-with/path/suffix-hit`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("blocks based on QUERY_STRING collection from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-query-string?query-string-hit=1`);
+      const res = await fetchClose(`${TEST_URL}/rules-query-string?query-string-hit=1`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("blocks based on REQUEST_LINE collection from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-request-line/request-line-hit`);
+      const res = await fetchClose(`${TEST_URL}/rules-request-line/request-line-hit`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("blocks based on @pm operator from file", async () => {
-      const res = await fetch(`${TEST_URL}/rules-pm`, {
+      const res = await fetchClose(`${TEST_URL}/rules-pm`, {
         headers: { "X-PM-Header": "phrase-hit" },
       });
       expect(res.status).toBe(403);
@@ -704,7 +712,7 @@ describe("waf module", () => {
       expect(blocked.headers.get("connection")).toBe("close");
       await blocked.text();
 
-      const clean = await fetch(`${TEST_URL}/clean`);
+      const clean = await fetchClose(`${TEST_URL}/clean`);
       expect(clean.status).toBe(200);
       expect(await clean.text()).toContain("clean response");
     });
@@ -717,7 +725,7 @@ describe("waf module", () => {
     });
 
     test("per-rule pass overrides block mode", async () => {
-      const res = await fetch(`${TEST_URL}/rules-pass/pass-path`);
+      const res = await fetchClose(`${TEST_URL}/rules-pass/pass-path`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("rules pass response");
@@ -761,7 +769,7 @@ describe("waf module", () => {
     });
 
     test("blocks based on explicit @libinjection_sqli operator", async () => {
-      const res = await fetch(`${TEST_URL}/rules-libinjection?id=1'%20%7C%7C%201%20--`);
+      const res = await fetchClose(`${TEST_URL}/rules-libinjection?id=1'%20%7C%7C%201%20--`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
@@ -983,7 +991,7 @@ describe("waf module", () => {
 
   describe("observability variables", () => {
     test("score-enabled rules expose accumulated score", async () => {
-      const res = await fetch(`${TEST_URL}/rules-score?token=score-subset-needle`);
+      const res = await fetchClose(`${TEST_URL}/rules-score?token=score-subset-needle`);
       expect(res.status).toBe(200);
       expect(res.headers.get("x-waf-result")).toBe("dryrun");
       expect(res.headers.get("x-waf-category")).toBe("rule");
@@ -1059,28 +1067,28 @@ describe("waf module", () => {
 
   describe("transform compatibility subset", () => {
     test("t:lowercase applies per-rule normalization", async () => {
-      const res = await fetch(`${TEST_URL}/rules-transform/TrAnSfOrM-HiT`);
+      const res = await fetchClose(`${TEST_URL}/rules-transform/TrAnSfOrM-HiT`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("accepts t:urlDecode rules and matches decoded query strings", async () => {
-      const res = await fetch(`${TEST_URL}/rules-transform-query?q=url%20decoded`);
+      const res = await fetchClose(`${TEST_URL}/rules-transform-query?q=url%20decoded`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("t:urlDecodeUni applies per-rule decoding", async () => {
-      const res = await fetch(`${TEST_URL}/rules-transform-query?q=unicode%20path`);
+      const res = await fetchClose(`${TEST_URL}/rules-transform-query?q=unicode%20path`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("t:none disables the legacy normalization path for that rule", async () => {
-      const res = await fetch(`${TEST_URL}/rules-transform-none/CaseSensitive-Hit`);
+      const res = await fetchClose(`${TEST_URL}/rules-transform-none/CaseSensitive-Hit`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("rules transform none response");
@@ -1089,28 +1097,28 @@ describe("waf module", () => {
 
   describe("dedicated operator fixtures", () => {
     test("keeps regex coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-regex/operators-regex-123`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-regex/operators-regex-123`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps beginsWith coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-prefix/rules-operators-prefix-hit/path`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-prefix/rules-operators-prefix-hit/path`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps endsWith coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-suffix/path/operators-suffix-hit`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-suffix/path/operators-suffix-hit`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps pm coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-pm`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-pm`, {
         headers: { "X-Operators-Header": "phrase-hit" },
       });
       expect(res.status).toBe(403);
@@ -1119,56 +1127,56 @@ describe("waf module", () => {
     });
 
     test("keeps equals coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-equals`, { method: "PATCH" });
+      const res = await fetchClose(`${TEST_URL}/rules-operators-equals`, { method: "PATCH" });
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps within coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-within`, { method: "DELETE" });
+      const res = await fetchClose(`${TEST_URL}/rules-operators-within`, { method: "DELETE" });
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("within requires exact token membership rather than substring matches", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-within`, { method: "GET" });
+      const res = await fetchClose(`${TEST_URL}/rules-operators-within`, { method: "GET" });
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("rules operators within response");
     });
 
     test("keeps ge coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-ge?ge_arg=10`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-ge?ge_arg=10`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps gt coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-gt?gt_arg=11`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-gt?gt_arg=11`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps le coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-le?le_arg=10`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-le?le_arg=10`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps lt coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-lt?lt_arg=9`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-lt?lt_arg=9`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("numeric comparison operators do not match when the comparison fails", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-lt?lt_arg=10`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-lt?lt_arg=10`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("rules operators lt response");
@@ -1193,28 +1201,28 @@ describe("waf module", () => {
     });
 
     test("keeps ipMatch coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-ipmatch`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-ipmatch`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("ipMatch does not match when the client IP falls outside the configured ranges", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-ipmatch-miss`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-ipmatch-miss`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("rules operators ipmatch miss response");
     });
 
     test("ipMatchFromFile loads local CIDR files and matches client IPs", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-ipmatchfromfile`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-ipmatchfromfile`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps containsWord coverage concrete in operators.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-contains-word`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-contains-word`, {
         headers: { "X-Word-Header": "prefix token suffix" },
       });
       expect(res.status).toBe(403);
@@ -1223,7 +1231,7 @@ describe("waf module", () => {
     });
 
     test("containsWord does not match when the candidate only appears as a substring", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-contains-word-miss`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-contains-word-miss`, {
         headers: { "X-Word-Header": "prefixtoken_suffix" },
       });
       expect(res.status).toBe(200);
@@ -1232,21 +1240,21 @@ describe("waf module", () => {
     });
 
     test("noMatch never produces a detection", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-no-match/some-path`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-no-match/some-path`);
       expect(res.status).toBe(200);
       const body = await res.text();
       expect(body).toContain("rules operators no match response");
     });
 
     test("unconditionalMatch always produces a detection", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-unconditional/some-path`);
+      const res = await fetchClose(`${TEST_URL}/rules-operators-unconditional/some-path`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("validateUrlEncoding matches malformed percent-encoding", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-validate-url-encoding`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-validate-url-encoding`, {
         headers: { "X-Encoded-Header": "bad%2Gvalue" },
       });
       expect(res.status).toBe(403);
@@ -1255,7 +1263,7 @@ describe("waf module", () => {
     });
 
     test("validateUrlEncoding also matches incomplete trailing escapes", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-validate-url-encoding`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-validate-url-encoding`, {
         headers: { "X-Encoded-Header": "bad%" },
       });
       expect(res.status).toBe(403);
@@ -1264,7 +1272,7 @@ describe("waf module", () => {
     });
 
     test("validateUrlEncoding does not match valid percent-encoding", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-validate-url-encoding-miss`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-validate-url-encoding-miss`, {
         headers: { "X-Encoded-Header": "good%20value" },
       });
       expect(res.status).toBe(200);
@@ -1295,7 +1303,7 @@ describe("waf module", () => {
     });
 
     test("validateUtf8Encoding does not match valid UTF-8 bytes", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-validate-utf8-miss`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-validate-utf8-miss`, {
         method: "POST",
         headers: { "Content-Type": "application/octet-stream" },
         body: new TextEncoder().encode("héllo"),
@@ -1306,7 +1314,7 @@ describe("waf module", () => {
     });
 
     test("pmFromFile loads local phrase files at config time and reuses pm semantics", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-pmfromfile`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-pmfromfile`, {
         headers: { "User-Agent": "harmless phrase-hit client" },
       });
       expect(res.status).toBe(403);
@@ -1315,7 +1323,7 @@ describe("waf module", () => {
     });
 
     test("pmFromFile ignores blank lines and comments while loading later phrases", async () => {
-      const res = await fetch(`${TEST_URL}/rules-operators-pmfromfile`, {
+      const res = await fetchClose(`${TEST_URL}/rules-operators-pmfromfile`, {
         headers: { "User-Agent": "agent another-needle present" },
       });
       expect(res.status).toBe(403);
@@ -1361,21 +1369,21 @@ describe("waf module", () => {
 
   describe("dedicated collection fixtures", () => {
     test("keeps query string coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-query?collections-query-hit=1`);
+      const res = await fetchClose(`${TEST_URL}/rules-collections-query?collections-query-hit=1`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps request line coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-line/collections-line-hit`);
+      const res = await fetchClose(`${TEST_URL}/rules-collections-line/collections-line-hit`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps header selector coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-header`, {
+      const res = await fetchClose(`${TEST_URL}/rules-collections-header`, {
         headers: { "X-Collections-Header": "collections-header-hit" },
       });
       expect(res.status).toBe(403);
@@ -1384,7 +1392,7 @@ describe("waf module", () => {
     });
 
     test("keeps cookie selector coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-cookie`, {
+      const res = await fetchClose(`${TEST_URL}/rules-collections-cookie`, {
         headers: { Cookie: "collections_cookie=collections-cookie-hit" },
       });
       expect(res.status).toBe(403);
@@ -1393,7 +1401,7 @@ describe("waf module", () => {
     });
 
     test("keeps arg selector coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-arg?collections_arg=collections-arg-hit`);
+      const res = await fetchClose(`${TEST_URL}/rules-collections-arg?collections_arg=collections-arg-hit`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
@@ -1411,7 +1419,7 @@ describe("waf module", () => {
     });
 
     test("keeps request header-name coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-header-name`, {
+      const res = await fetchClose(`${TEST_URL}/rules-collections-header-name`, {
         headers: { "X-Collections-Name-Hit": "present" },
       });
       expect(res.status).toBe(403);
@@ -1420,28 +1428,28 @@ describe("waf module", () => {
     });
 
     test("keeps request protocol coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-protocol`);
+      const res = await fetchClose(`${TEST_URL}/rules-collections-protocol`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps request scheme coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-scheme`);
+      const res = await fetchClose(`${TEST_URL}/rules-collections-scheme`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps request basename coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-basename/foo/basename-hit`);
+      const res = await fetchClose(`${TEST_URL}/rules-collections-basename/foo/basename-hit`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
     });
 
     test("keeps request ext coverage concrete in collections.rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-collections-ext/test.php`);
+      const res = await fetchClose(`${TEST_URL}/rules-collections-ext/test.php`);
       expect(res.status).toBe(403);
       const body = await res.json();
       expect(body.rule).toBe("rule");
@@ -1486,17 +1494,17 @@ describe("waf module", () => {
 
   describe("response-phase inspection", () => {
     test("blocks based on RESPONSE_STATUS rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-response-status`);
+      const res = await fetchClose(`${TEST_URL}/rules-response-status`);
       expect(res.status).toBe(451);
     });
 
     test("blocks based on RESPONSE_HEADERS rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-response-header`);
+      const res = await fetchClose(`${TEST_URL}/rules-response-header`);
       expect(res.status).toBe(452);
     });
 
     test("blocks based on RESPONSE_HEADERS selector rules", async () => {
-      const res = await fetch(`${TEST_URL}/rules-response-header-selector`);
+      const res = await fetchClose(`${TEST_URL}/rules-response-header-selector`);
       expect(res.status).toBe(453);
     });
   });

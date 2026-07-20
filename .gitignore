@@ -1,5 +1,6 @@
 zig-out/
 .zig-cache/
+.zig-build.lock
 objs/
 Makefile
 perf/**/benchmark/output/

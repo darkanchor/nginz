@@ -9,6 +9,14 @@ import {
 
 const MODULE = "ratelimit";
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("ratelimit module", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
@@ -23,7 +31,7 @@ describe("ratelimit module", () => {
     test("allows unlimited requests to non-rate-limited endpoint", async () => {
       // Make many requests - should all succeed
       for (let i = 0; i < 20; i++) {
-        const res = await fetch(`${TEST_URL}/`);
+        const res = await fetchClose(`${TEST_URL}/`);
         expect(res.status).toBe(200);
       }
     });
@@ -36,7 +44,7 @@ describe("ratelimit module", () => {
 
       // /api has 5r/s limit - make 3 requests, should all succeed
       for (let i = 0; i < 3; i++) {
-        const res = await fetch(`${TEST_URL}/api`);
+        const res = await fetchClose(`${TEST_URL}/api`);
         expect(res.status).toBe(200);
       }
     });
@@ -48,7 +56,7 @@ describe("ratelimit module", () => {
       // /strict has 2r/s limit
       const results = [];
       for (let i = 0; i < 5; i++) {
-        const res = await fetch(`${TEST_URL}/strict`);
+        const res = await fetchClose(`${TEST_URL}/strict`);
         results.push(res.status);
       }
 
@@ -63,18 +71,18 @@ describe("ratelimit module", () => {
 
       // Exhaust the limit
       for (let i = 0; i < 3; i++) {
-        await fetch(`${TEST_URL}/strict`);
+        await fetchClose(`${TEST_URL}/strict`);
       }
 
       // Should be rate limited now
-      const limitedRes = await fetch(`${TEST_URL}/strict`);
+      const limitedRes = await fetchClose(`${TEST_URL}/strict`);
       expect(limitedRes.status).toBe(429);
 
       // Wait for window to reset (1 second)
       await Bun.sleep(1100);
 
       // Should be allowed again
-      const resetRes = await fetch(`${TEST_URL}/strict`);
+      const resetRes = await fetchClose(`${TEST_URL}/strict`);
       expect(resetRes.status).toBe(200);
     });
   });
@@ -87,7 +95,7 @@ describe("ratelimit module", () => {
       // /burst has 3r/s + 2 burst = 5 total per window
       const results = [];
       for (let i = 0; i < 7; i++) {
-        const res = await fetch(`${TEST_URL}/burst`);
+        const res = await fetchClose(`${TEST_URL}/burst`);
         results.push(res.status);
       }
 
@@ -100,7 +108,7 @@ describe("ratelimit module", () => {
       await Bun.sleep(1100);
 
       const statuses = await Promise.all(
-        Array.from({ length: 6 }, () => fetch(`${TEST_URL}/api`).then((res) => res.status))
+        Array.from({ length: 6 }, () => fetchClose(`${TEST_URL}/api`).then((res) => res.status))
       );
 
       expect(statuses.filter((s) => s === 200).length).toBe(5);
@@ -114,15 +122,15 @@ describe("ratelimit module", () => {
       await Bun.sleep(1100);
 
       // Exhaust /strict limit (2r/s)
-      await fetch(`${TEST_URL}/strict`);
-      await fetch(`${TEST_URL}/strict`);
+      await fetchClose(`${TEST_URL}/strict`);
+      await fetchClose(`${TEST_URL}/strict`);
 
       // /strict should be limited
-      const strictRes = await fetch(`${TEST_URL}/strict`);
+      const strictRes = await fetchClose(`${TEST_URL}/strict`);
       expect(strictRes.status).toBe(429);
 
       // /api should still work because it has its own per-location limit window
-      const apiRes = await fetch(`${TEST_URL}/api`);
+      const apiRes = await fetchClose(`${TEST_URL}/api`);
       expect(apiRes.status).toBe(200);
     });
 
@@ -131,7 +139,7 @@ describe("ratelimit module", () => {
 
       const results = [];
       for (let i = 0; i < 6; i++) {
-        const res = await fetch(`${TEST_URL}/plain`);
+        const res = await fetchClose(`${TEST_URL}/plain`);
         results.push(res.status);
       }
 
@@ -145,9 +153,9 @@ describe("ratelimit module", () => {
       await Bun.sleep(1100);
 
       const statuses = [];
-      statuses.push((await fetch(`${TEST_URL}/shared-a`)).status);
-      statuses.push((await fetch(`${TEST_URL}/shared-a`)).status);
-      statuses.push((await fetch(`${TEST_URL}/shared-a`)).status);
+      statuses.push((await fetchClose(`${TEST_URL}/shared-a`)).status);
+      statuses.push((await fetchClose(`${TEST_URL}/shared-a`)).status);
+      statuses.push((await fetchClose(`${TEST_URL}/shared-a`)).status);
 
       expect(statuses).toEqual([200, 200, 429]);
     });
@@ -155,10 +163,10 @@ describe("ratelimit module", () => {
     test("same ratelimit_key in different locations still keeps separate location-scoped budgets", async () => {
       await Bun.sleep(1100);
 
-      await fetch(`${TEST_URL}/shared-parent-a`);
-      await fetch(`${TEST_URL}/shared-parent-a`);
+      await fetchClose(`${TEST_URL}/shared-parent-a`);
+      await fetchClose(`${TEST_URL}/shared-parent-a`);
 
-      const otherLocation = await fetch(`${TEST_URL}/shared-parent-b`);
+      const otherLocation = await fetchClose(`${TEST_URL}/shared-parent-b`);
       expect(otherLocation.status).toBe(200);
     });
 
@@ -166,8 +174,8 @@ describe("ratelimit module", () => {
       await Bun.sleep(1100);
 
       const [first, second] = await Promise.all([
-        fetch(`${TEST_URL}/costly`),
-        fetch(`${TEST_URL}/costly`),
+        fetchClose(`${TEST_URL}/costly`),
+        fetchClose(`${TEST_URL}/costly`),
       ]);
 
       const responses = [first, second];
@@ -185,7 +193,7 @@ describe("ratelimit module", () => {
       await Bun.sleep(1100);
 
       for (let i = 0; i < 5; i++) {
-        const res = await fetch(`${TEST_URL}/skip`);
+        const res = await fetchClose(`${TEST_URL}/skip`);
         expect(res.status).toBe(200);
         expect(res.headers.get("x-ratelimit-result")).toBe("allow");
       }
@@ -196,7 +204,7 @@ describe("ratelimit module", () => {
     test("default path exposes IP-derived key, source, cost, and decision", async () => {
       await Bun.sleep(1100);
 
-      const res = await fetch(`${TEST_URL}/observed`);
+      const res = await fetchClose(`${TEST_URL}/observed`);
 
       expect(res.status).toBe(200);
       expect(res.headers.get("x-ratelimit-cost")).toBe("1");
@@ -212,7 +220,7 @@ describe("ratelimit module", () => {
 
       const statuses = [];
       for (let i = 0; i < 11; i++) {
-        statuses.push((await fetch(`${TEST_URL}/inherit-parent/child-rate-10`)).status);
+        statuses.push((await fetchClose(`${TEST_URL}/inherit-parent/child-rate-10`)).status);
       }
 
       expect(statuses.filter((s) => s === 200).length).toBe(10);
@@ -230,15 +238,15 @@ describe("ratelimit module", () => {
       await Bun.sleep(1050);
       const fills = await Promise.all(
         Array.from({ length: 1024 }, (_, index) =>
-          fetch(`${TEST_URL}/fill?k=key-${index}`).then((res) => res.status),
+          fetchClose(`${TEST_URL}/fill?k=key-${index}`).then((res) => res.status),
         ),
       );
       expect(fills.every((status) => status === 200)).toBe(true);
 
-      const overflow = await fetch(`${TEST_URL}/fill?k=overflow`);
+      const overflow = await fetchClose(`${TEST_URL}/fill?k=overflow`);
       expect(overflow.status).toBe(429);
 
-      let metrics = await fetch(`${TEST_URL}/metrics`);
+      let metrics = await fetchClose(`${TEST_URL}/metrics`);
       expect(metrics.status).toBe(200);
       expect(metrics.headers.get("x-ratelimit-entries")).toBe("1024");
       expect(metrics.headers.get("x-ratelimit-capacity-rejected")).toBe("1");
@@ -246,7 +254,7 @@ describe("ratelimit module", () => {
 
       await reloadNginz();
 
-      metrics = await fetch(`${TEST_URL}/metrics`);
+      metrics = await fetchClose(`${TEST_URL}/metrics`);
       expect(metrics.status).toBe(200);
       expect(metrics.headers.get("x-ratelimit-entries")).toBe("1024");
       expect(metrics.headers.get("x-ratelimit-capacity-rejected")).toBe("1");

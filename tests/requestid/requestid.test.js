@@ -14,6 +14,14 @@ let httpMock;
 // UUID4 regex pattern: 8-4-4-4-12 hex characters
 const UUID4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("requestid module", () => {
   beforeAll(async () => {
     // Start mock backend server
@@ -31,7 +39,7 @@ describe("requestid module", () => {
 
   describe("basic functionality", () => {
     test("generates X-Request-ID response header", async () => {
-      const res = await fetch(`${TEST_URL}/return-test`);
+      const res = await fetchClose(`${TEST_URL}/return-test`);
       expect(res.status).toBe(200);
 
       const requestId = res.headers.get("X-Request-ID");
@@ -43,7 +51,7 @@ describe("requestid module", () => {
       const ids = new Set();
 
       for (let i = 0; i < 10; i++) {
-        const res = await fetch(`${TEST_URL}/return-test`);
+        const res = await fetchClose(`${TEST_URL}/return-test`);
         const requestId = res.headers.get("X-Request-ID");
         ids.add(requestId);
       }
@@ -55,7 +63,7 @@ describe("requestid module", () => {
 
   describe("disabled location", () => {
     test("does not generate ID when request_id is not enabled", async () => {
-      const res = await fetch(`${TEST_URL}/disabled`);
+      const res = await fetchClose(`${TEST_URL}/disabled`);
       expect(res.status).toBe(200);
 
       const requestId = res.headers.get("X-Request-ID");
@@ -66,7 +74,7 @@ describe("requestid module", () => {
   describe("ID propagation", () => {
     test("propagates existing X-Request-ID from request", async () => {
       const incomingId = "test-propagated-id-12345";
-      const res = await fetch(`${TEST_URL}/return-test`, {
+      const res = await fetchClose(`${TEST_URL}/return-test`, {
         headers: { "X-Request-ID": incomingId },
       });
       expect(res.status).toBe(200);
@@ -77,7 +85,7 @@ describe("requestid module", () => {
     });
 
     test("generates new ID when no incoming header", async () => {
-      const res = await fetch(`${TEST_URL}/return-test`);
+      const res = await fetchClose(`${TEST_URL}/return-test`);
       expect(res.status).toBe(200);
 
       const requestId = res.headers.get("X-Request-ID");
@@ -89,13 +97,13 @@ describe("requestid module", () => {
       const incomingId = "case-insensitive-test-id";
 
       // Test with lowercase header
-      const res1 = await fetch(`${TEST_URL}/return-test`, {
+      const res1 = await fetchClose(`${TEST_URL}/return-test`, {
         headers: { "x-request-id": incomingId },
       });
       expect(res1.headers.get("X-Request-ID")).toBe(incomingId);
 
       // Test with mixed case header
-      const res2 = await fetch(`${TEST_URL}/return-test`, {
+      const res2 = await fetchClose(`${TEST_URL}/return-test`, {
         headers: { "X-REQUEST-ID": incomingId },
       });
       expect(res2.headers.get("X-Request-ID")).toBe(incomingId);
@@ -103,7 +111,7 @@ describe("requestid module", () => {
 
     test("supports custom request ID header names", async () => {
       const incomingId = "custom-correlation-id-123";
-      const res = await fetch(`${TEST_URL}/custom-header`, {
+      const res = await fetchClose(`${TEST_URL}/custom-header`, {
         headers: { "X-Correlation-ID": incomingId },
       });
       expect(res.status).toBe(200);
@@ -113,7 +121,7 @@ describe("requestid module", () => {
 
     test("rejects oversized or whitespace-bearing incoming IDs and regenerates", async () => {
       for (const incomingId of ["x".repeat(129), "not a safe id"]) {
-        const res = await fetch(`${TEST_URL}/return-test`, {
+        const res = await fetchClose(`${TEST_URL}/return-test`, {
           headers: { "X-Request-ID": incomingId },
         });
         const responseId = res.headers.get("X-Request-ID");
@@ -126,7 +134,7 @@ describe("requestid module", () => {
   describe("proxy pass", () => {
     test("adds X-Request-ID header when proxying", async () => {
       httpMock.requestLog = [];
-      const res = await fetch(`${TEST_URL}/proxy-test`);
+      const res = await fetchClose(`${TEST_URL}/proxy-test`);
       expect(res.status).toBe(200);
 
       const requestId = res.headers.get("X-Request-ID");
@@ -141,7 +149,7 @@ describe("requestid module", () => {
 
   describe("$ngz_request_id variable", () => {
     test("variable contains the request ID", async () => {
-      const res = await fetch(`${TEST_URL}/variable-test`);
+      const res = await fetchClose(`${TEST_URL}/variable-test`);
       expect(res.status).toBe(200);
 
       const body = await res.text();
@@ -152,7 +160,7 @@ describe("requestid module", () => {
     });
 
     test("variable matches UUID4 format", async () => {
-      const res = await fetch(`${TEST_URL}/variable-test`);
+      const res = await fetchClose(`${TEST_URL}/variable-test`);
       const body = await res.text();
 
       // Extract ID from body "id:<uuid>\n"
@@ -162,7 +170,7 @@ describe("requestid module", () => {
 
     test("variable propagates incoming header", async () => {
       const incomingId = "propagated-via-variable-123";
-      const res = await fetch(`${TEST_URL}/variable-test`, {
+      const res = await fetchClose(`${TEST_URL}/variable-test`, {
         headers: { "X-Request-ID": incomingId },
       });
       expect(res.status).toBe(200);
@@ -172,7 +180,7 @@ describe("requestid module", () => {
     });
 
     test("variable still works when response header emission is disabled", async () => {
-      const res = await fetch(`${TEST_URL}/internal-variable`);
+      const res = await fetchClose(`${TEST_URL}/internal-variable`);
       expect(res.status).toBe(200);
 
       const body = await res.text();
@@ -184,7 +192,7 @@ describe("requestid module", () => {
 
   describe("UUID4 format validation", () => {
     test("version nibble is 4", async () => {
-      const res = await fetch(`${TEST_URL}/return-test`);
+      const res = await fetchClose(`${TEST_URL}/return-test`);
       const requestId = res.headers.get("X-Request-ID");
 
       // Character at position 14 should be '4' (version)
@@ -192,7 +200,7 @@ describe("requestid module", () => {
     });
 
     test("variant nibble is valid (8, 9, a, or b)", async () => {
-      const res = await fetch(`${TEST_URL}/return-test`);
+      const res = await fetchClose(`${TEST_URL}/return-test`);
       const requestId = res.headers.get("X-Request-ID");
 
       // Character at position 19 should be 8, 9, a, or b (variant)
@@ -200,7 +208,7 @@ describe("requestid module", () => {
     });
 
     test("correct hyphen positions", async () => {
-      const res = await fetch(`${TEST_URL}/return-test`);
+      const res = await fetchClose(`${TEST_URL}/return-test`);
       const requestId = res.headers.get("X-Request-ID");
 
       expect(requestId[8]).toBe("-");
@@ -210,7 +218,7 @@ describe("requestid module", () => {
     });
 
     test("correct total length", async () => {
-      const res = await fetch(`${TEST_URL}/return-test`);
+      const res = await fetchClose(`${TEST_URL}/return-test`);
       const requestId = res.headers.get("X-Request-ID");
 
       expect(requestId.length).toBe(36);

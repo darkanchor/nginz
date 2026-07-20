@@ -213,6 +213,14 @@ GRANT SELECT ON TABLE json_stress TO ${PG_USER};
 // Suite
 // ---------------------------------------------------------------------------
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("pgrest module - real PostgreSQL 18 integration", () => {
   beforeAll(async () => {
     ensureContainerRunning(PG_CONTAINER);
@@ -241,7 +249,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users returns all 5 seed users as JSON array", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`);
+    const res = await fetchClose(`${TEST_URL}/api/users`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
     const body = await res.json();
@@ -254,7 +262,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with select=id,name returns only those columns", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=id,name`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,name`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(5);
@@ -266,7 +274,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users embeds direct child orders", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=id,name,orders(id,amount)&order=id.asc&limit=1`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,name,orders(id,amount)&order=id.asc&limit=1`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual([
@@ -282,7 +290,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/orders embeds parent user with alias", async () => {
-    const res = await fetch(`${TEST_URL}/api/orders?select=id,amount,user:users(id,name)&order=id.asc&limit=1`);
+    const res = await fetchClose(`${TEST_URL}/api/orders?select=id,amount,user:users(id,name)&order=id.asc&limit=1`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual([
@@ -295,7 +303,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users supports !inner embedding to filter parent rows", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=id,name,orders!inner(id)&order=id.asc`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,name,orders!inner(id)&order=id.asc`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual([
@@ -323,7 +331,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users embeds many-to-many teams with nested owner", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=id,teams!memberships_team_id_fkey(id,name,owner:users(id,name))&order=id.asc&limit=1`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,teams!memberships_team_id_fkey(id,name,owner:users(id,name))&order=id.asc&limit=1`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual([
@@ -342,7 +350,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with eq filter returns only active users", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?status=eq.active`);
+    const res = await fetchClose(`${TEST_URL}/api/users?status=eq.active`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(3); // Alice, Bob, Dave
@@ -350,7 +358,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with neq filter excludes active users", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?status=neq.active`);
+    const res = await fetchClose(`${TEST_URL}/api/users?status=neq.active`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(2); // Carol, Eve
@@ -358,7 +366,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with gt filter returns users with age > 25", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?age=gt.25`);
+    const res = await fetchClose(`${TEST_URL}/api/users?age=gt.25`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(2); // Alice (30), Dave (45)
@@ -366,7 +374,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with gte filter returns users with age >= 25", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?age=gte.25`);
+    const res = await fetchClose(`${TEST_URL}/api/users?age=gte.25`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(3); // Alice (30), Bob (25), Dave (45)
@@ -374,7 +382,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with lt filter returns users with age < 25", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?age=lt.25`);
+    const res = await fetchClose(`${TEST_URL}/api/users?age=lt.25`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(2); // Carol (17), Eve (22)
@@ -382,7 +390,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with lte filter returns users with age <= 22", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?age=lte.22`);
+    const res = await fetchClose(`${TEST_URL}/api/users?age=lte.22`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(2); // Carol (17), Eve (22)
@@ -390,14 +398,14 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with in filter matches multiple values", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?status=in.(active,inactive)`);
+    const res = await fetchClose(`${TEST_URL}/api/users?status=in.(active,inactive)`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(5);
   });
 
   test("GET /api/users with like filter uses wildcard matching", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?name=like.Alice*`);
+    const res = await fetchClose(`${TEST_URL}/api/users?name=like.Alice*`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(1);
@@ -405,7 +413,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with ilike filter is case-insensitive", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?name=ilike.bob*`);
+    const res = await fetchClose(`${TEST_URL}/api/users?name=ilike.bob*`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(1);
@@ -417,7 +425,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with order=name.asc returns names in ascending order", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?order=name.asc`);
+    const res = await fetchClose(`${TEST_URL}/api/users?order=name.asc`);
     expect(res.status).toBe(200);
     const body = await res.json();
     const names = body.map((r) => r.name);
@@ -425,7 +433,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with order=age.desc returns ages in descending order", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?order=age.desc`);
+    const res = await fetchClose(`${TEST_URL}/api/users?order=age.desc`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body[0].name).toBe("Dave Brown"); // 45
@@ -433,17 +441,17 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with limit=2 returns exactly 2 rows", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?limit=2`);
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=2`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(2);
   });
 
   test("GET /api/users with limit and offset returns correct page", async () => {
-    const allRes = await fetch(`${TEST_URL}/api/users?order=id.asc`);
+    const allRes = await fetchClose(`${TEST_URL}/api/users?order=id.asc`);
     const allUsers = await allRes.json();
 
-    const pageRes = await fetch(`${TEST_URL}/api/users?order=id.asc&limit=2&offset=2`);
+    const pageRes = await fetchClose(`${TEST_URL}/api/users?order=id.asc&limit=2&offset=2`);
     expect(pageRes.status).toBe(200);
     const page = await pageRes.json();
     expect(page.length).toBe(2);
@@ -456,7 +464,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with Accept: text/csv returns CSV response", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?order=id.asc&limit=1`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?order=id.asc&limit=1`, {
       headers: { Accept: "text/csv" },
     });
     expect(res.status).toBe(200);
@@ -470,14 +478,14 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with unknown Accept returns 406", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: { Accept: "application/vnd.unknown+format" },
     });
     expect(res.status).toBe(406);
   });
 
   test("HEAD /api/users returns headers without body", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, { method: "HEAD" });
+    const res = await fetchClose(`${TEST_URL}/api/users`, { method: "HEAD" });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
     const text = await res.text();
@@ -485,7 +493,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("OPTIONS /api/users returns allow and CORS headers", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "OPTIONS",
       headers: {
         Origin: "https://example.com",
@@ -498,7 +506,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("OPTIONS /rpc/add_them returns rpc allow and CORS headers", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/add_them`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/add_them`, {
       method: "OPTIONS",
       headers: {
         Origin: "https://example.com",
@@ -511,7 +519,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/ returns an OpenAPI discovery document", async () => {
-    const res = await fetch(`${TEST_URL}/api/`);
+    const res = await fetchClose(`${TEST_URL}/api/`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.openapi).toBe("3.1.0");
@@ -523,7 +531,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with Range: 1-2 returns slice with Content-Range header", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?order=id.asc`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?order=id.asc`, {
       headers: { "Range-Unit": "items", Range: "1-2" },
     });
     expect(res.status).toBe(200);
@@ -534,7 +542,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with Prefer: count=exact returns 206 with total in Content-Range", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=2`, {
       headers: { Prefer: "count=exact" },
     });
     expect(res.status).toBe(206);
@@ -550,14 +558,14 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /rpc/get_user_count invokes STABLE function and returns count of 5", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/get_user_count`);
+    const res = await fetchClose(`${TEST_URL}/rpc/get_user_count`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text).toContain("5");
   });
 
   test("POST /rpc/add_them with JSON body returns sum of two integers", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/add_them`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/add_them`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ a: 3, b: 4 }),
@@ -568,7 +576,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("POST /rpc/add_them with form-urlencoded body returns sum", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/add_them`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/add_them`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "a=10&b=20",
@@ -583,7 +591,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with select=count() returns row count aggregate", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=count()`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=count()`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(Array.isArray(body)).toBe(true);
@@ -592,7 +600,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/orders with grouped sum aggregate returns per-date totals", async () => {
-    const res = await fetch(`${TEST_URL}/api/orders?select=amount.sum(),order_date&order=order_date.asc`);
+    const res = await fetchClose(`${TEST_URL}/api/orders?select=amount.sum(),order_date&order=order_date.asc`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(Array.isArray(body)).toBe(true);
@@ -609,7 +617,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("POST /api/users with return=representation inserts row and returns it", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ name: "New User", email: "newuser@example.com", status: "active", age: 28 }),
@@ -621,11 +629,11 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(rows[0]).toHaveProperty("id");
 
     // Cleanup
-    await fetch(`${TEST_URL}/api/users?id=eq.${rows[0].id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${rows[0].id}`, { method: "DELETE" });
   });
 
   test("POST /api/users with return=minimal returns empty body", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=minimal" },
       body: JSON.stringify({ name: "Minimal User", email: "minimal@example.com", status: "active", age: 31 }),
@@ -639,7 +647,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("POST /api/users with return=headers-only returns Location header without body", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=headers-only" },
       body: JSON.stringify({ name: "Headers Only", email: "headersonly@example.com", status: "inactive", age: 26 }),
@@ -653,7 +661,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("PATCH /api/users updates a row and returns updated data", async () => {
-    const insertRes = await fetch(`${TEST_URL}/api/users`, {
+    const insertRes = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ name: "Patch Target", email: "patchtarget@example.com", status: "active", age: 35 }),
@@ -661,7 +669,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const inserted = await insertRes.json();
     const id = inserted[0].id;
 
-    const patchRes = await fetch(`${TEST_URL}/api/users?id=eq.${id}`, {
+    const patchRes = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ status: "inactive" }),
@@ -672,11 +680,11 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(updated[0].name).toBe("Patch Target");
 
     // Cleanup
-    await fetch(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
   });
 
   test("DELETE /api/users removes the matching row", async () => {
-    const insertRes = await fetch(`${TEST_URL}/api/users`, {
+    const insertRes = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ name: "Delete Target", email: "deletetarget@example.com", status: "active", age: 40 }),
@@ -684,16 +692,16 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const inserted = await insertRes.json();
     const id = inserted[0].id;
 
-    const delRes = await fetch(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
+    const delRes = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
     expect(delRes.status).toBe(200);
 
-    const check = await fetch(`${TEST_URL}/api/users?id=eq.${id}`);
+    const check = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`);
     const rows = await check.json();
     expect(rows.length).toBe(0);
   });
 
   test("bulk POST /api/users inserts multiple rows from JSON array", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify([
@@ -708,7 +716,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(rows[1].name).toBe("Bulk B");
 
     // Cleanup
-    await fetch(`${TEST_URL}/api/users?email=in.(bulk-a@example.com,bulk-b@example.com)`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?email=in.(bulk-a@example.com,bulk-b@example.com)`, { method: "DELETE" });
   });
 
   // =========================================================================
@@ -716,7 +724,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with is.null filter returns rows where bio is null", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?bio=is.null`);
+    const res = await fetchClose(`${TEST_URL}/api/users?bio=is.null`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(3); // Carol, Dave, Eve have null bio
@@ -724,7 +732,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with not.like filter excludes matching names", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?name=not.like.Alice*`);
+    const res = await fetchClose(`${TEST_URL}/api/users?name=not.like.Alice*`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(4);
@@ -733,7 +741,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
 
   test("GET /api/users with or() filter matches either condition", async () => {
     // bio=Engineer (Alice) OR status=inactive (Carol, Eve)
-    const res = await fetch(`${TEST_URL}/api/users?or=(bio.eq.Engineer,status.eq.inactive)`);
+    const res = await fetchClose(`${TEST_URL}/api/users?or=(bio.eq.Engineer,status.eq.inactive)`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(3); // Alice, Carol, Eve
@@ -744,7 +752,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with alias:col in select renames the JSON key", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=user_name:name&order=id.asc&limit=1`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=user_name:name&order=id.asc&limit=1`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body[0]).toHaveProperty("user_name");
@@ -753,7 +761,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with col::text cast returns the value as text", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=age::text&order=id.asc&limit=1`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=age::text&order=id.asc&limit=1`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body[0]).toHaveProperty("age");
@@ -765,7 +773,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with Accept: text/xml returns XML-structured response", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?order=id.asc&limit=1`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?order=id.asc&limit=1`, {
       headers: { Accept: "text/xml" },
     });
     expect(res.status).toBe(200);
@@ -778,7 +786,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with Accept: text/plain returns newline-separated values", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=name&order=id.asc&limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?select=name&order=id.asc&limit=2`, {
       headers: { Accept: "text/plain" },
     });
     expect(res.status).toBe(200);
@@ -793,7 +801,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with Accept-Profile: public uses the allowed schema", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?order=id.asc&limit=1`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?order=id.asc&limit=1`, {
       headers: { "Accept-Profile": "public" },
     });
     expect(res.status).toBe(200);
@@ -802,7 +810,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with disallowed Accept-Profile returns PGRST106 error", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: { "Accept-Profile": "secret_schema" },
     });
     expect(res.status).toBe(406);
@@ -811,7 +819,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("POST /api/users with disallowed Content-Profile returns PGRST106 error", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Content-Profile": "secret_schema" },
       body: JSON.stringify({ name: "X", email: "x@x.com" }),
@@ -826,7 +834,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("pgrst.object+json with exactly one matching row returns a JSON object", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?email=eq.alice@example.com`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?email=eq.alice@example.com`, {
       headers: { Accept: "application/vnd.pgrst.object+json" },
     });
     expect(res.status).toBe(200);
@@ -837,7 +845,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("pgrst.object+json with zero matching rows returns 406", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?email=eq.nobody@example.com`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?email=eq.nobody@example.com`, {
       headers: { Accept: "application/vnd.pgrst.object+json" },
     });
     expect(res.status).toBe(406);
@@ -846,7 +854,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("pgrst.object+json with multiple matching rows returns 406", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?status=eq.active`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?status=eq.active`, {
       headers: { Accept: "application/vnd.pgrst.object+json" },
     });
     expect(res.status).toBe(406);
@@ -856,7 +864,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
 
   test("nulls=stripped removes null fields from JSON array results", async () => {
     // Alice and Bob have non-null bio; Carol has null bio
-    const res = await fetch(`${TEST_URL}/api/users?select=name,bio&email=eq.carol@example.com`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?select=name,bio&email=eq.carol@example.com`, {
       headers: { Accept: "application/vnd.pgrst.array+json;nulls=stripped" },
     });
     expect(res.status).toBe(200);
@@ -866,7 +874,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("pgrst.object+json;nulls=stripped combines singular and stripped semantics", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=name,bio&email=eq.carol@example.com`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?select=name,bio&email=eq.carol@example.com`, {
       headers: { Accept: "application/vnd.pgrst.object+json;nulls=stripped" },
     });
     expect(res.status).toBe(200);
@@ -881,7 +889,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with order=bio.asc.nullsfirst puts null bios first", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=name,bio&order=bio.asc.nullsfirst`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=name,bio&order=bio.asc.nullsfirst`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body[0].bio).toBeNull();
@@ -892,7 +900,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with order=bio.asc.nullslast puts null bios last", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=name,bio&order=bio.asc.nullslast`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=name,bio&order=bio.asc.nullslast`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body[0].bio).toBe("Designer"); // Bob
@@ -907,7 +915,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/users with min and max aggregates returns bounds of seed data", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=age.min(),age.max()`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=age.min(),age.max()`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(1);
@@ -916,7 +924,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("GET /api/users with avg aggregate returns mean of seed ages", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=age.avg()`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=age.avg()`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.length).toBe(1);
@@ -929,7 +937,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("Prefer: handling=strict rejects unknown preference before any SQL", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -941,12 +949,12 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const body = await res.json();
     expect(body.message).toContain("Invalid Prefer header");
     // Verify no row was inserted
-    const check = await fetch(`${TEST_URL}/api/users?email=eq.strict@example.com`);
+    const check = await fetchClose(`${TEST_URL}/api/users?email=eq.strict@example.com`);
     expect((await check.json()).length).toBe(0);
   });
 
   test("Prefer: handling=lenient ignores unknown preference and proceeds normally", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -957,7 +965,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(res.status).toBe(201);
     const rows = await res.json();
     expect(rows[0].name).toBe("Lenient User");
-    await fetch(`${TEST_URL}/api/users?id=eq.${rows[0].id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${rows[0].id}`, { method: "DELETE" });
   });
 
   // =========================================================================
@@ -965,7 +973,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("Prefer: max-affected=1 emits Preference-Applied when limit is not exceeded", async () => {
-    const insertRes = await fetch(`${TEST_URL}/api/users`, {
+    const insertRes = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ name: "MaxAffect Target", email: "maxaffect@example.com", status: "pending", age: 25 }),
@@ -973,7 +981,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const inserted = await insertRes.json();
     const id = inserted[0].id;
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.${id}`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Prefer: "max-affected=1" },
       body: JSON.stringify({ status: "active" }),
@@ -981,20 +989,20 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("preference-applied")).toContain("max-affected=1");
 
-    await fetch(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
   });
 
   test("Prefer: max-affected=1 returns 400 when more rows would be affected", async () => {
     const emails = ["maxo1@example.com", "maxo2@example.com", "maxo3@example.com"];
     for (const email of emails) {
-      await fetch(`${TEST_URL}/api/users`, {
+      await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: "Overflow", email, status: "overflow_test", age: 20 }),
       });
     }
 
-    const res = await fetch(`${TEST_URL}/api/users?status=eq.overflow_test`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?status=eq.overflow_test`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Prefer: "max-affected=1" },
       body: JSON.stringify({ age: 99 }),
@@ -1012,7 +1020,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("Prefer: count=planned returns 206 with Content-Range total", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=2`, {
       headers: { Prefer: "count=planned" },
     });
     expect(res.status).toBe(206);
@@ -1022,7 +1030,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("Prefer: count=estimated returns 206 with Content-Range total", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=2`, {
       headers: { Prefer: "count=estimated" },
     });
     expect(res.status).toBe(206);
@@ -1032,7 +1040,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("Prefer: count=planned works for table-valued RPC reads", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/active_users?select=name,age&age=gt.20&order=name.asc&limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/active_users?select=name,age&age=gt.20&order=name.asc&limit=2`, {
       headers: { Prefer: "count=planned" },
     });
     expect(res.status).toBe(206);
@@ -1046,25 +1054,25 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/no_such_table returns 404 for undefined table", async () => {
-    const res = await fetch(`${TEST_URL}/api/no_such_table`);
+    const res = await fetchClose(`${TEST_URL}/api/no_such_table`);
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "Undefined table" });
   });
 
   test("GET /rpc/no_such_function returns 404 for undefined function", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/no_such_function`);
+    const res = await fetchClose(`${TEST_URL}/rpc/no_such_function`);
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ message: "Undefined function" });
   });
 
   test("GET /rpc/broken_sql returns 400 for PostgreSQL syntax errors", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/broken_sql`);
+    const res = await fetchClose(`${TEST_URL}/rpc/broken_sql`);
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ message: "SQL syntax error" });
   });
 
   test("POST /api/users duplicate email returns 409 for constraint violation", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: "Dup User", email: "alice@example.com", status: "active", age: 33 }),
@@ -1074,7 +1082,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("POST /api/readonly_docs returns 403 for insufficient privilege", async () => {
-    const res = await fetch(`${TEST_URL}/api/readonly_docs`, {
+    const res = await fetchClose(`${TEST_URL}/api/readonly_docs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: "Denied" }),
@@ -1088,7 +1096,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("GET /api/active_users_view supports filtering, ordering, and pagination on views", async () => {
-    const res = await fetch(`${TEST_URL}/api/active_users_view?age=gte.25&order=name.desc&limit=2`);
+    const res = await fetchClose(`${TEST_URL}/api/active_users_view?age=gte.25&order=name.desc&limit=2`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual([
       { id: "4", name: "Dave Brown", email: "dave@example.com", status: "active", age: "45", bio: null },
@@ -1097,7 +1105,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("PATCH /api/users_editable_view updates rows through an updatable view", async () => {
-    const res = await fetch(`${TEST_URL}/api/users_editable_view?id=eq.1`, {
+    const res = await fetchClose(`${TEST_URL}/api/users_editable_view?id=eq.1`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ bio: "Updated via view" }),
@@ -1109,7 +1117,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("PATCH /api/user_order_summary_view fails for a non-updatable view", async () => {
-    const res = await fetch(`${TEST_URL}/api/user_order_summary_view?id=eq.1`, {
+    const res = await fetchClose(`${TEST_URL}/api/user_order_summary_view?id=eq.1`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ name: "Nope" }),
@@ -1124,7 +1132,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("PUT /api/users with non-existent id inserts a new row", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.9999`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.9999`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ id: 9999, name: "Put User", email: "putuser@example.com", status: "active", age: 28 }),
@@ -1134,11 +1142,11 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(rows[0].id).toBe("9999");
     expect(rows[0].name).toBe("Put User");
 
-    await fetch(`${TEST_URL}/api/users?id=eq.9999`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.9999`, { method: "DELETE" });
   });
 
   test("PUT /api/users with existing id updates the row", async () => {
-    const insertRes = await fetch(`${TEST_URL}/api/users`, {
+    const insertRes = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ name: "Put Target", email: "puttarget@example.com", status: "active", age: 30 }),
@@ -1146,7 +1154,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const inserted = await insertRes.json();
     const id = Number(inserted[0].id);
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.${id}`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ id, name: "Put Updated", email: "puttarget@example.com", status: "inactive", age: 31 }),
@@ -1156,11 +1164,11 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(rows[0].name).toBe("Put Updated");
     expect(rows[0].status).toBe("inactive");
 
-    await fetch(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
   });
 
   test("POST with resolution=merge-duplicates upserts on email conflict", async () => {
-    const insertRes = await fetch(`${TEST_URL}/api/users`, {
+    const insertRes = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ name: "Conflict Original", email: "conflict@example.com", status: "active", age: 30 }),
@@ -1168,7 +1176,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const original = await insertRes.json();
     const id = original[0].id;
 
-    const upsertRes = await fetch(`${TEST_URL}/api/users?on_conflict=email`, {
+    const upsertRes = await fetchClose(`${TEST_URL}/api/users?on_conflict=email`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1181,7 +1189,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(upserted[0].name).toBe("Conflict Updated");
     expect(upserted[0].email).toBe("conflict@example.com");
 
-    await fetch(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
   });
 
   // =========================================================================
@@ -1190,7 +1198,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
 
   test("POST /api/users with text/csv body inserts rows from CSV", async () => {
     const csvBody = "name,email,status,age\nCsv User,csvuser@example.com,active,27";
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "text/csv", Prefer: "return=representation" },
       body: csvBody,
@@ -1200,7 +1208,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(rows[0].name).toBe("Csv User");
     expect(rows[0].email).toBe("csvuser@example.com");
 
-    await fetch(`${TEST_URL}/api/users?id=eq.${rows[0].id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${rows[0].id}`, { method: "DELETE" });
   });
 
   // =========================================================================
@@ -1208,7 +1216,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("POST /api/users with missing=default uses column DEFAULT for omitted fields", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1221,7 +1229,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(rows[0].status).toBe("active"); // column DEFAULT
     expect(rows[0].name).toBe("Default Status");
 
-    await fetch(`${TEST_URL}/api/users?id=eq.${rows[0].id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${rows[0].id}`, { method: "DELETE" });
   });
 
   // =========================================================================
@@ -1233,14 +1241,14 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const emailB = "limitpatch-b@example.com";
 
     for (const [name, email] of [["Limit A", emailA], ["Limit B", emailB]]) {
-      await fetch(`${TEST_URL}/api/users`, {
+      await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, email, status: "draft", age: 20 }),
       });
     }
 
-    const patchRes = await fetch(`${TEST_URL}/api/users?status=eq.draft&limit=1&order=id.asc`, {
+    const patchRes = await fetchClose(`${TEST_URL}/api/users?status=eq.draft&limit=1&order=id.asc`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ status: "done" }),
@@ -1258,19 +1266,19 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const emailB = "limitdel-b@example.com";
 
     for (const [name, email] of [["Del A", emailA], ["Del B", emailB]]) {
-      await fetch(`${TEST_URL}/api/users`, {
+      await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, email, status: "todelete", age: 20 }),
       });
     }
 
-    const delRes = await fetch(`${TEST_URL}/api/users?status=eq.todelete&limit=1&order=id.asc`, {
+    const delRes = await fetchClose(`${TEST_URL}/api/users?status=eq.todelete&limit=1&order=id.asc`, {
       method: "DELETE",
     });
     expect(delRes.status).toBe(200);
 
-    const check = await fetch(`${TEST_URL}/api/users?status=eq.todelete`);
+    const check = await fetchClose(`${TEST_URL}/api/users?status=eq.todelete`);
     const remaining = await check.json();
     expect(remaining.length).toBe(1);
     expect(remaining[0].email).toBe(emailB); // emailA was deleted (lower id)
@@ -1283,7 +1291,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // =========================================================================
 
   test("PATCH with return=headers-only emits Preference-Applied and returns empty body", async () => {
-    const insertRes = await fetch(`${TEST_URL}/api/users`, {
+    const insertRes = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Prefer: "return=representation" },
       body: JSON.stringify({ name: "HdrsOnly", email: "hdrsonly@example.com", status: "active", age: 28 }),
@@ -1291,7 +1299,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     const inserted = await insertRes.json();
     const id = inserted[0].id;
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.${id}`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json", Prefer: "return=headers-only" },
       body: JSON.stringify({ status: "inactive" }),
@@ -1300,7 +1308,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(res.headers.get("preference-applied")).toContain("return=headers-only");
     expect(await res.text()).toBe("");
 
-    await fetch(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
+    await fetchClose(`${TEST_URL}/api/users?id=eq.${id}`, { method: "DELETE" });
   });
 
   // =========================================================================
@@ -1311,7 +1319,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     // nginx.container.conf sets pgrest_pool_size 8 on /api/ — nginx would
     // refuse to start if the directive were unknown or out-of-range.
     // A successful GET proves the module parsed the directive and connected.
-    const res = await fetch(`${TEST_URL}/api/users?limit=1`);
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=1`);
     expect(res.status).toBe(200);
     const rows = await res.json();
     expect(Array.isArray(rows)).toBe(true);
@@ -1320,12 +1328,12 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   test("pgrest_schemas is isolated per location block", async () => {
     // /api/ uses pgrest_schemas "public"; /rpc/ also uses "public".
     // Requesting with Accept-Profile: public must succeed on both.
-    const apiRes = await fetch(`${TEST_URL}/api/users?limit=1`, {
+    const apiRes = await fetchClose(`${TEST_URL}/api/users?limit=1`, {
       headers: { "Accept-Profile": "public" },
     });
     expect(apiRes.status).toBe(200);
 
-    const rpcRes = await fetch(`${TEST_URL}/rpc/add_them`, {
+    const rpcRes = await fetchClose(`${TEST_URL}/rpc/add_them`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Content-Profile": "public" },
       body: JSON.stringify({ a: 1, b: 2 }),
@@ -1333,7 +1341,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
     expect(rpcRes.status).toBe(200);
 
     // Requesting a disallowed schema must return 406 (PGRST106).
-    const badRes = await fetch(`${TEST_URL}/api/users?limit=1`, {
+    const badRes = await fetchClose(`${TEST_URL}/api/users?limit=1`, {
       headers: { "Accept-Profile": "private" },
     });
     expect(badRes.status).toBe(406);
@@ -1342,7 +1350,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   // ── P1: JSON formatting correctness ───────────────────────────────
 
   test("special JSON characters in values survive round-trip", async () => {
-    const res = await fetch(`${TEST_URL}/api/json_stress?id=eq.1`, {
+    const res = await fetchClose(`${TEST_URL}/api/json_stress?id=eq.1`, {
       headers: { Accept: "application/json" },
     });
     expect(res.status).toBe(200);
@@ -1355,7 +1363,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("mixed text/integer types in same row — all are JSON strings", async () => {
-    const res = await fetch(`${TEST_URL}/api/json_stress?id=eq.1`, {
+    const res = await fetchClose(`${TEST_URL}/api/json_stress?id=eq.1`, {
       headers: { Accept: "application/json" },
     });
     expect(res.status).toBe(200);
@@ -1371,7 +1379,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("wide row (10 columns) returns all fields", async () => {
-    const res = await fetch(`${TEST_URL}/api/json_stress?id=eq.1`, {
+    const res = await fetchClose(`${TEST_URL}/api/json_stress?id=eq.1`, {
       headers: { Accept: "application/json" },
     });
     expect(res.status).toBe(200);
@@ -1386,7 +1394,7 @@ describe("pgrest module - real PostgreSQL 18 integration", () => {
   });
 
   test("nulls=stripped removes null fields", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=name,bio&limit=5`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?select=name,bio&limit=5`, {
       headers: { Accept: "application/json; nulls=stripped" },
     });
     expect(res.status).toBe(200);

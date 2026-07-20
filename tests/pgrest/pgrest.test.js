@@ -17,6 +17,14 @@ function lastSql() {
   return pgMock.getLastQuery();
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("pgrest module", () => {
   beforeAll(async () => {
     // Start PostgreSQL mock server
@@ -577,7 +585,7 @@ describe("pgrest module", () => {
   // ============================================================================
 
   test("GET /api/users returns all users as JSON array", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`);
+    const res = await fetchClose(`${TEST_URL}/api/users`);
     expect(res.status).toBe(200);
 
     const contentType = res.headers.get("content-type");
@@ -597,32 +605,32 @@ describe("pgrest module", () => {
       rows: [["x".repeat(70 * 1024)]],
     }));
 
-    const res = await fetch(`${TEST_URL}/api/oversized_response`);
+    const res = await fetchClose(`${TEST_URL}/api/oversized_response`);
     expect(res.status).toBe(502);
     expect(await res.json()).toEqual({
       message: "PostgreSQL response exceeds pgrest serialization limit",
     });
 
-    const followup = await fetch(`${TEST_URL}/api/users`);
+    const followup = await fetchClose(`${TEST_URL}/api/users`);
     expect(followup.status).toBe(200);
   });
 
   test("different pgrest_pass backends keep independent live pools", async () => {
-    const primaryBefore = await fetch(`${TEST_URL}/api/users`);
+    const primaryBefore = await fetchClose(`${TEST_URL}/api/users`);
     expect(primaryBefore.status).toBe(200);
     expect((await primaryBefore.json())[0].name).toBe("John Doe");
 
-    const secondary = await fetch(`${TEST_URL}/api-secondary/users`);
+    const secondary = await fetchClose(`${TEST_URL}/api-secondary/users`);
     expect(secondary.status).toBe(200);
     expect(await secondary.json()).toEqual([{ id: "99", name: "Secondary Backend" }]);
 
-    const primaryAfter = await fetch(`${TEST_URL}/api/users`);
+    const primaryAfter = await fetchClose(`${TEST_URL}/api/users`);
     expect(primaryAfter.status).toBe(200);
     expect((await primaryAfter.json())[0].name).toBe("John Doe");
   });
 
   test("GET /api/users with select parameter returns specified columns", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=id,name`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,name`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -640,7 +648,7 @@ describe("pgrest module", () => {
   // ============================================================================
 
   test("GET /api/users with eq filter returns filtered results", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?status=eq.active`);
+    const res = await fetchClose(`${TEST_URL}/api/users?status=eq.active`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -654,7 +662,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/users with id filter returns single user", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.1`);
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.1`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -667,7 +675,7 @@ describe("pgrest module", () => {
   test("GET /api/users with gt filter builds numeric comparison SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?age=gt.18`);
+    const res = await fetchClose(`${TEST_URL}/api/users?age=gt.18`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -678,7 +686,7 @@ describe("pgrest module", () => {
   test("GET /api/users with is.null filter emits SQL NULL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?deleted_at=is.null`);
+    const res = await fetchClose(`${TEST_URL}/api/users?deleted_at=is.null`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -689,7 +697,7 @@ describe("pgrest module", () => {
   test("GET /api/users with in filter emits a proper SQL list", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?status=in.(active,pending)`);
+    const res = await fetchClose(`${TEST_URL}/api/users?status=in.(active,pending)`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -700,7 +708,7 @@ describe("pgrest module", () => {
   test("GET /api/users with or and not.and emits grouped logical SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?or=(age.lt.18,not.and(age.gte.11,age.lte.17))`);
+    const res = await fetchClose(`${TEST_URL}/api/users?or=(age.lt.18,not.and(age.gte.11,age.lte.17))`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -711,7 +719,7 @@ describe("pgrest module", () => {
   test("GET /api/users with like(any) emits ANY array SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?last_name=like(any).{O*,P*}`);
+    const res = await fetchClose(`${TEST_URL}/api/users?last_name=like(any).{O*,P*}`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -722,7 +730,7 @@ describe("pgrest module", () => {
   test("GET /api/users with like(all) emits ALL array SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?last_name=like(all).{O*,*n}`);
+    const res = await fetchClose(`${TEST_URL}/api/users?last_name=like(all).{O*,*n}`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -733,7 +741,7 @@ describe("pgrest module", () => {
   test("GET /api/users with match emits regex SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?name=match.^J.*n$`);
+    const res = await fetchClose(`${TEST_URL}/api/users?name=match.^J.*n$`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -744,7 +752,7 @@ describe("pgrest module", () => {
   test("GET /api/tsearch with fts language emits to_tsquery SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/tsearch?my_tsv=fts(french).amusant`);
+    const res = await fetchClose(`${TEST_URL}/api/tsearch?my_tsv=fts(french).amusant`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -755,7 +763,7 @@ describe("pgrest module", () => {
   test("GET /api/vulnerabilities with quoted identifier decodes into SQL identifier", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/vulnerabilities?%22information.cpe%22=like.*MS*`);
+    const res = await fetchClose(`${TEST_URL}/api/vulnerabilities?%22information.cpe%22=like.*MS*`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -766,7 +774,7 @@ describe("pgrest module", () => {
   test("GET /api/employees with quoted in values preserves commas", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/employees?name=in.(%22Hebdon,John%22,%22Williams,Mary%22)`);
+    const res = await fetchClose(`${TEST_URL}/api/employees?name=in.(%22Hebdon,John%22,%22Williams,Mary%22)`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -777,7 +785,7 @@ describe("pgrest module", () => {
   test("GET /api/people with json path filter emits to_jsonb SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/people?json_data->>blood_type=eq.A-`);
+    const res = await fetchClose(`${TEST_URL}/api/people?json_data->>blood_type=eq.A-`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -788,7 +796,7 @@ describe("pgrest module", () => {
   test("GET /api/users with select alias and cast emits projected SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?select=id,fullName:full_name,birthDate:birth_date,salary::text`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,fullName:full_name,birthDate:birth_date,salary::text`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -804,7 +812,7 @@ describe("pgrest module", () => {
   test("GET /api/orders supports grouped aggregates with alias and output cast", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/orders?select=amount.sum(),average:amount.avg()::int,order_date`);
+    const res = await fetchClose(`${TEST_URL}/api/orders?select=amount.sum(),average:amount.avg()::int,order_date`);
     expect(res.status).toBe(200);
     expect(lastSql()).toBe("SELECT sum(amount) AS sum,avg(amount)::int AS average,order_date FROM orders GROUP BY order_date");
     expect(await res.json()).toEqual([
@@ -816,7 +824,7 @@ describe("pgrest module", () => {
   test("GET /api/people supports computed fields in select and ordering", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/people?select=full_name,job&order=full_name.desc`);
+    const res = await fetchClose(`${TEST_URL}/api/people?select=full_name,job&order=full_name.desc`);
     expect(res.status).toBe(200);
     expect(lastSql()).toBe("SELECT full_name,job FROM people ORDER BY full_name DESC");
     expect(await res.json()).toEqual([{ full_name: "Samuel Beckett", job: "novelist" }]);
@@ -825,7 +833,7 @@ describe("pgrest module", () => {
   test("GET /api/people supports computed fields in filters", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/people?full_name=fts.Beckett`);
+    const res = await fetchClose(`${TEST_URL}/api/people?full_name=fts.Beckett`);
     expect(res.status).toBe(200);
     expect(lastSql()).toBe("SELECT * FROM people WHERE full_name @@ to_tsquery('Beckett')");
     expect(await res.json()).toEqual([{ first_name: "Samuel", last_name: "Beckett", job: "novelist" }]);
@@ -834,7 +842,7 @@ describe("pgrest module", () => {
   test("GET /api/people with select json and array paths emits projected SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/people?select=id,json_data->>blood_type,json_data->phones,primary_language:languages->0`);
+    const res = await fetchClose(`${TEST_URL}/api/people?select=id,json_data->>blood_type,json_data->phones,primary_language:languages->0`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -850,7 +858,7 @@ describe("pgrest module", () => {
   test("GET /api/jsonb_examples emits jsonb columns as native JSON values", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/jsonb_examples`);
+    const res = await fetchClose(`${TEST_URL}/api/jsonb_examples`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual([
       {
@@ -866,7 +874,7 @@ describe("pgrest module", () => {
   // ============================================================================
 
   test("GET /api/users with order parameter sorts results", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?order=name.asc`);
+    const res = await fetchClose(`${TEST_URL}/api/users?order=name.asc`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -880,7 +888,7 @@ describe("pgrest module", () => {
   test("GET /api/users with order nullsfirst emits NULLS FIRST SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?order=name.nullsfirst`);
+    const res = await fetchClose(`${TEST_URL}/api/users?order=name.nullsfirst`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -891,7 +899,7 @@ describe("pgrest module", () => {
   test("GET /api/users with order desc nullslast emits NULLS LAST SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?order=name.desc.nullslast`);
+    const res = await fetchClose(`${TEST_URL}/api/users?order=name.desc.nullslast`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -902,7 +910,7 @@ describe("pgrest module", () => {
   test("GET /api/users with multi-column null ordering emits exact SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?order=name.nullslast,id.desc.nullsfirst`);
+    const res = await fetchClose(`${TEST_URL}/api/users?order=name.nullslast,id.desc.nullsfirst`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -913,7 +921,7 @@ describe("pgrest module", () => {
   test("GET /api/users with malformed order returns 400 before SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?order=name.foo`);
+    const res = await fetchClose(`${TEST_URL}/api/users?order=name.foo`);
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ message: "Invalid order parameter" });
     expect(lastSql()).toBe(null);
@@ -922,7 +930,7 @@ describe("pgrest module", () => {
   test("GET /api/countries with json path order emits to_jsonb ORDER BY SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/countries?location->lat=gte.19&order=location->>lat`);
+    const res = await fetchClose(`${TEST_URL}/api/countries?location->lat=gte.19&order=location->>lat`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -935,7 +943,7 @@ describe("pgrest module", () => {
   // ============================================================================
 
   test("GET /api/users with limit parameter limits results", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?limit=2`);
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=2`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -946,8 +954,7 @@ describe("pgrest module", () => {
   test("GET /api/users combines select, filter, order, limit, and offset", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(
-      `${TEST_URL}/api/users?select=id,name&status=eq.active&order=id.desc&limit=1&offset=1`
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,name&status=eq.active&order=id.desc&limit=1&offset=1`
     );
     expect(res.status).toBe(200);
 
@@ -960,7 +967,7 @@ describe("pgrest module", () => {
 
   test("GET /api/users supports one-level to-many embedding", async () => {
     pgMock.clearTracking();
-    const res = await fetch(`${TEST_URL}/api/users?select=id,name,orders(id,amount)&order=id.asc`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,name,orders(id,amount)&order=id.asc`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -982,7 +989,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/orders supports one-level to-one embedding with alias", async () => {
-    const res = await fetch(`${TEST_URL}/api/orders?select=id,amount,user:users(id,name)&order=id.asc`);
+    const res = await fetchClose(`${TEST_URL}/api/orders?select=id,amount,user:users(id,name)&order=id.asc`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -996,7 +1003,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/users supports !inner embedding to filter parent rows", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=id,name,orders!inner(id)&order=id.asc`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,name,orders!inner(id)&order=id.asc`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -1011,7 +1018,7 @@ describe("pgrest module", () => {
 
   test("GET /api/users supports many-to-many plus nested embedding", async () => {
     pgMock.clearTracking();
-    const res = await fetch(`${TEST_URL}/api/users?select=id,teams!memberships_team_id_fkey(id,name,owner:users(id,name))&order=id.asc`);
+    const res = await fetchClose(`${TEST_URL}/api/users?select=id,teams!memberships_team_id_fkey(id,name,owner:users(id,name))&order=id.asc`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -1034,7 +1041,7 @@ describe("pgrest module", () => {
   // ============================================================================
 
   test("POST /api/users inserts new user and returns result", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1059,7 +1066,7 @@ describe("pgrest module", () => {
   test("POST /api/users with form-urlencoded body maps fields into INSERT SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -1078,7 +1085,7 @@ describe("pgrest module", () => {
   test("POST /api/users with unsupported request media type returns 415", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "text/csv",
@@ -1095,7 +1102,7 @@ describe("pgrest module", () => {
   test("POST /api/users with text/plain body maps payload into data column", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "text/plain",
@@ -1113,7 +1120,7 @@ describe("pgrest module", () => {
     pgMock.clearTracking();
     const payload = `spill-start-${"x".repeat(2048)}-spill-end`;
 
-    const res = await fetch(`${TEST_URL}/api-spill/users`, {
+    const res = await fetchClose(`${TEST_URL}/api-spill/users`, {
       method: "POST",
       headers: {
         "Content-Type": "text/plain",
@@ -1130,7 +1137,7 @@ describe("pgrest module", () => {
   test("POST /api/users with text/xml body maps payload into data column", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "text/xml",
@@ -1147,7 +1154,7 @@ describe("pgrest module", () => {
   test("POST /api/users with octet-stream body maps payload into data column", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/octet-stream",
@@ -1162,7 +1169,7 @@ describe("pgrest module", () => {
   test("POST /api/users with Content-Profile writes to schema-qualified table", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1185,7 +1192,7 @@ describe("pgrest module", () => {
   test("POST /api/users without profile uses unqualified default table path", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1203,7 +1210,7 @@ describe("pgrest module", () => {
   test("POST /api/users ignores Accept-Profile and uses Content-Profile semantics", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1222,7 +1229,7 @@ describe("pgrest module", () => {
   test("PATCH /api/users with Content-Profile updates schema-qualified table", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.5`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
@@ -1242,7 +1249,7 @@ describe("pgrest module", () => {
   test("DELETE /api/users with Content-Profile deletes from schema-qualified table", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.5`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "DELETE",
       headers: {
         "Content-Profile": "admin",
@@ -1258,7 +1265,7 @@ describe("pgrest module", () => {
   test("DELETE /api/users ignores Accept-Profile and uses unqualified default table path", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.5`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "DELETE",
       headers: {
         "Accept-Profile": "admin",
@@ -1272,7 +1279,7 @@ describe("pgrest module", () => {
   test("PATCH /api/users preserves null values in JSON body SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.5`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
@@ -1291,7 +1298,7 @@ describe("pgrest module", () => {
   test("POST /api/users with Prefer: return=minimal omits body and RETURNING", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1311,7 +1318,7 @@ describe("pgrest module", () => {
   test("POST /api/users bulk JSON array uses one INSERT statement", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1333,7 +1340,7 @@ describe("pgrest module", () => {
   test("POST /api/users bulk CSV uses one INSERT statement", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "text/csv",
@@ -1352,7 +1359,7 @@ describe("pgrest module", () => {
   test("POST /api/users with columns parameter ignores extra JSON keys", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?columns=name,email`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?columns=name,email`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1372,7 +1379,7 @@ describe("pgrest module", () => {
   test("POST /api/foo bulk JSON with missing=default emits DEFAULT for missing fields", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/foo?columns=id,bar,baz`, {
+    const res = await fetchClose(`${TEST_URL}/api/foo?columns=id,bar,baz`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1398,7 +1405,7 @@ describe("pgrest module", () => {
   test("POST /api/users with resolution=merge-duplicates and on_conflict=id builds upsert SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?on_conflict=id`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?on_conflict=id`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1420,7 +1427,7 @@ describe("pgrest module", () => {
   test("POST /api/employees with resolution=ignore-duplicates and on_conflict=name builds do-nothing upsert SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/employees?on_conflict=name`, {
+    const res = await fetchClose(`${TEST_URL}/api/employees?on_conflict=name`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1443,7 +1450,7 @@ describe("pgrest module", () => {
   test("PUT /api/users with eq filter performs single-row upsert", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.4`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.4`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -1460,7 +1467,7 @@ describe("pgrest module", () => {
   test("PATCH /api/users with limit and order emits limited update SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?limit=10&order=id&last_login=lt.2020-01-01`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=10&order=id&last_login=lt.2020-01-01`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
@@ -1477,7 +1484,7 @@ describe("pgrest module", () => {
   test("DELETE /api/users with limit and order emits limited delete SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?limit=10&order=id&status=eq.inactive`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=10&order=id&status=eq.inactive`, {
       method: "DELETE",
     });
 
@@ -1490,7 +1497,7 @@ describe("pgrest module", () => {
   test("PATCH /api/users with Prefer: return=headers-only omits body and RETURNING", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.5`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
@@ -1508,7 +1515,7 @@ describe("pgrest module", () => {
   test("POST /api/users with Prefer: handling=strict rejects invalid preferences before SQL", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1525,7 +1532,7 @@ describe("pgrest module", () => {
   test("POST /api/users with Prefer: handling=lenient ignores invalid preferences", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1543,7 +1550,7 @@ describe("pgrest module", () => {
   test("PATCH /api/users with Prefer: max-affected accepts row counts within limit", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?id=eq.5`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?id=eq.5`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
@@ -1559,7 +1566,7 @@ describe("pgrest module", () => {
   test("PATCH /api/users with Prefer: max-affected rejects overflow", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?status=eq.active`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?status=eq.active`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
@@ -1580,7 +1587,7 @@ describe("pgrest module", () => {
   // ============================================================================
 
   test("GET /rpc/get_user_count calls stored function", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/get_user_count`);
+    const res = await fetchClose(`${TEST_URL}/rpc/get_user_count`);
     expect(res.status).toBe(200);
 
     const body = await res.text();
@@ -1589,7 +1596,7 @@ describe("pgrest module", () => {
   });
 
   test("POST /rpc/add_them with JSON body calls function with parameters", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/add_them`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/add_them`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1607,7 +1614,7 @@ describe("pgrest module", () => {
   test("POST /rpc/process_numbers converts JSON arrays to PostgreSQL ARRAY syntax", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/process_numbers`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/process_numbers`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1624,7 +1631,7 @@ describe("pgrest module", () => {
   test("POST /rpc/create_user with Prefer: params=single-object wraps the body into a data parameter", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/create_user`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/create_user`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1644,7 +1651,7 @@ describe("pgrest module", () => {
   test("POST /rpc/add_them with form-urlencoded body parses named RPC params", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/add_them`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/add_them`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -1661,7 +1668,7 @@ describe("pgrest module", () => {
   test("POST /rpc/add_them with unsupported request media type returns 415", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/add_them`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/add_them`, {
       method: "POST",
       headers: {
         "Content-Type": "text/plain",
@@ -1676,7 +1683,7 @@ describe("pgrest module", () => {
   test("POST /rpc/import_csv with text/csv body maps raw payload into data parameter", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/import_csv`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/import_csv`, {
       method: "POST",
       headers: {
         "Content-Type": "text/csv",
@@ -1694,7 +1701,7 @@ describe("pgrest module", () => {
     pgMock.clearTracking();
     const payload = `name,email\nspill-${"y".repeat(2048)},spill@example.com\n`;
 
-    const res = await fetch(`${TEST_URL}/rpc/import_csv`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/import_csv`, {
       method: "POST",
       headers: {
         "Content-Type": "text/csv",
@@ -1709,7 +1716,7 @@ describe("pgrest module", () => {
   test("POST /rpc/upload_blob with octet-stream body maps raw payload into data parameter", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/upload_blob`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/upload_blob`, {
       method: "POST",
       headers: {
         "Content-Type": "application/octet-stream",
@@ -1724,7 +1731,7 @@ describe("pgrest module", () => {
   test("POST /rpc/mult_them with unnamed json parameter uses positional JSON body", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/mult_them`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/mult_them`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1740,7 +1747,7 @@ describe("pgrest module", () => {
   test("GET /rpc/plus_one collapses repeated query params into a variadic ARRAY argument", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/plus_one?v=1&v=2&v=3&v=4`);
+    const res = await fetchClose(`${TEST_URL}/rpc/plus_one?v=1&v=2&v=3&v=4`);
     expect(res.status).toBe(200);
     expect(lastSql()).toBe("SELECT plus_one(v => ARRAY[1,2,3,4])");
     expect(await res.text()).toContain("{2,3,4,5}");
@@ -1749,7 +1756,7 @@ describe("pgrest module", () => {
   test("GET /rpc/best_films_2017 applies table-style select, filter, order, and limit to a TVF", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/best_films_2017?select=title,rating&rating=gt.8&order=title.desc&limit=2`);
+    const res = await fetchClose(`${TEST_URL}/rpc/best_films_2017?select=title,rating&rating=gt.8&order=title.desc&limit=2`);
     expect(res.status).toBe(200);
     expect(lastSql()).toBe(`SELECT title,rating FROM "best_films_2017"() WHERE rating > '8' ORDER BY title DESC LIMIT 2`);
     expect(await res.json()).toEqual([
@@ -1761,7 +1768,7 @@ describe("pgrest module", () => {
   test("GET /users honors Range headers in blocking mode", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: {
         "Range-Unit": "items",
         Range: "1-1",
@@ -1780,7 +1787,7 @@ describe("pgrest module", () => {
   test("GET /users with Prefer: count=exact returns partial-content metadata in blocking mode", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=2`, {
       headers: {
         Prefer: "count=exact",
       },
@@ -1796,7 +1803,7 @@ describe("pgrest module", () => {
   test("GET /rpc/best_films_2017 with Prefer: count=exact returns TVF count metadata in blocking mode", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/best_films_2017?select=title,rating&rating=gt.8&order=title.desc&limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/best_films_2017?select=title,rating&rating=gt.8&order=title.desc&limit=2`, {
       headers: {
         Prefer: "count=exact",
       },
@@ -1811,7 +1818,7 @@ describe("pgrest module", () => {
   test("GET /users with Prefer: count=planned uses EXPLAIN instead of count(*)", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users?limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?limit=2`, {
       headers: {
         Prefer: "count=planned",
       },
@@ -1828,7 +1835,7 @@ describe("pgrest module", () => {
   test("GET /rpc/best_films_2017 with Prefer: count=estimated uses EXPLAIN instead of count(*)", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/best_films_2017?select=title,rating&rating=gt.8&order=title.desc&limit=2`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/best_films_2017?select=title,rating&rating=gt.8&order=title.desc&limit=2`, {
       headers: {
         Prefer: "count=estimated",
       },
@@ -1845,7 +1852,7 @@ describe("pgrest module", () => {
   test("POST /rpc/plus_one with form body collapses repeated params into a variadic ARRAY argument", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/plus_one`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/plus_one`, {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -1861,7 +1868,7 @@ describe("pgrest module", () => {
   test("GET /rpc/create_user rejects GET when function metadata is volatile", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/create_user`);
+    const res = await fetchClose(`${TEST_URL}/rpc/create_user`);
     expect(res.status).toBe(405);
     expect(res.headers.get("allow")).toBe("OPTIONS,POST");
     expect(await res.json()).toEqual({
@@ -1875,7 +1882,7 @@ describe("pgrest module", () => {
   // ============================================================================
 
   test("GET /api/users with Accept: text/csv returns CSV format", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: { Accept: "text/csv" },
     });
     expect(res.status).toBe(200);
@@ -1893,7 +1900,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/users with Accept: text/xml returns XML format", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: { Accept: "text/xml" },
     });
     expect(res.status).toBe(200);
@@ -1910,7 +1917,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/users with Accept: text/plain returns plain text", async () => {
-    const res = await fetch(`${TEST_URL}/api/users?select=name`, {
+    const res = await fetchClose(`${TEST_URL}/api/users?select=name`, {
       headers: { Accept: "text/plain" },
     });
     expect(res.status).toBe(200);
@@ -1923,7 +1930,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/users with Accept: application/json returns JSON (default)", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: { Accept: "application/json" },
     });
     expect(res.status).toBe(200);
@@ -1938,7 +1945,7 @@ describe("pgrest module", () => {
   test("GET /api/users with Accept-Profile reads from schema-qualified table", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: { "Accept-Profile": "admin" },
     });
     expect(res.status).toBe(200);
@@ -1958,7 +1965,7 @@ describe("pgrest module", () => {
   test("GET /api/users without profile uses unqualified default table path", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`);
+    const res = await fetchClose(`${TEST_URL}/api/users`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -1969,7 +1976,7 @@ describe("pgrest module", () => {
   test("GET /api/users rejects disallowed Accept-Profile schema", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: { "Accept-Profile": "tenant_999" },
     });
     expect(res.status).toBe(406);
@@ -1983,7 +1990,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/profiles with pgrst object accept returns a single object", async () => {
-    const res = await fetch(`${TEST_URL}/api/profiles?id=eq.1`, {
+    const res = await fetchClose(`${TEST_URL}/api/profiles?id=eq.1`, {
       headers: { Accept: "application/vnd.pgrst.object+json" },
     });
     expect(res.status).toBe(200);
@@ -2000,7 +2007,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/profiles with pgrst object accept returns 406 when zero rows are returned", async () => {
-    const res = await fetch(`${TEST_URL}/api/profiles?id=eq.404`, {
+    const res = await fetchClose(`${TEST_URL}/api/profiles?id=eq.404`, {
       headers: { Accept: "application/vnd.pgrst.object+json" },
     });
     expect(res.status).toBe(406);
@@ -2010,7 +2017,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/profiles with pgrst object accept returns 406 when multiple rows are returned", async () => {
-    const res = await fetch(`${TEST_URL}/api/profiles`, {
+    const res = await fetchClose(`${TEST_URL}/api/profiles`, {
       headers: { Accept: "application/vnd.pgrst.object+json" },
     });
     expect(res.status).toBe(406);
@@ -2020,7 +2027,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/profiles with nulls=stripped removes null fields from array results", async () => {
-    const res = await fetch(`${TEST_URL}/api/profiles`, {
+    const res = await fetchClose(`${TEST_URL}/api/profiles`, {
       headers: { Accept: "application/vnd.pgrst.array+json;nulls=stripped" },
     });
     expect(res.status).toBe(200);
@@ -2033,7 +2040,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/profiles with object+nulls=stripped combines both JSON options", async () => {
-    const res = await fetch(`${TEST_URL}/api/profiles?id=eq.1`, {
+    const res = await fetchClose(`${TEST_URL}/api/profiles?id=eq.1`, {
       headers: { Accept: "application/vnd.pgrst.object+json;nulls=stripped" },
     });
     expect(res.status).toBe(200);
@@ -2043,7 +2050,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/files with Accept: application/octet-stream returns raw payload", async () => {
-    const res = await fetch(`${TEST_URL}/api/files?id=eq.1&select=data`, {
+    const res = await fetchClose(`${TEST_URL}/api/files?id=eq.1&select=data`, {
       headers: { Accept: "application/octet-stream" },
     });
     expect(res.status).toBe(200);
@@ -2054,7 +2061,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/files with octet-stream rejects multi-column results", async () => {
-    const res = await fetch(`${TEST_URL}/api/files`, {
+    const res = await fetchClose(`${TEST_URL}/api/files`, {
       headers: { Accept: "application/octet-stream" },
     });
     expect(res.status).toBe(406);
@@ -2064,7 +2071,7 @@ describe("pgrest module", () => {
   });
 
   test("POST /rpc/get_profile with pgrst object accept returns a single object", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/get_profile`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/get_profile`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2081,7 +2088,7 @@ describe("pgrest module", () => {
   test("POST /rpc/get_user_count with Content-Profile calls schema-qualified function", async () => {
     pgMock.clearTracking();
 
-    const res = await fetch(`${TEST_URL}/rpc/get_user_count`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/get_user_count`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2094,7 +2101,7 @@ describe("pgrest module", () => {
   });
 
   test("POST /rpc/create_user returns Preference-Applied for params=single-object", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/create_user`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/create_user`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2107,7 +2114,7 @@ describe("pgrest module", () => {
   });
 
   test("HEAD /api/users returns headers without a body", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, { method: "HEAD" });
+    const res = await fetchClose(`${TEST_URL}/api/users`, { method: "HEAD" });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
     expect(res.headers.get("range-unit")).toBe("items");
@@ -2117,7 +2124,7 @@ describe("pgrest module", () => {
   });
 
   test("OPTIONS /api/users returns allow and CORS headers", async () => {
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       method: "OPTIONS",
       headers: {
         Origin: "https://example.com",
@@ -2130,7 +2137,7 @@ describe("pgrest module", () => {
   });
 
   test("OPTIONS /rpc/add_them returns rpc allow and CORS headers", async () => {
-    const res = await fetch(`${TEST_URL}/rpc/add_them`, {
+    const res = await fetchClose(`${TEST_URL}/rpc/add_them`, {
       method: "OPTIONS",
       headers: {
         Origin: "https://example.com",
@@ -2143,7 +2150,7 @@ describe("pgrest module", () => {
   });
 
   test("GET /api/ returns an OpenAPI discovery document", async () => {
-    const res = await fetch(`${TEST_URL}/api/`);
+    const res = await fetchClose(`${TEST_URL}/api/`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.openapi).toBe("3.1.0");
@@ -2154,7 +2161,7 @@ describe("pgrest module", () => {
   // ============================================================================
 
   test("GET /health returns OK", async () => {
-    const res = await fetch(`${TEST_URL}/health`);
+    const res = await fetchClose(`${TEST_URL}/health`);
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body.trim()).toBe("OK");
@@ -2201,7 +2208,7 @@ describe("pgrest module", () => {
         JWT_SECRET
       );
 
-      const res = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer ${jwt}` },
       });
       expect(res.status).toBe(200);
@@ -2216,7 +2223,7 @@ describe("pgrest module", () => {
         JWT_SECRET
       );
 
-      const res = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer ${jwt}` },
       });
       expect(res.status).toBe(200);
@@ -2231,7 +2238,7 @@ describe("pgrest module", () => {
         "wrong-secret-key" // Different secret = invalid signature
       );
 
-      const res = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer ${jwt}` },
       });
       expect(res.status).toBe(401);
@@ -2245,7 +2252,7 @@ describe("pgrest module", () => {
         JWT_SECRET
       );
 
-      const res = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer ${jwt}` },
       });
       expect(res.status).toBe(401);
@@ -2259,7 +2266,7 @@ describe("pgrest module", () => {
         JWT_SECRET
       );
 
-      const res = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer ${jwt}` },
       });
       expect(res.status).toBe(401);
@@ -2268,7 +2275,7 @@ describe("pgrest module", () => {
     });
 
     test("malformed JWT returns 401", async () => {
-      const res = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer not.a.valid.jwt.token` },
       });
       expect(res.status).toBe(401);
@@ -2279,7 +2286,7 @@ describe("pgrest module", () => {
     test("JWT without signature segment returns 401", async () => {
       const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
       const payload = Buffer.from(JSON.stringify({ sub: "user123", role: "admin" })).toString("base64url");
-      const res = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer ${header}.${payload}` },
       });
       expect(res.status).toBe(401);
@@ -2288,7 +2295,7 @@ describe("pgrest module", () => {
     });
 
     test("missing JWT uses anon_role", async () => {
-      const res = await fetch(`${TEST_URL}/jwt-api/users`);
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`);
       expect(res.status).toBe(200);
 
       // Should use anon role since no JWT provided
@@ -2301,7 +2308,7 @@ describe("pgrest module", () => {
         JWT_SECRET
       );
 
-      const res = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer ${jwt}` },
       });
       expect(res.status).toBe(200);
@@ -2313,7 +2320,7 @@ describe("pgrest module", () => {
     test("every request starts with RESET ROLE to prevent cross-request role leakage", async () => {
       pgMock.clearTracking();
 
-      const res = await fetch(`${TEST_URL}/jwt-api/users`);
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`);
       expect(res.status).toBe(200);
 
       // RESET ROLE must be the first query so any role set by a previous
@@ -2328,7 +2335,7 @@ describe("pgrest module", () => {
     test("request without JWT clears request.jwt session variable", async () => {
       pgMock.clearTracking();
 
-      const res = await fetch(`${TEST_URL}/jwt-api/users`);
+      const res = await fetchClose(`${TEST_URL}/jwt-api/users`);
       expect(res.status).toBe(200);
 
       // The JWT session variable must be cleared so a stale token from a
@@ -2342,7 +2349,7 @@ describe("pgrest module", () => {
         { sub: "user123", role: "authenticated_user", exp: Math.floor(Date.now() / 1000) + 3600 },
         JWT_SECRET
       );
-      const res1 = await fetch(`${TEST_URL}/jwt-api/users`, {
+      const res1 = await fetchClose(`${TEST_URL}/jwt-api/users`, {
         headers: { Authorization: `Bearer ${jwt}` },
       });
       expect(res1.status).toBe(200);
@@ -2351,7 +2358,7 @@ describe("pgrest module", () => {
       // Request 2: no JWT — after RESET ROLE the connection-level role is
       // the database user (anon is configured for jwt-api, so anon is set).
       pgMock.clearTracking();
-      const res2 = await fetch(`${TEST_URL}/jwt-api/users`);
+      const res2 = await fetchClose(`${TEST_URL}/jwt-api/users`);
       expect(res2.status).toBe(200);
 
       // RESET ROLE must have fired, clearing the previous role.
@@ -2364,7 +2371,7 @@ describe("pgrest module", () => {
   describe("parameterized query execution", () => {
     test("filter value is sent as $1 parameter, not interpolated into SQL", async () => {
       pgMock.clearTracking();
-      const res = await fetch(`${TEST_URL}/api/users?name=eq.Alice`);
+      const res = await fetchClose(`${TEST_URL}/api/users?name=eq.Alice`);
       expect(res.status).toBe(200);
       const log = pgMock.getQueryLog();
       const dataQuery = log.find((q) => q.includes("FROM users") && q.includes("name"));
@@ -2384,7 +2391,7 @@ describe("pgrest module", () => {
         return { columns: ["id", "name"], rows: [] };
       });
       const injected = encodeURIComponent("' OR '1'='1");
-      const res = await fetch(`${TEST_URL}/api/users?name=eq.${injected}`);
+      const res = await fetchClose(`${TEST_URL}/api/users?name=eq.${injected}`);
       expect(res.status).toBe(200);
       // The dangerous string must not appear unquoted; it must be SQL-safe
       expect(capturedQuery).not.toBeNull();
@@ -2396,7 +2403,7 @@ describe("pgrest module", () => {
     test("parameter overflow returns 400 instead of sending mixed placeholder SQL", async () => {
       pgMock.clearTracking();
       const values = Array.from({ length: 65 }, (_, i) => `v${i}`).join(",");
-      const res = await fetch(`${TEST_URL}/api/users?name=in.(${values})`);
+      const res = await fetchClose(`${TEST_URL}/api/users?name=in.(${values})`);
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ message: "Too many SQL parameters" });
 
@@ -2407,7 +2414,7 @@ describe("pgrest module", () => {
 
   describe("malformed payload handling", () => {
     test("malformed Range header returns 400", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         headers: { Range: "invalid-range" },
       });
       expect(res.status).toBe(400);
@@ -2416,7 +2423,7 @@ describe("pgrest module", () => {
     });
 
     test("Range header with dash at start returns 400", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         headers: { Range: "-10" },
       });
       expect(res.status).toBe(400);
@@ -2427,7 +2434,7 @@ describe("pgrest module", () => {
 
   describe("embedding format rejection", () => {
     test("non-JSON Accept with embedding returns 406", async () => {
-      const res = await fetch(`${TEST_URL}/api/users?select=id,name,orders(id)`, {
+      const res = await fetchClose(`${TEST_URL}/api/users?select=id,name,orders(id)`, {
         headers: { Accept: "text/csv" },
       });
       expect(res.status).toBe(406);
@@ -2445,7 +2452,7 @@ describe("pgrest module", () => {
       // distinct backends guarantees that one worker must reject its 17th;
       // retrying only 17 backends can be split between workers indefinitely.
       const statuses = await Promise.all(Array.from({ length: 33 }, (_, i) =>
-        fetch(`${TEST_URL}/backend-${i}/users`, { headers: { Connection: "close" } })
+        fetchClose(`${TEST_URL}/backend-${i}/users`, { headers: { Connection: "close" } })
           .then((res) => res.status)
       ));
       expect(statuses).toContain(503);
@@ -2453,7 +2460,7 @@ describe("pgrest module", () => {
       let retainedStatus = false;
       for (let i = 0; i < 17 && !retainedStatus; i++) {
         const probes = await Promise.all(Array.from({ length: 8 }, () =>
-          fetch(`${TEST_URL}/backend-${i}/users`, { headers: { Connection: "close" } })
+          fetchClose(`${TEST_URL}/backend-${i}/users`, { headers: { Connection: "close" } })
             .then((res) => res.status)
         ));
         retainedStatus = probes.includes(200);
@@ -2461,7 +2468,7 @@ describe("pgrest module", () => {
       expect(retainedStatus).toBe(true);
 
       await reloadNginz();
-      const afterReload = await fetch(`${TEST_URL}/backend-32/users`, {
+      const afterReload = await fetchClose(`${TEST_URL}/backend-32/users`, {
         headers: { Connection: "close" },
       });
       expect(afterReload.status).toBe(200);

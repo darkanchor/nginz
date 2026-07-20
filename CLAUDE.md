@@ -10,6 +10,7 @@ Nginz is a framework for writing nginx modules in Zig. It wraps nginx 1.30.4 and
 - Read from $HOME/.claude/skills
 - This project requires zig 0.16, equip yourself with `skills/zig-0.16/SKILL.md`
 - Nginx is a subtle piece of software, it might take substantial effort to learn a hard fact when debug its core and native modules, as you learnt, append to an existing skill or create one
+- Bun integration test flakiness: see `skills/bun-test-flaky-connection/SKILL.md` before debugging "socket connection was closed unexpectedly" failures
 
 ## Build Commands
 
@@ -122,7 +123,11 @@ Access nginx APIs through the ngx namespace:
 ### Testing
 
 Integration tests use Bun and run against a live nginx instance:
-If used wrong, bun test could introduce false positives by itself, use curl to double confirm
+If used wrong, bun test could introduce false positives by itself, use curl to double confirm.
+`bunfig.toml` sets `maxConcurrency = 1` so suites do not race fixed ports (8888 / mock ports).
+Prefer `testFetch` / `stableFetch` from `tests/harness.js` (sends `Connection: close`, retries ECONNRESET).
+For njs/subrequest suites that share mock ports, use `prepareMockPorts` before `create*Mock` and
+`teardownModule` in `afterAll` so the next file can re-bind cleanly.
 ```bash
 bun test tests/jsonschema/
 ```

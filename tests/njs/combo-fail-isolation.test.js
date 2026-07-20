@@ -1,15 +1,26 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
-  startNginz, stopNginz, cleanupRuntime, TEST_URL,
-  createRedisMock, createPostgresMock, MOCK_PORTS,
+  startNginz,
+  stopNginz,
+  cleanupRuntime,
+  TEST_URL,
+  createRedisMock,
+  createPostgresMock,
+  MOCK_PORTS,
+  teardownModule,
+  prepareMockPorts,
+  testFetch,
 } from "../harness.js";
 
 const MODULE = "njs";
 let redisMock;
 let pgMock;
 
+
+
 describe("njs combo subrequest - failing tests only", () => {
   beforeAll(async () => {
+    await prepareMockPorts(MOCK_PORTS.REDIS, MOCK_PORTS.POSTGRES);
     redisMock = createRedisMock(MOCK_PORTS.REDIS);
     pgMock = createPostgresMock(MOCK_PORTS.POSTGRES);
 
@@ -37,14 +48,11 @@ describe("njs combo subrequest - failing tests only", () => {
   }, 30000);
 
   afterAll(async () => {
-    await stopNginz();
-    cleanupRuntime(MODULE);
-    redisMock?.stop();
-    pgMock?.stop();
+    await teardownModule(MODULE, [redisMock, pgMock], [MOCK_PORTS.REDIS, MOCK_PORTS.POSTGRES]);
   });
 
   test("decr rate gate allows request", async () => {
-    const r1 = await fetch(`${TEST_URL}/combo/decr-gate?key=rate-limit`, { method: "POST" });
+    const r1 = await testFetch(`/combo/decr-gate?key=rate-limit`, { method: "POST" });
     expect(r1.status).toBe(200);
     const b1 = await r1.json();
     expect(b1.allowed).toBe(true);
@@ -53,7 +61,7 @@ describe("njs combo subrequest - failing tests only", () => {
   });
 
   test("exists guard allows write", async () => {
-    const res = await fetch(`${TEST_URL}/combo/exists-guard?key=guard-key`, {
+    const res = await testFetch(`/combo/exists-guard?key=guard-key`, {
       method: "POST",
       body: JSON.stringify({ name: "Guard-User", email: "guard@test.com" }),
     });

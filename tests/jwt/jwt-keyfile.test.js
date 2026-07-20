@@ -155,6 +155,14 @@ function generateEdDsaKeys() {
 
 // ── Suite ──────────────────────────────────────────────────────────────
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("JWT — Algorithm Support & Key Loading", () => {
   beforeAll(async () => {
     generateRsaKeys();
@@ -212,7 +220,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("HS256: legacy jwt_secret still works", async () => {
     const token = createHmacToken("HS256", { sub: "test" }, "my-secret-key-for-testing-hs256");
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -225,7 +233,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
   test("HS384: validates token with SHA-384 HMAC", async () => {
     const secret = "hs384-test-secret-32-bytes-long!!";
     const token = createHmacToken("HS384", { sub: "test" }, secret);
-    const res = await fetch(`${TEST_URL}/hs384`, {
+    const res = await fetchClose(`${TEST_URL}/hs384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -233,7 +241,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("HS384: rejects token with wrong secret", async () => {
     const token = createHmacToken("HS384", { sub: "test" }, "wrong-secret-for-hs384-testing!!");
-    const res = await fetch(`${TEST_URL}/hs384`, {
+    const res = await fetchClose(`${TEST_URL}/hs384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -242,7 +250,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
   test("HS384: also accepts HS256 tokens (inline secret accepts all HMAC)", async () => {
     const secret = "hs384-test-secret-32-bytes-long!!";
     const token = createHmacToken("HS256", { sub: "test" }, secret);
-    const res = await fetch(`${TEST_URL}/hs384`, {
+    const res = await fetchClose(`${TEST_URL}/hs384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -255,7 +263,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
   test("HS512: validates token with SHA-512 HMAC", async () => {
     const secret = "hs512-test-secret-64-bytes-long!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!";
     const token = createHmacToken("HS512", { sub: "test" }, secret);
-    const res = await fetch(`${TEST_URL}/hs512`, {
+    const res = await fetchClose(`${TEST_URL}/hs512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -264,7 +272,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
   test("HS512: rejects token with wrong signature", async () => {
     const secret = "hs512-test-secret-64-bytes-long!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!";
     const token = createHmacToken("HS512", { sub: "test" }, "wrong-secret-for-hs512-testing!!!!!!!!!!!!!!!!!");
-    const res = await fetch(`${TEST_URL}/hs512`, {
+    const res = await fetchClose(`${TEST_URL}/hs512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -276,7 +284,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("RS256: validates RSA-SHA256 signed token", async () => {
     const token = createRsaToken("RS256", { sub: "rs256-user" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/rs256`, {
+    const res = await fetchClose(`${TEST_URL}/rs256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -284,7 +292,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("RS256: rejects token signed with different key", async () => {
     const token = createRsaToken("RS256", { sub: "bad" }, rsaKeys.RS384.privateKey);
-    const res = await fetch(`${TEST_URL}/rs256`, {
+    const res = await fetchClose(`${TEST_URL}/rs256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -292,7 +300,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("RS256: rejects token with HS256 alg on RSA endpoint", async () => {
     const token = createHmacToken("HS256", { sub: "test" }, "some-secret");
-    const res = await fetch(`${TEST_URL}/rs256`, {
+    const res = await fetchClose(`${TEST_URL}/rs256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -303,7 +311,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
       sub: "rs256-user",
       exp: Math.floor(Date.now() / 1000) - 3600,
     }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/rs256`, {
+    const res = await fetchClose(`${TEST_URL}/rs256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -315,7 +323,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("RS384: validates RSA-SHA384 signed token", async () => {
     const token = createRsaToken("RS384", { sub: "rs384-user" }, rsaKeys.RS384.privateKey);
-    const res = await fetch(`${TEST_URL}/rs384`, {
+    const res = await fetchClose(`${TEST_URL}/rs384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -323,7 +331,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("RS384: rejects wrong key", async () => {
     const token = createRsaToken("RS384", { sub: "bad" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/rs384`, {
+    const res = await fetchClose(`${TEST_URL}/rs384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -335,7 +343,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("RS512: validates RSA-SHA512 signed token", async () => {
     const token = createRsaToken("RS512", { sub: "rs512-user" }, rsaKeys.RS512.privateKey);
-    const res = await fetch(`${TEST_URL}/rs512`, {
+    const res = await fetchClose(`${TEST_URL}/rs512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -343,7 +351,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("RS512: rejects wrong key", async () => {
     const token = createRsaToken("RS512", { sub: "bad" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/rs512`, {
+    const res = await fetchClose(`${TEST_URL}/rs512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -355,7 +363,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("kid: matches token to correct key by kid", async () => {
     const token = createRsaTokenWithKid("RS256", "key-alpha", { sub: "alpha-user" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/kid-match`, {
+    const res = await fetchClose(`${TEST_URL}/kid-match`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -363,7 +371,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("kid: matches different kid to different key", async () => {
     const token = createRsaTokenWithKid("RS384", "key-beta", { sub: "beta-user" }, rsaKeys.RS384.privateKey);
-    const res = await fetch(`${TEST_URL}/kid-match`, {
+    const res = await fetchClose(`${TEST_URL}/kid-match`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -371,7 +379,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("kid: rejects an unknown kid instead of falling back", async () => {
     const token = createRsaTokenWithKid("RS256", "key-unknown", { sub: "test" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/kid-match`, {
+    const res = await fetchClose(`${TEST_URL}/kid-match`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -379,7 +387,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("kid: rejects a missing kid when multiple keys are configured", async () => {
     const token = createRsaToken("RS256", { sub: "no-kid-user" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/kid-match`, {
+    const res = await fetchClose(`${TEST_URL}/kid-match`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -387,7 +395,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("algorithm: rejects RS384 even when the RS256 key can verify it", async () => {
     const token = createRsaToken("RS384", { sub: "alg-confusion" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/alg-rs256-only`, {
+    const res = await fetchClose(`${TEST_URL}/alg-rs256-only`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -395,7 +403,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("jwks: validates RSA token from JWKS key material", async () => {
     const token = createRsaTokenWithKid("RS256", "jwks-rs256", { sub: "jwks-user" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/jwks-rs256`, {
+    const res = await fetchClose(`${TEST_URL}/jwks-rs256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -403,7 +411,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("jwks: rejects RSA token signed by a different key", async () => {
     const token = createRsaTokenWithKid("RS256", "jwks-rs256", { sub: "jwks-bad" }, rsaKeys.RS384.privateKey);
-    const res = await fetch(`${TEST_URL}/jwks-rs256`, {
+    const res = await fetchClose(`${TEST_URL}/jwks-rs256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -415,7 +423,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("ES256: validates token signed with ECDSA key", async () => {
     const token = createEcdsaToken("ES256", { sub: "es256-user" }, ecKeys.ES256.privateKey);
-    const res = await fetch(`${TEST_URL}/es256`, {
+    const res = await fetchClose(`${TEST_URL}/es256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -428,7 +436,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
       privateKeyEncoding: { type: "pkcs8", format: "pem" },
     });
     const token = createEcdsaToken("ES256", { sub: "es256-bad" }, privateKey);
-    const res = await fetch(`${TEST_URL}/es256`, {
+    const res = await fetchClose(`${TEST_URL}/es256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -440,7 +448,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("ES384: validates token signed with P-384 ECDSA key", async () => {
     const token = createEcdsaToken("ES384", { sub: "es384-user" }, ecKeys.ES384.privateKey);
-    const res = await fetch(`${TEST_URL}/es384`, {
+    const res = await fetchClose(`${TEST_URL}/es384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -453,7 +461,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
       privateKeyEncoding: { type: "pkcs8", format: "pem" },
     });
     const token = createEcdsaToken("ES384", { sub: "es384-bad" }, privateKey);
-    const res = await fetch(`${TEST_URL}/es384`, {
+    const res = await fetchClose(`${TEST_URL}/es384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -461,7 +469,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("ES384: rejects token with ES256 alg on ES384 endpoint", async () => {
     const token = createEcdsaToken("ES256", { sub: "test" }, ecKeys.ES256.privateKey);
-    const res = await fetch(`${TEST_URL}/es384`, {
+    const res = await fetchClose(`${TEST_URL}/es384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -473,7 +481,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("ES512: validates token signed with P-521 ECDSA key", async () => {
     const token = createEcdsaToken("ES512", { sub: "es512-user" }, ecKeys.ES512.privateKey);
-    const res = await fetch(`${TEST_URL}/es512`, {
+    const res = await fetchClose(`${TEST_URL}/es512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -486,7 +494,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
       privateKeyEncoding: { type: "pkcs8", format: "pem" },
     });
     const token = createEcdsaToken("ES512", { sub: "es512-bad" }, privateKey);
-    const res = await fetch(`${TEST_URL}/es512`, {
+    const res = await fetchClose(`${TEST_URL}/es512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -497,7 +505,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
       sub: "es512-user",
       exp: Math.floor(Date.now() / 1000) - 3600,
     }, ecKeys.ES512.privateKey);
-    const res = await fetch(`${TEST_URL}/es512`, {
+    const res = await fetchClose(`${TEST_URL}/es512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -509,7 +517,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("PS256: validates token signed with RSA-PSS", async () => {
     const token = createPssToken("PS256", { sub: "ps256-user" }, pssKeys.PS256.privateKey);
-    const res = await fetch(`${TEST_URL}/ps256`, {
+    const res = await fetchClose(`${TEST_URL}/ps256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -517,7 +525,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("PS256: rejects token signed by a different RSA key", async () => {
     const token = createPssToken("PS256", { sub: "ps256-bad" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/ps256`, {
+    const res = await fetchClose(`${TEST_URL}/ps256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -529,7 +537,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("PS384: validates token signed with RSA-PSS SHA-384", async () => {
     const token = createPssToken("PS384", { sub: "ps384-user" }, pssKeys.PS384.privateKey);
-    const res = await fetch(`${TEST_URL}/ps384`, {
+    const res = await fetchClose(`${TEST_URL}/ps384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -537,7 +545,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("PS384: rejects token signed by a different RSA key", async () => {
     const token = createPssToken("PS384", { sub: "ps384-bad" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/ps384`, {
+    const res = await fetchClose(`${TEST_URL}/ps384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -545,7 +553,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("PS384: rejects token with PS256 alg on PS384 endpoint", async () => {
     const token = createPssToken("PS256", { sub: "test" }, pssKeys.PS256.privateKey);
-    const res = await fetch(`${TEST_URL}/ps384`, {
+    const res = await fetchClose(`${TEST_URL}/ps384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -557,7 +565,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("PS512: validates token signed with RSA-PSS SHA-512", async () => {
     const token = createPssToken("PS512", { sub: "ps512-user" }, pssKeys.PS512.privateKey);
-    const res = await fetch(`${TEST_URL}/ps512`, {
+    const res = await fetchClose(`${TEST_URL}/ps512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -565,7 +573,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("PS512: rejects token signed by a different RSA key", async () => {
     const token = createPssToken("PS512", { sub: "ps512-bad" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/ps512`, {
+    const res = await fetchClose(`${TEST_URL}/ps512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -576,7 +584,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
       sub: "ps512-user",
       exp: Math.floor(Date.now() / 1000) - 3600,
     }, pssKeys.PS512.privateKey);
-    const res = await fetch(`${TEST_URL}/ps512`, {
+    const res = await fetchClose(`${TEST_URL}/ps512`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -584,7 +592,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("EdDSA: validates token signed with Ed25519", async () => {
     const token = createEdDsaToken({ sub: "eddsa-user" }, eddsaKeys.EdDSA.privateKey);
-    const res = await fetch(`${TEST_URL}/eddsa`, {
+    const res = await fetchClose(`${TEST_URL}/eddsa`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -592,7 +600,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
 
   test("EdDSA: rejects token signed with the wrong key", async () => {
     const token = createEdDsaToken({ sub: "eddsa-bad" }, eddsaKeys.EdDSA.privateKey);
-    const res = await fetch(`${TEST_URL}/rs256`, {
+    const res = await fetchClose(`${TEST_URL}/rs256`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -601,7 +609,7 @@ describe("JWT — Algorithm Support & Key Loading", () => {
   test("alg: RSA key rejects wrong key even with matching RSA alg type", async () => {
     // RS256 token signed with RS256 key, verified against RS384 key → rejected
     const token = createRsaToken("RS256", { sub: "test" }, rsaKeys.RS256.privateKey);
-    const res = await fetch(`${TEST_URL}/rs384`, {
+    const res = await fetchClose(`${TEST_URL}/rs384`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -612,12 +620,12 @@ describe("JWT — Algorithm Support & Key Loading", () => {
   // =====================================================================
 
   test("returns 401 when no Authorization header", async () => {
-    const res = await fetch(`${TEST_URL}/rs256`);
+    const res = await fetchClose(`${TEST_URL}/rs256`);
     expect(res.status).toBe(401);
   });
 
   test("public endpoint accessible without token", async () => {
-    const res = await fetch(`${TEST_URL}/public`);
+    const res = await fetchClose(`${TEST_URL}/public`);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("Public");
   });

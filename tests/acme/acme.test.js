@@ -83,6 +83,14 @@ async function triggerUntilIssued({
   return last;
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("acme module", () => {
   beforeAll(async () => {
     // Ensure clean state
@@ -109,8 +117,7 @@ describe("acme module", () => {
   describe("HTTP-01 Challenge Handler", () => {
     test("returns 404 for unknown challenge token", async () => {
       // When no challenges are registered, any token should return 404
-      const res = await fetch(
-        `${TEST_URL}/.well-known/acme-challenge/unknown-token-12345`
+      const res = await fetchClose(`${TEST_URL}/.well-known/acme-challenge/unknown-token-12345`
       );
       expect(res.status).toBe(404);
     });
@@ -127,7 +134,7 @@ describe("acme module", () => {
     });
 
     test("normal requests pass through on ACME-enabled server", async () => {
-      const res = await fetch(`${TEST_URL}/`);
+      const res = await fetchClose(`${TEST_URL}/`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -136,13 +143,12 @@ describe("acme module", () => {
     });
 
     test("challenge path with no token returns 404", async () => {
-      const res = await fetch(`${TEST_URL}/.well-known/acme-challenge/`);
+      const res = await fetchClose(`${TEST_URL}/.well-known/acme-challenge/`);
       expect(res.status).toBe(404);
     });
 
     test("challenge path traversal is normalized by nginx", async () => {
-      const res = await fetch(
-        `${TEST_URL}/.well-known/acme-challenge/../../../etc/passwd`
+      const res = await fetchClose(`${TEST_URL}/.well-known/acme-challenge/../../../etc/passwd`
       );
       // Nginx normalizes the path to /etc/passwd before our handler sees it
       // So the challenge handler declines and the request falls through to location /
@@ -155,7 +161,7 @@ describe("acme module", () => {
     test("auth_request to acme-trigger is rejected and does not advance ACME state", async () => {
       await restartAcmeEnvironment();
 
-      const gate = await fetch(`${TEST_URL}/auth-gate`, { redirect: "manual" });
+      const gate = await fetchClose(`${TEST_URL}/auth-gate`, { redirect: "manual" });
       expect(gate.status).toBe(403);
 
       const firstTrigger = await triggerAcmeFlow();
@@ -165,7 +171,7 @@ describe("acme module", () => {
     test("SSI include to acme-trigger is rejected and does not advance ACME state", async () => {
       await restartAcmeEnvironment();
 
-      const ssi = await fetch(`${TEST_URL}/ssi-trigger`, { redirect: "manual" });
+      const ssi = await fetchClose(`${TEST_URL}/ssi-trigger`, { redirect: "manual" });
       expect(ssi.status).toBe(200);
       expect(await ssi.text()).toContain("403 Forbidden");
 
@@ -176,7 +182,7 @@ describe("acme module", () => {
     test("mirror to acme-trigger leaves the parent response intact and side-effect free", async () => {
       await restartAcmeEnvironment();
 
-      const mirror = await fetch(`${TEST_URL}/mirror-trigger`, { redirect: "manual" });
+      const mirror = await fetchClose(`${TEST_URL}/mirror-trigger`, { redirect: "manual" });
       expect(mirror.status).toBe(200);
       expect(await mirror.text()).toBe("acme-mirror-ok");
 
@@ -367,7 +373,7 @@ describe("acme module", () => {
   describe("Trigger Endpoint", () => {
     test("trigger endpoint initializes ACME client on first call", async () => {
       // The trigger endpoint should exist at /.well-known/acme-trigger
-      const res = await fetch(`${TEST_URL}/.well-known/acme-trigger`);
+      const res = await fetchClose(`${TEST_URL}/.well-known/acme-trigger`);
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -403,8 +409,7 @@ describe("acme module", () => {
 
       const ready = await triggerUntil(
         async () => {
-          const probe = await fetch(
-            `${TEST_URL}/.well-known/acme-challenge/${challenge.token}`
+          const probe = await fetchClose(`${TEST_URL}/.well-known/acme-challenge/${challenge.token}`
           );
           return probe.status === 200;
         },
@@ -412,8 +417,7 @@ describe("acme module", () => {
       );
       expect(ready.status).not.toBe("error");
 
-      const challengeRes = await fetch(
-        `${TEST_URL}/.well-known/acme-challenge/${challenge.token}`
+      const challengeRes = await fetchClose(`${TEST_URL}/.well-known/acme-challenge/${challenge.token}`
       );
       expect(challengeRes.status).toBe(200);
 
@@ -490,14 +494,14 @@ describe("acme module", () => {
       await startNginz(`tests/${MODULE}/nginx-capacity-reload.conf`, MODULE);
 
       for (let i = 0; i < 16; i++) {
-        const res = await fetch(`${TEST_URL}/.well-known/acme-trigger`, {
+        const res = await fetchClose(`${TEST_URL}/.well-known/acme-trigger`, {
           headers: { Host: `domain-${i}.example.com`, Connection: "close" },
         });
         expect(res.status).toBe(200);
         expect((await res.json()).status).toBe("initialized");
       }
 
-      const overflow = await fetch(`${TEST_URL}/.well-known/acme-trigger`, {
+      const overflow = await fetchClose(`${TEST_URL}/.well-known/acme-trigger`, {
         headers: { Host: "domain-16.example.com", Connection: "close" },
       });
       expect(overflow.status).toBe(503);
@@ -505,12 +509,12 @@ describe("acme module", () => {
 
       await reloadNginz();
 
-      const preserved = await fetch(`${TEST_URL}/.well-known/acme-trigger`, {
+      const preserved = await fetchClose(`${TEST_URL}/.well-known/acme-trigger`, {
         headers: { Host: "domain-0.example.com", Connection: "close" },
       });
       expect(preserved.status).toBe(200);
 
-      const stillFull = await fetch(`${TEST_URL}/.well-known/acme-trigger`, {
+      const stillFull = await fetchClose(`${TEST_URL}/.well-known/acme-trigger`, {
         headers: { Host: "domain-16.example.com", Connection: "close" },
       });
       expect(stillFull.status).toBe(503);

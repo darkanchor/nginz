@@ -29,6 +29,14 @@ const SECRET = "require-test-secret-hs256";
 
 // ── Suite ──────────────────────────────────────────────────────────────
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("JWT — Rich Claim Validation", () => {
   beforeAll(async () => {
     writeFileSync("tests/jwt/revoked-subs.json", JSON.stringify(["revoked-user"], null, 2));
@@ -49,7 +57,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("eq: allows when claim matches", async () => {
     const token = createToken({ sub: "u1", role: "admin" }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-eq`, {
+    const res = await fetchClose(`${TEST_URL}/require-eq`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -57,7 +65,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("eq: rejects when claim differs", async () => {
     const token = createToken({ sub: "u2", role: "user" }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-eq`, {
+    const res = await fetchClose(`${TEST_URL}/require-eq`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -65,7 +73,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("eq: rejects when claim is missing", async () => {
     const token = createToken({ sub: "u3" }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-eq`, {
+    const res = await fetchClose(`${TEST_URL}/require-eq`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -77,7 +85,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("!eq: allows when claim does not match", async () => {
     const token = createToken({ sub: "u4", role: "user" }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-neq`, {
+    const res = await fetchClose(`${TEST_URL}/require-neq`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -85,7 +93,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("!eq: rejects when claim matches banned value", async () => {
     const token = createToken({ sub: "u5", role: "banned" }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-neq`, {
+    const res = await fetchClose(`${TEST_URL}/require-neq`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -97,7 +105,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("gt: allows when numeric value exceeds threshold", async () => {
     const token = createToken({ sub: "u6", level: 10 }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-gt`, {
+    const res = await fetchClose(`${TEST_URL}/require-gt`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -105,7 +113,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("gt: rejects when value is below threshold", async () => {
     const token = createToken({ sub: "u7", level: 3 }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-gt`, {
+    const res = await fetchClose(`${TEST_URL}/require-gt`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -113,7 +121,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("lt: allows when value is below threshold", async () => {
     const token = createToken({ sub: "u8", level: 50 }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-lt`, {
+    const res = await fetchClose(`${TEST_URL}/require-lt`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -121,7 +129,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("lt: rejects when value exceeds threshold", async () => {
     const token = createToken({ sub: "u9", level: 200 }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-lt`, {
+    const res = await fetchClose(`${TEST_URL}/require-lt`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -133,7 +141,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("multi: allows when all claims pass", async () => {
     const token = createToken({ sub: "u10", role: "admin", department: "engineering", level: 5 }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-multi`, {
+    const res = await fetchClose(`${TEST_URL}/require-multi`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -141,7 +149,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("multi: rejects when one claim fails", async () => {
     const token = createToken({ sub: "u11", role: "admin", department: "marketing", level: 5 }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-multi`, {
+    const res = await fetchClose(`${TEST_URL}/require-multi`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -149,7 +157,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("multi: rejects when numeric claim too low", async () => {
     const token = createToken({ sub: "u12", role: "admin", department: "engineering", level: 2 }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-multi`, {
+    const res = await fetchClose(`${TEST_URL}/require-multi`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -157,7 +165,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("nested claim paths: allows when nested values match", async () => {
     const token = createToken({ sub: "u12b", profile: { name: "Alice" }, roles: ["admin", "user"] }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-nested`, {
+    const res = await fetchClose(`${TEST_URL}/require-nested`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -165,7 +173,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("nested claim paths: rejects when nested values differ", async () => {
     const token = createToken({ sub: "u12c", profile: { name: "Bob" }, roles: ["user"] }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-nested`, {
+    const res = await fetchClose(`${TEST_URL}/require-nested`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -177,7 +185,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("missing claim: eq on absent claim rejects", async () => {
     const token = createToken({ sub: "u13" }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-missing-eq`, {
+    const res = await fetchClose(`${TEST_URL}/require-missing-eq`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -185,7 +193,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("missing claim: !eq on absent claim passes", async () => {
     const token = createToken({ sub: "u14" }, SECRET);
-    const res = await fetch(`${TEST_URL}/require-missing-neq`, {
+    const res = await fetchClose(`${TEST_URL}/require-missing-neq`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -200,7 +208,7 @@ describe("JWT — Rich Claim Validation", () => {
       sub: "u15",
       exp: Math.floor(Date.now() / 1000) - 3600,
     }, SECRET);
-    const res = await fetch(`${TEST_URL}/no-exp-check`, {
+    const res = await fetchClose(`${TEST_URL}/no-exp-check`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -216,7 +224,7 @@ describe("JWT — Rich Claim Validation", () => {
       sub: "u16",
       exp: Math.floor(Date.now() / 1000) - 60,
     }, SECRET);
-    const res = await fetch(`${TEST_URL}/leeway`, {
+    const res = await fetchClose(`${TEST_URL}/leeway`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -227,7 +235,7 @@ describe("JWT — Rich Claim Validation", () => {
       sub: "u17",
       exp: Math.floor(Date.now() / 1000) - 600,
     }, SECRET);
-    const res = await fetch(`${TEST_URL}/leeway`, {
+    const res = await fetchClose(`${TEST_URL}/leeway`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -235,7 +243,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("require_header: allows when jose header matches", async () => {
     const token = createTokenWithHeader({ sub: "u18" }, SECRET, { typ: "JWT" });
-    const res = await fetch(`${TEST_URL}/require-header-typ`, {
+    const res = await fetchClose(`${TEST_URL}/require-header-typ`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -243,7 +251,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("require_header: rejects when jose header differs", async () => {
     const token = createTokenWithHeader({ sub: "u19" }, SECRET, { typ: "JOSE" });
-    const res = await fetch(`${TEST_URL}/require-header-typ`, {
+    const res = await fetchClose(`${TEST_URL}/require-header-typ`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -251,7 +259,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("jwt_audience: allows string aud claim match", async () => {
     const token = createToken({ sub: "u19b", aud: "my-service" }, SECRET);
-    const res = await fetch(`${TEST_URL}/audience`, {
+    const res = await fetchClose(`${TEST_URL}/audience`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -259,7 +267,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("jwt_audience: allows array aud claim match", async () => {
     const token = createToken({ sub: "u19c", aud: ["other-service", "my-service"] }, SECRET);
-    const res = await fetch(`${TEST_URL}/audience`, {
+    const res = await fetchClose(`${TEST_URL}/audience`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -267,7 +275,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("jwt_audience: rejects aud mismatch", async () => {
     const token = createToken({ sub: "u19d", aud: "other-service" }, SECRET);
-    const res = await fetch(`${TEST_URL}/audience`, {
+    const res = await fetchClose(`${TEST_URL}/audience`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -275,7 +283,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("revocation sub: rejects revoked subject", async () => {
     const token = createToken({ sub: "revoked-user" }, SECRET);
-    const res = await fetch(`${TEST_URL}/revoke-sub`, {
+    const res = await fetchClose(`${TEST_URL}/revoke-sub`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -283,7 +291,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("revocation sub: allows non-revoked subject", async () => {
     const token = createToken({ sub: "active-user" }, SECRET);
-    const res = await fetch(`${TEST_URL}/revoke-sub`, {
+    const res = await fetchClose(`${TEST_URL}/revoke-sub`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);
@@ -291,7 +299,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("revocation kid: rejects revoked kid", async () => {
     const token = createTokenWithHeader({ sub: "u20" }, SECRET, { kid: "revoked-kid" });
-    const res = await fetch(`${TEST_URL}/revoke-kid`, {
+    const res = await fetchClose(`${TEST_URL}/revoke-kid`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -299,7 +307,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("revocation kid: rejects when kid header missing", async () => {
     const token = createToken({ sub: "u21" }, SECRET);
-    const res = await fetch(`${TEST_URL}/revoke-kid`, {
+    const res = await fetchClose(`${TEST_URL}/revoke-kid`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(401);
@@ -307,7 +315,7 @@ describe("JWT — Rich Claim Validation", () => {
 
   test("revocation kid: allows non-revoked kid", async () => {
     const token = createTokenWithHeader({ sub: "u22" }, SECRET, { kid: "active-kid" });
-    const res = await fetch(`${TEST_URL}/revoke-kid`, {
+    const res = await fetchClose(`${TEST_URL}/revoke-kid`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     expect(res.status).toBe(200);

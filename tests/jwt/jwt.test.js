@@ -75,10 +75,18 @@ afterAll(async () => {
   cleanupRuntime(MODULE_NAME);
 });
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("JWT Authentication", () => {
   test("allows access with valid token", async () => {
     const token = createJWT({ sub: "user123", exp: Math.floor(Date.now() / 1000) + 3600 }, SECRET);
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(200);
@@ -87,12 +95,12 @@ describe("JWT Authentication", () => {
   });
 
   test("rejects request without Authorization header", async () => {
-    const res = await fetch(`${TEST_URL}/protected`);
+    const res = await fetchClose(`${TEST_URL}/protected`);
     expect(res.status).toBe(401);
   });
 
   test("rejects request with invalid token format", async () => {
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: "Bearer invalid-token" }
     });
     expect(res.status).toBe(401);
@@ -100,7 +108,7 @@ describe("JWT Authentication", () => {
 
   test("rejects request with wrong secret", async () => {
     const token = createJWT({ sub: "user123", exp: Math.floor(Date.now() / 1000) + 3600 }, "wrong-secret");
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(401);
@@ -108,7 +116,7 @@ describe("JWT Authentication", () => {
 
   test("rejects expired token", async () => {
     const token = createJWT({ sub: "user123", exp: Math.floor(Date.now() / 1000) - 3600 }, SECRET);
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(401);
@@ -120,14 +128,14 @@ describe("JWT Authentication", () => {
       exp: Math.floor(Date.now() / 1000) + 7200,
       nbf: Math.floor(Date.now() / 1000) + 3600  // not valid until 1 hour from now
     }, SECRET);
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(401);
   });
 
   test("allows access to public endpoints without token", async () => {
-    const res = await fetch(`${TEST_URL}/public`);
+    const res = await fetchClose(`${TEST_URL}/public`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text.trim()).toBe("Public content");
@@ -135,7 +143,7 @@ describe("JWT Authentication", () => {
 
   test("supports Bearer prefix case-insensitively", async () => {
     const token = createJWT({ sub: "user123", exp: Math.floor(Date.now() / 1000) + 3600 }, SECRET);
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `bearer ${token}` }  // lowercase bearer
     });
     expect(res.status).toBe(200);
@@ -143,7 +151,7 @@ describe("JWT Authentication", () => {
 
   test("inherits jwt_secret from parent location", async () => {
     const token = createJWT({ sub: "user123", exp: Math.floor(Date.now() / 1000) + 3600 }, API_SECRET);
-    const res = await fetch(`${TEST_URL}/api/users`, {
+    const res = await fetchClose(`${TEST_URL}/api/users`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(200);
@@ -153,7 +161,7 @@ describe("JWT Authentication", () => {
 
   test("inherits jwt_secret to nested child locations", async () => {
     const token = createJWT({ sub: "admin123", exp: Math.floor(Date.now() / 1000) + 3600 }, API_SECRET);
-    const res = await fetch(`${TEST_URL}/admin/settings`, {
+    const res = await fetchClose(`${TEST_URL}/admin/settings`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(200);
@@ -162,7 +170,7 @@ describe("JWT Authentication", () => {
   });
 
   test("allows access without token when jwt not enabled", async () => {
-    const res = await fetch(`${TEST_URL}/api/public`);
+    const res = await fetchClose(`${TEST_URL}/api/public`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text.trim()).toBe("Public API");
@@ -171,7 +179,7 @@ describe("JWT Authentication", () => {
   test("token without exp claim is allowed", async () => {
     // Token without expiration - should be allowed (no exp check fails)
     const token = createJWT({ sub: "user123" }, SECRET);
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(200);
@@ -183,7 +191,7 @@ describe("JWT Authentication", () => {
       { sub: "user123", exp: Math.floor(Date.now() / 1000) + 3600 },
       SECRET
     );
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(401);
@@ -195,7 +203,7 @@ describe("JWT Authentication", () => {
       "not-json-payload",
       SECRET
     );
-    const res = await fetch(`${TEST_URL}/protected`, {
+    const res = await fetchClose(`${TEST_URL}/protected`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     expect(res.status).toBe(401);

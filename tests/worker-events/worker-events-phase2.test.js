@@ -8,6 +8,14 @@ import {
 
 const MODULE = "worker-events";
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx-multiw.conf`, MODULE);
@@ -19,13 +27,13 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
   });
 
   test("neighboring routes work with 2 workers", async () => {
-    const res = await fetch(`${TEST_URL}/`);
+    const res = await fetchClose(`${TEST_URL}/`);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("ok");
   });
 
   test("inspect shows capacity in response", async () => {
-    const res = await fetch(`${TEST_URL}/worker-events`);
+    const res = await fetchClose(`${TEST_URL}/worker-events`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.module).toBe("worker_events");
@@ -38,7 +46,7 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
     // subsequent GETs will be handled by different workers.
     const publishedGens = [];
     for (let i = 0; i < 50; i++) {
-      const res = await fetch(`${TEST_URL}/worker-events`, {
+      const res = await fetchClose(`${TEST_URL}/worker-events`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ type: "cross_worker", payload: String(i) }),
@@ -51,7 +59,7 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
     }
 
     // Verify all generations are accounted for in inspect
-    const res = await fetch(`${TEST_URL}/worker-events`);
+    const res = await fetchClose(`${TEST_URL}/worker-events`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.events.length).toBeGreaterThanOrEqual(50);
@@ -71,7 +79,7 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
   test("since query filters correctly in multi-worker setup", async () => {
     // Publish a few more events
     for (let i = 0; i < 5; i++) {
-      await fetch(`${TEST_URL}/worker-events`, {
+      await fetchClose(`${TEST_URL}/worker-events`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ type: "since_test", payload: String(i) }),
@@ -79,12 +87,12 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
     }
 
     // Get all events
-    const all = await fetch(`${TEST_URL}/worker-events`);
+    const all = await fetchClose(`${TEST_URL}/worker-events`);
     const allBody = await all.json();
     const midGen = allBody.events[Math.floor(allBody.events.length / 2)].generation;
 
     // Query with since
-    const res = await fetch(`${TEST_URL}/worker-events?since=${midGen}`);
+    const res = await fetchClose(`${TEST_URL}/worker-events?since=${midGen}`);
     const body = await res.json();
     for (const ev of body.events) {
       expect(ev.generation).toBeGreaterThan(midGen);
@@ -93,7 +101,7 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
   });
 
   test("dropped_events is zero when ring not full", async () => {
-    const res = await fetch(`${TEST_URL}/worker-events`);
+    const res = await fetchClose(`${TEST_URL}/worker-events`);
     const body = await res.json();
     // Ring is 256, we published 55 events - no overflow
     expect(body.dropped_events).toBe(0);
@@ -101,7 +109,7 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
 
   test("inspect does not silently truncate above 128 retained events", async () => {
     for (let i = 0; i < 90; i++) {
-      const res = await fetch(`${TEST_URL}/worker-events`, {
+      const res = await fetchClose(`${TEST_URL}/worker-events`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ type: "bulk", payload: String(i) }),
@@ -111,7 +119,7 @@ describe("worker-events Phase 2 - multi-worker cross-worker visibility", () => {
       expect(body.retention_evicted).toBe(false);
     }
 
-    const res = await fetch(`${TEST_URL}/worker-events`);
+    const res = await fetchClose(`${TEST_URL}/worker-events`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.events.length).toBe(145);
@@ -131,7 +139,7 @@ describe("worker-events Phase 2 - overflow semantics", () => {
   });
 
   test("ring capacity is 4 as configured", async () => {
-    const res = await fetch(`${TEST_URL}/worker-events`);
+    const res = await fetchClose(`${TEST_URL}/worker-events`);
     const body = await res.json();
     expect(body.capacity).toBeGreaterThanOrEqual(4);
     expect(body.capacity).toBeLessThanOrEqual(8); // small ring
@@ -140,7 +148,7 @@ describe("worker-events Phase 2 - overflow semantics", () => {
 
   test("publishing up to capacity fills ring without overflow", async () => {
     for (let i = 0; i < 4; i++) {
-      const res = await fetch(`${TEST_URL}/worker-events`, {
+      const res = await fetchClose(`${TEST_URL}/worker-events`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ type: "fill", payload: String(i) }),
@@ -150,7 +158,7 @@ describe("worker-events Phase 2 - overflow semantics", () => {
       expect(body.retention_evicted).toBe(false);
     }
 
-    const res = await fetch(`${TEST_URL}/worker-events`);
+    const res = await fetchClose(`${TEST_URL}/worker-events`);
     const body = await res.json();
     expect(body.events.length).toBe(4);
     expect(body.dropped_events).toBe(0);
@@ -160,7 +168,7 @@ describe("worker-events Phase 2 - overflow semantics", () => {
   test("overflow drops oldest and increments dropped_events", async () => {
     // Ring is full (4 entries). Publish 3 more - each should overwrite the oldest.
     for (let i = 0; i < 3; i++) {
-      const res = await fetch(`${TEST_URL}/worker-events`, {
+      const res = await fetchClose(`${TEST_URL}/worker-events`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ type: "overflow", payload: String(i) }),
@@ -170,7 +178,7 @@ describe("worker-events Phase 2 - overflow semantics", () => {
       expect(body.retention_evicted).toBe(true);
     }
 
-    const res = await fetch(`${TEST_URL}/worker-events`);
+    const res = await fetchClose(`${TEST_URL}/worker-events`);
     const body = await res.json();
 
     // Ring should still have 4 entries
@@ -197,14 +205,14 @@ describe("worker-events Phase 2 - overflow semantics", () => {
   test("overflow wraps around multiple times correctly", async () => {
     // Publish 10 more events (ring is 4, so 2.5 wrap-arounds)
     for (let i = 0; i < 10; i++) {
-      await fetch(`${TEST_URL}/worker-events`, {
+      await fetchClose(`${TEST_URL}/worker-events`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ type: "wrap", payload: String(i) }),
       });
     }
 
-    const res = await fetch(`${TEST_URL}/worker-events`);
+    const res = await fetchClose(`${TEST_URL}/worker-events`);
     const body = await res.json();
 
     // Ring should still have 4 entries (capacity)
@@ -224,7 +232,7 @@ describe("worker-events Phase 2 - overflow semantics", () => {
 
   test("since= query works correctly after overflow", async () => {
     // Request events after generation 15
-    const res = await fetch(`${TEST_URL}/worker-events?since=15`);
+    const res = await fetchClose(`${TEST_URL}/worker-events?since=15`);
     const body = await res.json();
 
     // Should only get events with gen > 15
@@ -242,7 +250,7 @@ describe("worker-events Phase 2 - overflow semantics", () => {
   test("since= query for dropped range returns empty", async () => {
     // Generations 1-13 were dropped. Querying since=5 should
     // skip all events (since oldest retained is 14).
-    const res = await fetch(`${TEST_URL}/worker-events?since=5`);
+    const res = await fetchClose(`${TEST_URL}/worker-events?since=5`);
     const body = await res.json();
     // All retained events have gen > 13, so since=5 should match them all
     if (body.events.length > 0) {

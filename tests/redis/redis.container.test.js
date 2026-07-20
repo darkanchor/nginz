@@ -62,6 +62,14 @@ function redisCli(...args) {
 // Suite
 // ---------------------------------------------------------------------------
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("redis module - real Redis integration", () => {
   beforeAll(async () => {
     ensureContainerRunning(REDIS_CONTAINER);
@@ -89,7 +97,7 @@ describe("redis module - real Redis integration", () => {
   // =========================================================================
 
   test("gets value using URI as key", async () => {
-    const res = await fetch(`${TEST_URL}/get/mykey`);
+    const res = await fetchClose(`${TEST_URL}/get/mykey`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
 
@@ -98,7 +106,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("gets value using static key directive", async () => {
-    const res = await fetch(`${TEST_URL}/static-key`);
+    const res = await fetchClose(`${TEST_URL}/static-key`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
 
@@ -107,7 +115,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("returns null for non-existent key", async () => {
-    const res = await fetch(`${TEST_URL}/get/nonexistent-key`);
+    const res = await fetchClose(`${TEST_URL}/get/nonexistent-key`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
 
@@ -116,7 +124,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("handles JSON value stored in Redis", async () => {
-    const res = await fetch(`${TEST_URL}/get/json-data`);
+    const res = await fetchClose(`${TEST_URL}/get/json-data`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -125,7 +133,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("handles numeric value stored in Redis", async () => {
-    const res = await fetch(`${TEST_URL}/get/counter`);
+    const res = await fetchClose(`${TEST_URL}/get/counter`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -136,7 +144,7 @@ describe("redis module - real Redis integration", () => {
     const rawValue = 'quote" slash\\ newline\n tab\t carriage\r';
     redisCli("SET", "get/escaped", rawValue);
 
-    const res = await fetch(`${TEST_URL}/get/escaped`);
+    const res = await fetchClose(`${TEST_URL}/get/escaped`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -148,7 +156,7 @@ describe("redis module - real Redis integration", () => {
   // =========================================================================
 
   test("sets a value and returns ok", async () => {
-    const res = await fetch(`${TEST_URL}/set/newkey`, {
+    const res = await fetchClose(`${TEST_URL}/set/newkey`, {
       method: "POST",
       body: "new-value",
     });
@@ -166,7 +174,7 @@ describe("redis module - real Redis integration", () => {
   test("overwrites existing value", async () => {
     redisCli("SET", "set/existing", "old-value");
 
-    const res = await fetch(`${TEST_URL}/set/existing`, {
+    const res = await fetchClose(`${TEST_URL}/set/existing`, {
       method: "POST",
       body: "updated-value",
     });
@@ -182,7 +190,7 @@ describe("redis module - real Redis integration", () => {
   test("stores request bodies with special characters intact", async () => {
     const rawValue = 'value with "quotes", slash\\, and\nnewlines';
 
-    const res = await fetch(`${TEST_URL}/set/escaped-body`, {
+    const res = await fetchClose(`${TEST_URL}/set/escaped-body`, {
       method: "POST",
       body: rawValue,
     });
@@ -196,12 +204,12 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("rejects GET method for SET command", async () => {
-    const res = await fetch(`${TEST_URL}/set/testkey`);
+    const res = await fetchClose(`${TEST_URL}/set/testkey`);
     expect(res.status).toBe(405);
   });
 
   test("rejects empty body for SET", async () => {
-    const res = await fetch(`${TEST_URL}/set/emptykey`, {
+    const res = await fetchClose(`${TEST_URL}/set/emptykey`, {
       method: "POST",
       body: "",
     });
@@ -215,7 +223,7 @@ describe("redis module - real Redis integration", () => {
   test("deletes existing key and returns count", async () => {
     redisCli("SET", "del/deletekey", "to-delete");
 
-    const res = await fetch(`${TEST_URL}/del/deletekey`, {
+    const res = await fetchClose(`${TEST_URL}/del/deletekey`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -230,7 +238,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("returns 0 for non-existent key", async () => {
-    const res = await fetch(`${TEST_URL}/del/nonexistent`, {
+    const res = await fetchClose(`${TEST_URL}/del/nonexistent`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -242,7 +250,7 @@ describe("redis module - real Redis integration", () => {
   test("accepts DELETE method", async () => {
     redisCli("SET", "del/deletemethod", "delete-me");
 
-    const res = await fetch(`${TEST_URL}/del/deletemethod`, {
+    const res = await fetchClose(`${TEST_URL}/del/deletemethod`, {
       method: "DELETE",
     });
     expect(res.status).toBe(200);
@@ -261,7 +269,7 @@ describe("redis module - real Redis integration", () => {
   test("increments existing numeric key", async () => {
     redisCli("SET", "incr/counter", "10");
 
-    const res = await fetch(`${TEST_URL}/incr/counter`, {
+    const res = await fetchClose(`${TEST_URL}/incr/counter`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -278,7 +286,7 @@ describe("redis module - real Redis integration", () => {
     // Ensure key doesn't exist
     redisCli("DEL", "incr/newcounter");
 
-    const res = await fetch(`${TEST_URL}/incr/newcounter`, {
+    const res = await fetchClose(`${TEST_URL}/incr/newcounter`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -291,14 +299,14 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("rejects GET method for INCR command", async () => {
-    const res = await fetch(`${TEST_URL}/incr/counter`);
+    const res = await fetchClose(`${TEST_URL}/incr/counter`);
     expect(res.status).toBe(405);
   });
 
   test("returns redis_error for non-numeric INCR target", async () => {
     redisCli("SET", "incr/not-a-number", "abc");
 
-    const res = await fetch(`${TEST_URL}/incr/not-a-number`, {
+    const res = await fetchClose(`${TEST_URL}/incr/not-a-number`, {
       method: "POST",
     });
     expect(res.status).toBe(500);
@@ -315,7 +323,7 @@ describe("redis module - real Redis integration", () => {
   test("sets expiration on existing key", async () => {
     redisCli("SET", "expire/tempkey", "temporary");
 
-    const res = await fetch(`${TEST_URL}/expire/tempkey`, {
+    const res = await fetchClose(`${TEST_URL}/expire/tempkey`, {
       method: "POST",
       body: "3600", // 1 hour in seconds
     });
@@ -331,7 +339,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("returns 0 for non-existent key", async () => {
-    const res = await fetch(`${TEST_URL}/expire/nonexistent`, {
+    const res = await fetchClose(`${TEST_URL}/expire/nonexistent`, {
       method: "POST",
       body: "60",
     });
@@ -344,7 +352,7 @@ describe("redis module - real Redis integration", () => {
   test("uses default TTL if body is empty", async () => {
     redisCli("SET", "expire/defaultttl", "default-ttl-test");
 
-    const res = await fetch(`${TEST_URL}/expire/defaultttl`, {
+    const res = await fetchClose(`${TEST_URL}/expire/defaultttl`, {
       method: "POST",
       body: "",
     });
@@ -362,7 +370,7 @@ describe("redis module - real Redis integration", () => {
   test("returns redis_error for invalid TTL body", async () => {
     redisCli("SET", "expire/badttl", "still-here");
 
-    const res = await fetch(`${TEST_URL}/expire/badttl`, {
+    const res = await fetchClose(`${TEST_URL}/expire/badttl`, {
       method: "POST",
       body: "not-a-number",
     });
@@ -382,7 +390,7 @@ describe("redis module - real Redis integration", () => {
     redisCli("SET", "key2", "value2");
     redisCli("SET", "key3", "value3");
 
-    const res = await fetch(`${TEST_URL}/mget?keys=key1,key2,key3`);
+    const res = await fetchClose(`${TEST_URL}/mget?keys=key1,key2,key3`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/json");
 
@@ -395,7 +403,7 @@ describe("redis module - real Redis integration", () => {
     redisCli("DEL", "missing2"); // Ensure it doesn't exist
     redisCli("SET", "exists3", "exists-value-3");
 
-    const res = await fetch(`${TEST_URL}/mget?keys=exists1,missing2,exists3`);
+    const res = await fetchClose(`${TEST_URL}/mget?keys=exists1,missing2,exists3`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -405,7 +413,7 @@ describe("redis module - real Redis integration", () => {
   test("handles single key in query string", async () => {
     redisCli("SET", "singlekey", "single-value");
 
-    const res = await fetch(`${TEST_URL}/mget?keys=singlekey`);
+    const res = await fetchClose(`${TEST_URL}/mget?keys=singlekey`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -416,7 +424,7 @@ describe("redis module - real Redis integration", () => {
     redisCli("SET", "amp1", "value-1");
     redisCli("SET", "amp2", "value-2");
 
-    const res = await fetch(`${TEST_URL}/mget?keys=amp1,amp2&ignored=1`);
+    const res = await fetchClose(`${TEST_URL}/mget?keys=amp1,amp2&ignored=1`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -427,7 +435,7 @@ describe("redis module - real Redis integration", () => {
     const keys = Array.from({ length: 17 }, (_, i) => `limit-key-${i + 1}`);
     keys.forEach((key) => redisCli("SET", key, `value-${key}`));
 
-    const res = await fetch(`${TEST_URL}/mget?keys=${keys.join(",")}`);
+    const res = await fetchClose(`${TEST_URL}/mget?keys=${keys.join(",")}`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -443,7 +451,7 @@ describe("redis module - real Redis integration", () => {
   test("decrements existing numeric key", async () => {
     redisCli("SET", "decr/counter", "10");
 
-    const res = await fetch(`${TEST_URL}/decr/counter`, {
+    const res = await fetchClose(`${TEST_URL}/decr/counter`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -458,7 +466,7 @@ describe("redis module - real Redis integration", () => {
   test("creates key with value -1 if not exists", async () => {
     redisCli("DEL", "decr/newcounter");
 
-    const res = await fetch(`${TEST_URL}/decr/newcounter`, {
+    const res = await fetchClose(`${TEST_URL}/decr/newcounter`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -471,14 +479,14 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("rejects GET method for DECR command", async () => {
-    const res = await fetch(`${TEST_URL}/decr/counter`);
+    const res = await fetchClose(`${TEST_URL}/decr/counter`);
     expect(res.status).toBe(405);
   });
 
   test("returns redis_error for non-numeric DECR target", async () => {
     redisCli("SET", "decr/not-a-number", "abc");
 
-    const res = await fetch(`${TEST_URL}/decr/not-a-number`, {
+    const res = await fetchClose(`${TEST_URL}/decr/not-a-number`, {
       method: "POST",
     });
     expect(res.status).toBe(500);
@@ -494,7 +502,7 @@ describe("redis module - real Redis integration", () => {
   test("returns 1 for existing key", async () => {
     redisCli("SET", "exists/haskey", "some-value");
 
-    const res = await fetch(`${TEST_URL}/exists/haskey`);
+    const res = await fetchClose(`${TEST_URL}/exists/haskey`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -504,7 +512,7 @@ describe("redis module - real Redis integration", () => {
   test("returns 0 for non-existent key", async () => {
     redisCli("DEL", "exists/nokey");
 
-    const res = await fetch(`${TEST_URL}/exists/nokey`);
+    const res = await fetchClose(`${TEST_URL}/exists/nokey`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -512,7 +520,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("rejects POST method for EXISTS command", async () => {
-    const res = await fetch(`${TEST_URL}/exists/somekey`, {
+    const res = await fetchClose(`${TEST_URL}/exists/somekey`, {
       method: "POST",
     });
     expect(res.status).toBe(405);
@@ -526,7 +534,7 @@ describe("redis module - real Redis integration", () => {
     redisCli("SET", "ttl/noexpiry", "persistent");
     redisCli("PERSIST", "ttl/noexpiry");
 
-    const res = await fetch(`${TEST_URL}/ttl/noexpiry`);
+    const res = await fetchClose(`${TEST_URL}/ttl/noexpiry`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -536,7 +544,7 @@ describe("redis module - real Redis integration", () => {
   test("returns -2 for non-existent key", async () => {
     redisCli("DEL", "ttl/nokey");
 
-    const res = await fetch(`${TEST_URL}/ttl/nokey`);
+    const res = await fetchClose(`${TEST_URL}/ttl/nokey`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -547,7 +555,7 @@ describe("redis module - real Redis integration", () => {
     redisCli("SET", "ttl/withttl", "expires");
     redisCli("EXPIRE", "ttl/withttl", "300");
 
-    const res = await fetch(`${TEST_URL}/ttl/withttl`);
+    const res = await fetchClose(`${TEST_URL}/ttl/withttl`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -556,7 +564,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("rejects POST method for TTL command", async () => {
-    const res = await fetch(`${TEST_URL}/ttl/somekey`, {
+    const res = await fetchClose(`${TEST_URL}/ttl/somekey`, {
       method: "POST",
     });
     expect(res.status).toBe(405);
@@ -567,7 +575,7 @@ describe("redis module - real Redis integration", () => {
   // =========================================================================
 
   test("returns ok for PING", async () => {
-    const res = await fetch(`${TEST_URL}/ping`);
+    const res = await fetchClose(`${TEST_URL}/ping`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -581,7 +589,7 @@ describe("redis module - real Redis integration", () => {
   test("returns length of string value", async () => {
     redisCli("SET", "strlen/mystr", "hello");
 
-    const res = await fetch(`${TEST_URL}/strlen/mystr`);
+    const res = await fetchClose(`${TEST_URL}/strlen/mystr`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -591,7 +599,7 @@ describe("redis module - real Redis integration", () => {
   test("returns 0 for non-existent key", async () => {
     redisCli("DEL", "strlen/nokey");
 
-    const res = await fetch(`${TEST_URL}/strlen/nokey`);
+    const res = await fetchClose(`${TEST_URL}/strlen/nokey`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -599,7 +607,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("rejects POST method for STRLEN command", async () => {
-    const res = await fetch(`${TEST_URL}/strlen/somekey`, {
+    const res = await fetchClose(`${TEST_URL}/strlen/somekey`, {
       method: "POST",
     });
     expect(res.status).toBe(405);
@@ -613,7 +621,7 @@ describe("redis module - real Redis integration", () => {
     redisCli("HSET", "hget/myhash", "name", "Alice");
     redisCli("HSET", "hget/myhash", "age", "30");
 
-    const res = await fetch(`${TEST_URL}/hget/myhash?field=name`);
+    const res = await fetchClose(`${TEST_URL}/hget/myhash?field=name`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -623,7 +631,7 @@ describe("redis module - real Redis integration", () => {
   test("returns null for missing field", async () => {
     redisCli("HSET", "hget/myhash", "name", "Alice");
 
-    const res = await fetch(`${TEST_URL}/hget/myhash?field=missing`);
+    const res = await fetchClose(`${TEST_URL}/hget/myhash?field=missing`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -633,7 +641,7 @@ describe("redis module - real Redis integration", () => {
   test("returns null for non-existent hash key", async () => {
     redisCli("DEL", "hget/nokey");
 
-    const res = await fetch(`${TEST_URL}/hget/nokey?field=name`);
+    const res = await fetchClose(`${TEST_URL}/hget/nokey?field=name`);
     expect(res.status).toBe(200);
 
     const body = await res.json();
@@ -641,12 +649,12 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("returns 400 when field parameter is missing", async () => {
-    const res = await fetch(`${TEST_URL}/hget/myhash`);
+    const res = await fetchClose(`${TEST_URL}/hget/myhash`);
     expect(res.status).toBe(400);
   });
 
   test("rejects POST method for HGET command", async () => {
-    const res = await fetch(`${TEST_URL}/hget/myhash?field=name`, {
+    const res = await fetchClose(`${TEST_URL}/hget/myhash?field=name`, {
       method: "POST",
     });
     expect(res.status).toBe(405);
@@ -659,7 +667,7 @@ describe("redis module - real Redis integration", () => {
   test("sets a hash field and returns 1 for new field", async () => {
     redisCli("HSET", "hset/myhash", "existing", "old");
 
-    const res = await fetch(`${TEST_URL}/hset/myhash?field=newfield`, {
+    const res = await fetchClose(`${TEST_URL}/hset/myhash?field=newfield`, {
       method: "POST",
       body: "new-value",
     });
@@ -676,7 +684,7 @@ describe("redis module - real Redis integration", () => {
   test("returns 0 for existing field", async () => {
     redisCli("HSET", "hset/myhash", "field1", "val1");
 
-    const res = await fetch(`${TEST_URL}/hset/myhash?field=field1`, {
+    const res = await fetchClose(`${TEST_URL}/hset/myhash?field=field1`, {
       method: "POST",
       body: "updated",
     });
@@ -690,12 +698,12 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("rejects GET method for HSET command", async () => {
-    const res = await fetch(`${TEST_URL}/hset/myhash?field=f`);
+    const res = await fetchClose(`${TEST_URL}/hset/myhash?field=f`);
     expect(res.status).toBe(405);
   });
 
   test("rejects empty body for HSET", async () => {
-    const res = await fetch(`${TEST_URL}/hset/myhash?field=f`, {
+    const res = await fetchClose(`${TEST_URL}/hset/myhash?field=f`, {
       method: "POST",
       body: "",
     });
@@ -703,7 +711,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("returns 400 when field parameter is missing", async () => {
-    const res = await fetch(`${TEST_URL}/hset/myhash`, {
+    const res = await fetchClose(`${TEST_URL}/hset/myhash`, {
       method: "POST",
       body: "value",
     });
@@ -718,7 +726,7 @@ describe("redis module - real Redis integration", () => {
     redisCli("HSET", "hdel/myhash", "field1", "val1");
     redisCli("HSET", "hdel/myhash", "field2", "val2");
 
-    const res = await fetch(`${TEST_URL}/hdel/myhash?field=field1`, {
+    const res = await fetchClose(`${TEST_URL}/hdel/myhash?field=field1`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -736,7 +744,7 @@ describe("redis module - real Redis integration", () => {
   test("returns 0 for non-existent field", async () => {
     redisCli("HSET", "hdel/myhash", "field1", "val1");
 
-    const res = await fetch(`${TEST_URL}/hdel/myhash?field=missing`, {
+    const res = await fetchClose(`${TEST_URL}/hdel/myhash?field=missing`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -748,7 +756,7 @@ describe("redis module - real Redis integration", () => {
   test("returns 0 for non-existent hash key", async () => {
     redisCli("DEL", "hdel/nokey");
 
-    const res = await fetch(`${TEST_URL}/hdel/nokey?field=f`, {
+    const res = await fetchClose(`${TEST_URL}/hdel/nokey?field=f`, {
       method: "POST",
     });
     expect(res.status).toBe(200);
@@ -760,7 +768,7 @@ describe("redis module - real Redis integration", () => {
   test("accepts DELETE method for HDEL", async () => {
     redisCli("HSET", "hdel/myhash", "field1", "val1");
 
-    const res = await fetch(`${TEST_URL}/hdel/myhash?field=field1`, {
+    const res = await fetchClose(`${TEST_URL}/hdel/myhash?field=field1`, {
       method: "DELETE",
     });
     expect(res.status).toBe(200);
@@ -770,7 +778,7 @@ describe("redis module - real Redis integration", () => {
   });
 
   test("returns 400 when field parameter is missing", async () => {
-    const res = await fetch(`${TEST_URL}/hdel/myhash`, {
+    const res = await fetchClose(`${TEST_URL}/hdel/myhash`, {
       method: "POST",
     });
     expect(res.status).toBe(400);
@@ -781,7 +789,7 @@ describe("redis module - real Redis integration", () => {
   // =========================================================================
 
   test("rejects non-GET HTTP methods for GET command", async () => {
-    const res = await fetch(`${TEST_URL}/get/mykey`, {
+    const res = await fetchClose(`${TEST_URL}/get/mykey`, {
       method: "POST",
     });
     expect(res.status).toBe(405);
@@ -792,7 +800,7 @@ describe("redis module - real Redis integration", () => {
   // =========================================================================
 
   test("non-redis location returns content", async () => {
-    const res = await fetch(`${TEST_URL}/`);
+    const res = await fetchClose(`${TEST_URL}/`);
     expect(res.status).toBe(200);
     const text = await res.text();
     expect(text.trim()).toBe("Hello World");

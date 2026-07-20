@@ -24,6 +24,14 @@ http { server { listen 8899; location / { jsonschema '${schema}'; echozn ok; } }
   }
 }
 
+
+// Always close the connection: nginx closes after some non-2xx module responses
+// and Bun's keep-alive pool can race the FIN into the next test's fetch.
+function fetchClose(url, init = {}) {
+  const headers = { Connection: "close", ...(init.headers || {}) };
+  return fetch(url, { ...init, headers });
+}
+
 describe("jsonschema module", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
@@ -36,19 +44,19 @@ describe("jsonschema module", () => {
 
   describe("non-validated endpoints", () => {
     test("allows any request to non-validated endpoint", async () => {
-      const res = await fetch(`${TEST_URL}/`);
+      const res = await fetchClose(`${TEST_URL}/`);
       expect(res.status).toBe(200);
     });
 
     test("allows GET requests without validation", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`);
+      const res = await fetchClose(`${TEST_URL}/api/users`);
       expect(res.status).toBe(200);
     });
   });
 
   describe("valid JSON validation", () => {
     test("accepts valid JSON with required fields", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: "John", email: "john@example.com" }),
@@ -57,7 +65,7 @@ describe("jsonschema module", () => {
     });
 
     test("accepts valid JSON with all fields", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -70,7 +78,7 @@ describe("jsonschema module", () => {
     });
 
     test("accepts valid object type", async () => {
-      const res = await fetch(`${TEST_URL}/api/simple`, {
+      const res = await fetchClose(`${TEST_URL}/api/simple`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ any: "data" }),
@@ -79,7 +87,7 @@ describe("jsonschema module", () => {
     });
 
     test("accepts PUT requests when body matches schema", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -92,7 +100,7 @@ describe("jsonschema module", () => {
     });
 
     test("accepts PATCH requests when body matches schema", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json; charset=utf-8" },
         body: JSON.stringify({
@@ -105,7 +113,7 @@ describe("jsonschema module", () => {
     });
 
     test("accepts integer values for integer schemas", async () => {
-      const res = await fetch(`${TEST_URL}/api/integer`, {
+      const res = await fetchClose(`${TEST_URL}/api/integer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ count: 2 }),
@@ -116,7 +124,7 @@ describe("jsonschema module", () => {
 
   describe("invalid JSON validation", () => {
     test("rejects a request body above the configured module limit", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: "x".repeat(160), email: "john@example.com" }),
@@ -125,7 +133,7 @@ describe("jsonschema module", () => {
     });
 
     test("rejects invalid JSON syntax with 400", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "not valid json",
@@ -136,7 +144,7 @@ describe("jsonschema module", () => {
     });
 
     test("rejects missing required field with 400", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: "John" }), // missing email
@@ -147,7 +155,7 @@ describe("jsonschema module", () => {
     });
 
     test("rejects wrong type with 400", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -159,7 +167,7 @@ describe("jsonschema module", () => {
     });
 
     test("rejects number below minimum with 400", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -172,7 +180,7 @@ describe("jsonschema module", () => {
     });
 
     test("rejects string below minLength with 400", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -184,7 +192,7 @@ describe("jsonschema module", () => {
     });
 
     test("rejects non-object when object required", async () => {
-      const res = await fetch(`${TEST_URL}/api/simple`, {
+      const res = await fetchClose(`${TEST_URL}/api/simple`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify("just a string"),
@@ -193,7 +201,7 @@ describe("jsonschema module", () => {
     });
 
     test("rejects fractional numbers for integer schemas", async () => {
-      const res = await fetch(`${TEST_URL}/api/integer`, {
+      const res = await fetchClose(`${TEST_URL}/api/integer`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ count: 1.5 }),
@@ -204,7 +212,7 @@ describe("jsonschema module", () => {
 
   describe("content type handling", () => {
     test("does not mistake JSON-like media types for JSON", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/jsonp" },
         body: "not json",
@@ -213,7 +221,7 @@ describe("jsonschema module", () => {
     });
 
     test("skips validation for non-JSON content type", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "text/plain" },
         body: "not json",
@@ -223,7 +231,7 @@ describe("jsonschema module", () => {
     });
 
     test("skips validation for missing content type", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         body: JSON.stringify({ name: 123 }),
       });
@@ -231,7 +239,7 @@ describe("jsonschema module", () => {
     });
 
     test("allows empty JSON request bodies to pass through", async () => {
-      const res = await fetch(`${TEST_URL}/api/users`, {
+      const res = await fetchClose(`${TEST_URL}/api/users`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "",
