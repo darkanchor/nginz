@@ -13,13 +13,17 @@ const MODULE = "acme";
 const DOMAIN = "live-acme.test";
 const PEBBLE_IMAGE = "ghcr.io/letsencrypt/pebble:latest";
 const CHALLTESTSRV_IMAGE = "ghcr.io/letsencrypt/pebble-challtestsrv:latest";
-const PEBBLE_CONTAINER = `nginz-acme-pebble-${Date.now()}`;
-const CHALLTESTSRV_CONTAINER = `nginz-acme-challtestsrv-${Date.now()}`;
+// Stable names so a crashed prior run can be force-removed before rebinding
+// host-network ports (timestamped names left orphans holding :14000 forever).
+const PEBBLE_CONTAINER = "nginz-acme-pebble";
+const CHALLTESTSRV_CONTAINER = "nginz-acme-challtestsrv";
 const PEBBLE_CONFIG_HOST = join(process.cwd(), "tests", MODULE, "pebble-config.json");
 const PEBBLE_CONFIG = "/test/pebble-config.json";
 const PEBBLE_CA_HOST = join(process.cwd(), "tests", MODULE, "pebble.minica.pem");
 const STORAGE_DIR = join(process.cwd(), "tests", MODULE, "runtime", "acme");
 const ERROR_LOG = join(process.cwd(), "tests", MODULE, "runtime", "logs", "error.log");
+// Pebble ACME :14000, management :15000, challtestsrv DNS :8053
+const PEBBLE_PORTS = [14000, 15000, 8053];
 
 function runResult(command, options = {}) {
   const result = Bun.spawnSync(command, {
@@ -66,14 +70,47 @@ function ensureDockerImageAvailable(image) {
   }
 }
 
+function containerDiagnostics(name) {
+  const inspect = runResult([
+    "sudo",
+    "docker",
+    "inspect",
+    "--format",
+    "Running={{.State.Running}} Status={{.State.Status}} ExitCode={{.State.ExitCode}} Error={{.State.Error}}",
+    name,
+  ]);
+  const logs = runResult(["sudo", "docker", "logs", "--tail", "80", name]);
+  return [
+    `inspect: ${inspect.stdout}${inspect.stderr}`.trim(),
+    `logs:\n${logs.stdout}${logs.stderr}`.trim(),
+  ].join("\n");
+}
+
 function assertContainerRunning(name) {
   const result = runResult(["sudo", "docker", "inspect", "--format", "{{.State.Running}}", name]);
   if (result.exitCode !== 0) {
     throw new Error(`Container ${name} is not inspectable.\n${result.stdout}${result.stderr}`.trim());
   }
   if (!result.stdout.trim().includes("true")) {
-    const logs = runResult(["sudo", "docker", "logs", name]);
-    throw new Error(`Container ${name} exited before becoming ready.\n${logs.stdout}${logs.stderr}`.trim());
+    throw new Error(`Container ${name} exited before becoming ready.\n${containerDiagnostics(name)}`);
+  }
+}
+
+// Remove known + legacy timestamped nginz-acme-* containers so host ports
+// can be rebound. No --rm on run: crashed containers stay inspectable.
+function stopAllAcmeContainers() {
+  for (const name of [PEBBLE_CONTAINER, CHALLTESTSRV_CONTAINER]) {
+    runResult(["sudo", "docker", "rm", "-f", name]);
+  }
+  const listed = runResult(["sudo", "docker", "ps", "-aq", "--filter", "name=nginz-acme-"]);
+  for (const id of listed.stdout.trim().split(/\s+/).filter(Boolean)) {
+    runResult(["sudo", "docker", "rm", "-f", id]);
+  }
+}
+
+async function freePebblePorts() {
+  for (const port of PEBBLE_PORTS) {
+    await ensurePortFree(port);
   }
 }
 
@@ -81,7 +118,6 @@ function startChalltestsrv() {
   docker(
     "run",
     "--pull=never",
-    "--rm",
     "-d",
     "--name",
     CHALLTESTSRV_CONTAINER,
@@ -100,7 +136,6 @@ function startPebble() {
   docker(
     "run",
     "--pull=never",
-    "--rm",
     "-d",
     "--name",
     PEBBLE_CONTAINER,
@@ -120,13 +155,32 @@ function startPebble() {
     "-dnsserver",
     "127.0.0.1:8053"
   );
+  // Brief grace: bind failures exit almost immediately; healthy start stays up.
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline) {
+    const running = runResult([
+      "sudo",
+      "docker",
+      "inspect",
+      "--format",
+      "{{.State.Running}}",
+      PEBBLE_CONTAINER,
+    ]);
+    if (running.exitCode === 0 && running.stdout.trim().includes("true")) {
+      break;
+    }
+    if (running.exitCode === 0 && running.stdout.trim().includes("false")) {
+      throw new Error(`Pebble container exited on start.\n${containerDiagnostics(PEBBLE_CONTAINER)}`);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
   assertContainerRunning(PEBBLE_CONTAINER);
   docker("cp", `${PEBBLE_CONTAINER}:/test/certs/pebble.minica.pem`, PEBBLE_CA_HOST);
 }
 
 function stopContainer(name) {
   try {
-    docker("rm", "-f", name);
+    runResult(["sudo", "docker", "rm", "-f", name]);
   } catch {
     // best-effort
   }
@@ -164,21 +218,37 @@ async function waitForRunnerReady(timeout = 10000) {
   throw new Error("Timeout waiting for containerized ACME runner");
 }
 
-async function waitForPebbleReady(timeout = 10000) {
+async function waitForPebbleReady(timeout = 15000) {
   const start = Date.now();
+  let lastCurl = "";
   while (Date.now() - start < timeout) {
-    assertContainerRunning(PEBBLE_CONTAINER);
+    const running = runResult([
+      "sudo",
+      "docker",
+      "inspect",
+      "--format",
+      "{{.State.Running}}",
+      PEBBLE_CONTAINER,
+    ]);
+    if (running.exitCode !== 0 || !running.stdout.trim().includes("true")) {
+      throw new Error(
+        `Pebble container exited while waiting for readiness.\n${containerDiagnostics(PEBBLE_CONTAINER)}`,
+      );
+    }
     try {
       const res = run(["curl", "-sk", "https://127.0.0.1:14000/dir"]);
       if (res.stdout.includes('"newOrder"')) {
         return;
       }
-    } catch {
-      // still starting
+      lastCurl = res.stdout.slice(0, 200);
+    } catch (error) {
+      lastCurl = String(error?.message || error);
     }
     await Bun.sleep(100);
   }
-  throw new Error("Timeout waiting for Pebble");
+  throw new Error(
+    `Timeout waiting for Pebble directory endpoint.\nlast=${lastCurl}\n${containerDiagnostics(PEBBLE_CONTAINER)}`,
+  );
 }
 
 async function triggerUntilIssued({ maxSteps = 48, stepDelayMs = 100 } = {}) {
@@ -256,9 +326,10 @@ describe("acme module live Pebble integration", () => {
     ensureDockerAvailable();
     ensureDockerImageAvailable(CHALLTESTSRV_IMAGE);
     ensureDockerImageAvailable(PEBBLE_IMAGE);
-    // Unit ACME mock / prior pebble containers also bind these host ports.
-    await ensurePortFree(14000);
-    await ensurePortFree(8053);
+    // Drop orphans from prior runs, then free host ports held by unit mock /
+    // leftover pebble (root-owned listeners need ensurePortFree's sudo kill).
+    stopAllAcmeContainers();
+    await freePebblePorts();
     startChalltestsrv();
     startPebble();
     await waitForPebbleReady();
@@ -268,9 +339,11 @@ describe("acme module live Pebble integration", () => {
 
   afterAll(async () => {
     await stopNginz();
-    stopContainer(PEBBLE_CONTAINER);
-    stopContainer(CHALLTESTSRV_CONTAINER);
+    stopAllAcmeContainers();
     try { unlinkSync(PEBBLE_CA_HOST); } catch {}
+    for (const port of PEBBLE_PORTS) {
+      try { await ensurePortFree(port, 3000); } catch {}
+    }
     cleanupHarnessRuntime(MODULE);
   }, 30000);
 
@@ -302,7 +375,10 @@ describe("acme module live Pebble integration", () => {
     await assertTlsRejected("nginx.live-hostname-mismatch.conf");
   }, 30000);
 
-  test("rejects malformed trust material during configuration", () => {
+  test("rejects malformed trust material during configuration", async () => {
+    // Prior tests leave a live nginz on the shared runtime prefix; -t against
+    // the same -p can stall on pid/lock files under load.
+    await stopNginz();
     const result = runResult([
       "./zig-out/bin/nginz",
       "-t",
@@ -314,5 +390,5 @@ describe("acme module live Pebble integration", () => {
     expect(result.exitCode).not.toBe(0);
     const diagnostic = `${result.stdout}${result.stderr}${existsSync(ERROR_LOG) ? readFileSync(ERROR_LOG, "utf8") : ""}`;
     expect(diagnostic).toMatch(/certificate|PEM|SSL/i);
-  });
+  }, 15000);
 });

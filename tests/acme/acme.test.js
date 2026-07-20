@@ -5,7 +5,8 @@ import {
   startNginz,
   reloadNginz,
   stopNginz,
-  cleanupRuntime,
+  prepareMockPorts,
+  teardownModule,
   TEST_URL,
   createACMEMock,
   MOCK_PORTS,
@@ -21,6 +22,7 @@ async function restartAcmeEnvironment() {
   await stopNginz();
   if (acmeMock) {
     acmeMock.stop();
+    acmeMock = null;
   }
 
   const acmeStoragePath = `tests/${MODULE}/runtime/acme`;
@@ -29,6 +31,7 @@ async function restartAcmeEnvironment() {
   }
   mkdirSync(acmeStoragePath, { recursive: true });
 
+  await prepareMockPorts(MOCK_PORTS.ACME);
   acmeMock = createACMEMock(MOCK_PORTS.ACME);
   await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
 }
@@ -100,18 +103,16 @@ describe("acme module", () => {
     }
     mkdirSync(acmeStoragePath, { recursive: true });
 
-    // Start ACME mock server
+    // Free :14000 from a prior suite / leftover host-network Pebble, then bind.
+    await prepareMockPorts(MOCK_PORTS.ACME);
     acmeMock = createACMEMock(MOCK_PORTS.ACME);
 
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
   });
 
   afterAll(async () => {
-    await stopNginz();
-    if (acmeMock) {
-      acmeMock.stop();
-    }
-    cleanupRuntime(MODULE);
+    await teardownModule(MODULE, [acmeMock], [MOCK_PORTS.ACME]);
+    acmeMock = null;
   });
 
   describe("HTTP-01 Challenge Handler", () => {

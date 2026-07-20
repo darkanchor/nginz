@@ -22,8 +22,43 @@ function killStaleListeners(port) {
     for (const match of text.matchAll(/pid=(\d+)/g)) {
       const pid = Number(match[1]);
       if (pid > 0 && pid !== process.pid) {
-        try { process.kill(pid, "SIGKILL"); } catch {}
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Root-owned host-network docker (pebble) holds :14000 across suites.
+          try {
+            spawnSync(["sudo", "kill", "-9", String(pid)], {
+              stdout: "ignore",
+              stderr: "ignore",
+            });
+          } catch {}
+        }
       }
+    }
+  } catch {}
+}
+
+function stopStaleAcmeDocker() {
+  // Container suite uses host networking on :14000/:8053/:15000. Timestamped
+  // leftovers from crashed runs keep the ports forever unless removed here.
+  try {
+    const listed = spawnSync(
+      ["sudo", "docker", "ps", "-aq", "--filter", "name=nginz-acme-"],
+      { stdout: "pipe", stderr: "ignore" },
+    );
+    const raw = listed.stdout;
+    const text = raw == null
+      ? ""
+      : typeof raw === "string"
+        ? raw
+        : Buffer.from(raw).toString();
+    for (const id of text.trim().split(/\s+/).filter(Boolean)) {
+      try {
+        spawnSync(["sudo", "docker", "rm", "-f", id], {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+      } catch {}
     }
   } catch {}
 }
@@ -550,14 +585,21 @@ function sleepSync(ms) {
 
 export function createACMEMock(port = 14000) {
   // Retry bind: sequential describes share mock ports and Bun.serve
-  // can briefly reject re-bind after stop(true).
+  // can briefly reject re-bind after stop(true). Also clear leftover
+  // host-network Pebble containers that pin the same ACME port.
+  stopStaleAcmeDocker();
   let lastError = null;
   for (let attempt = 0; attempt < 10; attempt++) {
-    if (attempt > 0) sleepSync(30 * attempt);
+    if (attempt > 0) {
+      killStaleListeners(port);
+      sleepSync(30 * attempt);
+    }
     try {
       return new ACMEMock(port).start();
     } catch (error) {
       lastError = error;
+      const msg = String(error?.message || error);
+      if (!/EADDRINUSE|in use/i.test(msg)) break;
     }
   }
   throw lastError ?? new Error(`Failed to start ACME mock on port ${port}`);

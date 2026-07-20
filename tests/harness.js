@@ -168,7 +168,16 @@ function killListenersOnPort(port) {
       if (pid > 0 && pid !== process.pid) {
         try {
           process.kill(pid, "SIGKILL");
-        } catch {}
+        } catch {
+          // Host-network docker listeners (pebble/challtestsrv) often run as
+          // root; unprivileged kill fails with EPERM and leaves EADDRINUSE.
+          try {
+            spawnSync(["sudo", "kill", "-9", String(pid)], {
+              stdout: "ignore",
+              stderr: "ignore",
+            });
+          } catch {}
+        }
       }
     }
   } catch {}
