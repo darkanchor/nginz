@@ -22,6 +22,20 @@ function fetchClose(url, init = {}) {
   return fetch(url, { ...init, headers });
 }
 
+async function sampleUpstreamVersions(path, n, init = {}) {
+  const versions = { stable: 0, canary: 0 };
+  for (let i = 0; i < n; i++) {
+    const res = await fetchClose(`${TEST_URL}${path}`, init);
+    const body = await res.json();
+    if (body.version in versions) versions[body.version]++;
+  }
+  return versions;
+}
+
+// 10% canary is binomial noise at small n (Bin(100,0.1) hits ≤2 ~0.2% of the time).
+// Sample enough that "both sides seen" / loose band checks stop flaking.
+const PCT_SAMPLES = 300;
+
 describe("canary module", () => {
   beforeAll(async () => {
     mocks = createMockManager();
@@ -57,34 +71,21 @@ describe("canary module", () => {
 
   describe("percentage-based routing", () => {
     test("routes traffic to both stable and canary", async () => {
-      const versions = { stable: 0, canary: 0 };
+      const versions = await sampleUpstreamVersions("/api/test", PCT_SAMPLES);
 
-      // Make 100 requests to get a statistical distribution
-      for (let i = 0; i < 100; i++) {
-        const res = await fetchClose(`${TEST_URL}/api/test`);
-        const body = await res.json();
-        versions[body.version]++;
-      }
-
-      // With 10% canary, expect roughly 90 stable, 10 canary
-      // Allow some variance due to randomness
-      expect(versions.stable).toBeGreaterThan(70);
-      expect(versions.canary).toBeGreaterThan(2);
-      expect(versions.canary).toBeLessThan(30);
+      // With 10% canary, expect roughly 90/10; wide band for CSPRNG noise.
+      expect(versions.stable).toBeGreaterThan(PCT_SAMPLES * 0.7);
+      expect(versions.canary).toBeGreaterThan(PCT_SAMPLES * 0.02);
+      expect(versions.canary).toBeLessThan(PCT_SAMPLES * 0.3);
     });
 
     test("maintains statistical distribution over many requests", async () => {
-      const versions = { stable: 0, canary: 0 };
+      const n = 400;
+      const versions = await sampleUpstreamVersions("/api/test", n);
 
-      for (let i = 0; i < 200; i++) {
-        const res = await fetchClose(`${TEST_URL}/api/test`);
-        const body = await res.json();
-        versions[body.version]++;
-      }
-
-      // Canary percentage should be roughly 10% (allow 3-25% range)
-      const canaryPct = (versions.canary / 200) * 100;
-      expect(canaryPct).toBeGreaterThan(3);
+      // Canary percentage should be roughly 10% (allow ~2-25% range)
+      const canaryPct = (versions.canary / n) * 100;
+      expect(canaryPct).toBeGreaterThan(2);
       expect(canaryPct).toBeLessThan(25);
     });
   });
@@ -134,32 +135,21 @@ describe("canary module", () => {
     });
 
     test("falls back to percentage when header absent", async () => {
-      const versions = { stable: 0, canary: 0 };
+      const versions = await sampleUpstreamVersions("/api-combined/test", PCT_SAMPLES);
 
-      for (let i = 0; i < 100; i++) {
-        const res = await fetchClose(`${TEST_URL}/api-combined/test`);
-        const body = await res.json();
-        versions[body.version]++;
-      }
-
-      // Should see both versions (percentage fallback working)
-      expect(versions.stable).toBeGreaterThan(70);
-      expect(versions.canary).toBeGreaterThan(2);
+      // Percentage fallback (10%): both sides must appear; avoid tight floors
+      // that flake under Bin(n, 0.1) tails (e.g. canary === 2 with n=100).
+      expect(versions.stable).toBeGreaterThan(PCT_SAMPLES * 0.7);
+      expect(versions.canary).toBeGreaterThan(PCT_SAMPLES * 0.02);
     });
 
     test("falls back to percentage when header is present but does not match", async () => {
-      const versions = { stable: 0, canary: 0 };
+      const versions = await sampleUpstreamVersions("/api-combined/test", PCT_SAMPLES, {
+        headers: { "X-Canary": "false" },
+      });
 
-      for (let i = 0; i < 100; i++) {
-        const res = await fetchClose(`${TEST_URL}/api-combined/test`, {
-          headers: { "X-Canary": "false" },
-        });
-        const body = await res.json();
-        versions[body.version]++;
-      }
-
-      expect(versions.stable).toBeGreaterThan(70);
-      expect(versions.canary).toBeGreaterThan(2);
+      expect(versions.stable).toBeGreaterThan(PCT_SAMPLES * 0.7);
+      expect(versions.canary).toBeGreaterThan(PCT_SAMPLES * 0.02);
     });
   });
 
@@ -200,8 +190,9 @@ describe("canary module", () => {
 
     test("variable distribution matches percentage", async () => {
       let canaryCount = 0;
+      const n = 200;
 
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < n; i++) {
         const res = await fetchClose(`${TEST_URL}/debug`);
         const body = await res.text();
         if (body === "canary=1\n") {
@@ -209,9 +200,9 @@ describe("canary module", () => {
         }
       }
 
-      // 50% canary, expect roughly 40-60%
-      expect(canaryCount).toBeGreaterThan(30);
-      expect(canaryCount).toBeLessThan(70);
+      // 50% canary; wider band than 30-70@n=100 to absorb CSPRNG tails
+      expect(canaryCount).toBeGreaterThan(n * 0.3);
+      expect(canaryCount).toBeLessThan(n * 0.7);
     });
 
     test("variable decision is stable within a single request", async () => {
