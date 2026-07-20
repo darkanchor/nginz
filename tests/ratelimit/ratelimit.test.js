@@ -17,6 +17,13 @@ function fetchClose(url, init = {}) {
   return fetch(url, { ...init, headers });
 }
 
+// Wait until `offsetMs` into the next wall-clock second. Used by the capacity
+// test so a ~200ms concurrent fill does not straddle the fixed 1s window.
+function sleepUntilNextSecondPlus(offsetMs = 30) {
+  const into = Date.now() % 1000;
+  return Bun.sleep(1000 - into + offsetMs);
+}
+
 describe("ratelimit module", () => {
   beforeAll(async () => {
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
@@ -233,9 +240,12 @@ describe("ratelimit module", () => {
     await startNginz(`tests/${MODULE}/nginx-capacity-reload.conf`, MODULE);
 
     try {
-      // Start near a fresh fixed-window boundary so all entries remain live
-      // while the concurrent fill reaches capacity.
-      await Bun.sleep(1050);
+      // Fixed windows are whole wall-clock seconds. A concurrent 1024-key fill
+      // takes ~200ms; if it straddles a second boundary, early entries become
+      // reclaimable and overflow gets 200 instead of capacity-reject 429.
+      // Align to the start of a second so fill + overflow stay in one window.
+      await sleepUntilNextSecondPlus(30);
+
       const fills = await Promise.all(
         Array.from({ length: 1024 }, (_, index) =>
           fetchClose(`${TEST_URL}/fill?k=key-${index}`).then((res) => res.status),
