@@ -6,6 +6,7 @@ import {
   stopNginz,
   cleanupRuntime as cleanupHarnessRuntime,
   ensurePortFree,
+  stopAcmeDockerContainers,
   TEST_URL,
 } from "../harness.js";
 
@@ -102,15 +103,16 @@ function stopAllAcmeContainers() {
   for (const name of [PEBBLE_CONTAINER, CHALLTESTSRV_CONTAINER]) {
     runResult(["sudo", "docker", "rm", "-f", name]);
   }
-  const listed = runResult(["sudo", "docker", "ps", "-aq", "--filter", "name=nginz-acme-"]);
-  for (const id of listed.stdout.trim().split(/\s+/).filter(Boolean)) {
-    runResult(["sudo", "docker", "rm", "-f", id]);
-  }
+  // Shared helper also tries sudo -n / plain docker when sudo prompts.
+  stopAcmeDockerContainers();
 }
 
 async function freePebblePorts() {
+  stopAllAcmeContainers();
   for (const port of PEBBLE_PORTS) {
-    await ensurePortFree(port);
+    // ensurePortFree bind-probes; also re-drops nginz-acme containers for
+    // :14000/:15000/:8053 because unprivileged ss hides root docker pids.
+    await ensurePortFree(port, 15000);
   }
 }
 
@@ -326,9 +328,8 @@ describe("acme module live Pebble integration", () => {
     ensureDockerAvailable();
     ensureDockerImageAvailable(CHALLTESTSRV_IMAGE);
     ensureDockerImageAvailable(PEBBLE_IMAGE);
-    // Drop orphans from prior runs, then free host ports held by unit mock /
-    // leftover pebble (root-owned listeners need ensurePortFree's sudo kill).
-    stopAllAcmeContainers();
+    // Drop orphans, then free host ports. Unit ACME mock uses :14001 so it no
+    // longer collides with Pebble :14000; leftovers are still docker-rm'd.
     await freePebblePorts();
     startChalltestsrv();
     startPebble();

@@ -103,17 +103,17 @@ describe("acme module", () => {
     }
     mkdirSync(acmeStoragePath, { recursive: true });
 
-    // Free :14000 from a prior suite / leftover host-network Pebble, then bind.
+    // Unit mock binds :14001 (MOCK_PORTS.ACME), separate from live Pebble :14000.
     await prepareMockPorts(MOCK_PORTS.ACME);
     acmeMock = createACMEMock(MOCK_PORTS.ACME);
 
     await startNginz(`tests/${MODULE}/nginx.conf`, MODULE);
-  });
+  }, 60000);
 
   afterAll(async () => {
     await teardownModule(MODULE, [acmeMock], [MOCK_PORTS.ACME]);
     acmeMock = null;
-  });
+  }, 30000);
 
   describe("HTTP-01 Challenge Handler", () => {
     test("returns 404 for unknown challenge token", async () => {

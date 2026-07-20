@@ -8,63 +8,69 @@ import { randomBytes } from "crypto";
 
 
 function killStaleListeners(port) {
-  try {
-    const ss = spawnSync(["ss", "-ltnp", `sport = :${port}`], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const raw = ss.stdout;
-    const text = raw == null
-      ? ""
-      : typeof raw === "string"
-        ? raw
-        : Buffer.from(raw).toString();
-    for (const match of text.matchAll(/pid=(\d+)/g)) {
-      const pid = Number(match[1]);
-      if (pid > 0 && pid !== process.pid) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // Root-owned host-network docker (pebble) holds :14000 across suites.
+  for (const cmd of [
+    ["ss", "-ltnp", `sport = :${port}`],
+    ["sudo", "-n", "ss", "-ltnp", `sport = :${port}`],
+  ]) {
+    try {
+      const ss = spawnSync(cmd, { stdout: "pipe", stderr: "ignore" });
+      const raw = ss.stdout;
+      const text = raw == null
+        ? ""
+        : typeof raw === "string"
+          ? raw
+          : Buffer.from(raw).toString();
+      for (const match of text.matchAll(/pid=(\d+)/g)) {
+        const pid = Number(match[1]);
+        if (pid > 0 && pid !== process.pid) {
           try {
-            spawnSync(["sudo", "kill", "-9", String(pid)], {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+          try {
+            spawnSync(["sudo", "-n", "kill", "-9", String(pid)], {
               stdout: "ignore",
               stderr: "ignore",
             });
           } catch {}
         }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 }
 
 function stopStaleAcmeDocker() {
-  // Container suite uses host networking on :14000/:8053/:15000. Timestamped
-  // leftovers from crashed runs keep the ports forever unless removed here.
-  try {
-    const listed = spawnSync(
-      ["sudo", "docker", "ps", "-aq", "--filter", "name=nginz-acme-"],
-      { stdout: "pipe", stderr: "ignore" },
-    );
-    const raw = listed.stdout;
-    const text = raw == null
-      ? ""
-      : typeof raw === "string"
-        ? raw
-        : Buffer.from(raw).toString();
-    for (const id of text.trim().split(/\s+/).filter(Boolean)) {
-      try {
-        spawnSync(["sudo", "docker", "rm", "-f", id], {
-          stdout: "ignore",
-          stderr: "ignore",
-        });
-      } catch {}
-    }
-  } catch {}
+  // Live Pebble suite uses host networking. Orphans must not pin ports for the
+  // next run; docker rm is reliable even when unprivileged ss hides pids.
+  // Do not use interactive `sudo docker` — password prompts hang beforeAll.
+  for (const docker of [["sudo", "-n", "docker"], ["docker"]]) {
+    try {
+      const listed = spawnSync(
+        [...docker, "ps", "-aq", "--filter", "name=nginz-acme"],
+        { stdout: "pipe", stderr: "ignore" },
+      );
+      if (listed.exitCode !== 0 && listed.exitCode != null) continue;
+      const raw = listed.stdout;
+      const text = raw == null
+        ? ""
+        : typeof raw === "string"
+          ? raw
+          : Buffer.from(raw).toString();
+      for (const id of text.trim().split(/\s+/).filter(Boolean)) {
+        try {
+          spawnSync([...docker, "rm", "-f", id], {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+        } catch {}
+      }
+      return;
+    } catch {}
+  }
 }
 
 export class ACMEMock {
-  constructor(port = 14000) {
+  // Default 14001: keep unit mock off Pebble's host-network :14000.
+  constructor(port = 14001) {
     this.port = port;
     this.server = null;
     this.baseUrl = `http://127.0.0.1:${port}`;
@@ -583,16 +589,17 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-export function createACMEMock(port = 14000) {
+export function createACMEMock(port = 14001) {
   // Retry bind: sequential describes share mock ports and Bun.serve
-  // can briefly reject re-bind after stop(true). Also clear leftover
-  // host-network Pebble containers that pin the same ACME port.
+  // can briefly reject re-bind after stop(true).
   stopStaleAcmeDocker();
   let lastError = null;
-  for (let attempt = 0; attempt < 10; attempt++) {
+  for (let attempt = 0; attempt < 12; attempt++) {
     if (attempt > 0) {
       killStaleListeners(port);
-      sleepSync(30 * attempt);
+      sleepSync(40 * attempt);
+    } else {
+      killStaleListeners(port);
     }
     try {
       return new ACMEMock(port).start();

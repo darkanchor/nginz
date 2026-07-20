@@ -148,51 +148,130 @@ export async function waitForPortFree(port, timeout = 10000) {
   throw new Error(`Timeout waiting for port ${port} to become free`);
 }
 
+function ssListenText(port) {
+  // Prefer unprivileged ss; fall back to sudo (often NOPASSWD only for docker,
+  // so this may still omit root pids — callers must also docker-rm host-net
+  // containers by name).
+  for (const cmd of [
+    ["ss", "-ltnp", `sport = :${port}`],
+    ["sudo", "-n", "ss", "-ltnp", `sport = :${port}`],
+  ]) {
+    try {
+      const ss = spawnSync(cmd, { stdout: "pipe", stderr: "ignore" });
+      if (ss.exitCode !== 0 && ss.exitCode != null) continue;
+      const raw = ss.stdout;
+      return raw == null
+        ? ""
+        : typeof raw === "string"
+          ? raw
+          : Buffer.from(raw).toString();
+    } catch {}
+  }
+  return "";
+}
+
 function killListenersOnPort(port) {
   // Only kill LISTEN-side processes (ss -ltnp). Do NOT use `fuser -k`:
   // fuser also targets clients connected to the port, which would SIGKILL
   // the bun test process itself while it still has sockets open to nginx.
   try {
-    const ss = spawnSync(["ss", "-ltnp", `sport = :${port}`], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const raw = ss.stdout;
-    const text = raw == null
-      ? ""
-      : typeof raw === "string"
-        ? raw
-        : Buffer.from(raw).toString();
+    const text = ssListenText(port);
     for (const match of text.matchAll(/pid=(\d+)/g)) {
       const pid = Number(match[1]);
       if (pid > 0 && pid !== process.pid) {
         try {
           process.kill(pid, "SIGKILL");
-        } catch {
-          // Host-network docker listeners (pebble/challtestsrv) often run as
-          // root; unprivileged kill fails with EPERM and leaves EADDRINUSE.
-          try {
-            spawnSync(["sudo", "kill", "-9", String(pid)], {
-              stdout: "ignore",
-              stderr: "ignore",
-            });
-          } catch {}
-        }
+        } catch {}
+        // Root-owned host-network docker may require elevated kill; -n avoids
+        // hanging on a password prompt when sudo is not passwordless.
+        try {
+          spawnSync(["sudo", "-n", "kill", "-9", String(pid)], {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+        } catch {}
       }
     }
   } catch {}
 }
 
-// Free a TCP port for reuse. Soft-wait first; if something is still bound,
-// kill listeners on that port (test-only harness) and wait again.
-export async function ensurePortFree(port, timeout = 10000) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
+// True only when this process can actually bind the port (connect probes lie
+// for same-process listeners and some dual-stack edge cases).
+function tryBindPort(port) {
+  try {
+    const server = Bun.serve({
+      port,
+      fetch() {
+        return new Response("");
+      },
+    });
     try {
-      await waitForPortFree(port, 150);
+      server.stop(true);
+    } catch {
+      try {
+        server.stop();
+      } catch {}
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Host-network ACME Pebble/challtestsrv leftovers pin :14000/:15000/:8053.
+// ss often hides their pids without root; docker rm is the reliable cleanup.
+// Never use interactive `sudo docker` here — a password prompt hangs spawnSync
+// and trips the bun hook timeout. Prefer passwordless `sudo -n` or bare docker.
+export function stopAcmeDockerContainers() {
+  const dockerBins = [
+    ["sudo", "-n", "docker"],
+    ["docker"],
+  ];
+  for (const docker of dockerBins) {
+    try {
+      const listed = spawnSync(
+        [...docker, "ps", "-aq", "--filter", "name=nginz-acme"],
+        { stdout: "pipe", stderr: "ignore" },
+      );
+      if (listed.exitCode !== 0 && listed.exitCode != null) continue;
+      const raw = listed.stdout;
+      const text = raw == null
+        ? ""
+        : typeof raw === "string"
+          ? raw
+          : Buffer.from(raw).toString();
+      const ids = text.trim().split(/\s+/).filter(Boolean);
+      for (const id of ids) {
+        try {
+          spawnSync([...docker, "rm", "-f", id], {
+            stdout: "ignore",
+            stderr: "ignore",
+          });
+        } catch {}
+      }
+      // A successful docker client invocation is enough; empty id list is fine.
       return;
     } catch {}
+  }
+}
+
+// Free a TCP port for reuse. Prefer a real bind probe over connect-only checks.
+export async function ensurePortFree(port, timeout = 10000) {
+  const deadline = Date.now() + timeout;
+  // ACME live suite ports: always drop known host-network containers first.
+  if (port === 14000 || port === 15000 || port === 8053) {
+    stopAcmeDockerContainers();
+  }
+  while (Date.now() < deadline) {
     killListenersOnPort(port);
+    if (tryBindPort(port)) {
+      // Let the probe socket fully release before the real server binds.
+      await Bun.sleep(30);
+      if (tryBindPort(port)) return;
+    }
+    if (port === 14000 || port === 15000 || port === 8053) {
+      stopAcmeDockerContainers();
+    }
     await Bun.sleep(50);
   }
   throw new Error(`Timeout waiting for port ${port} to become free`);
@@ -253,13 +332,17 @@ export function cleanupRuntime(moduleName) {
   }
 }
 
-// Default ports for mock servers
+// Default ports for mock servers.
+// ACME unit mock uses 14001 — NOT 14000. Live Pebble (acme.container.test.js)
+// binds host-network :14000; sharing that port with the Bun mock caused
+// cross-suite EADDRINUSE flakes that ensurePortFree could not always clear
+// (root docker listeners often have no pid in unprivileged `ss`).
 export const MOCK_PORTS = {
   REDIS: 16379,
   POSTGRES: 15432,
   CONSUL: 18500,
   OIDC: 19000,
-  ACME: 14000,
+  ACME: 14001,
   HTTP: 19001,
   HTTP_UPSTREAM_1: 19002,
   HTTP_UPSTREAM_2: 19003,
