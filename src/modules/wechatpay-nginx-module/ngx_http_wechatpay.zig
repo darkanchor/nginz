@@ -113,8 +113,8 @@ fn acceptFreshNonceInStore(store: *ReplayStore, nonce_value: []const u8, now: i6
     return true;
 }
 
-fn acceptFreshNonce(nonce_value: []const u8, now: i64) bool {
-    const zone = wechatpay_replay_zone;
+fn acceptFreshNonce(zone_override: [*c]core.ngx_shm_zone_t, nonce_value: []const u8, now: i64) bool {
+    const zone = if (zone_override != null) zone_override else wechatpay_replay_zone;
     if (zone == core.nullptr(core.ngx_shm_zone_t) or zone.*.data == null or zone.*.shm.addr == null) return false;
     const store_c = core.castPtr(ReplayStore, zone.*.data) orelse return false;
     const store: *ReplayStore = @ptrCast(@alignCast(store_c));
@@ -159,10 +159,16 @@ const wechatpay_request_context = extern struct {
     status: http.ngx_http_status_t,
     done_access: ngx_flag_t,
     response_bytes: usize,
+    prepared_headers: ngx_str_t,
+    captured_request: ngx_str_t,
+    captured_response: ngx_str_t,
+    verified_notification: ngx_str_t,
 };
 
 const wechatpay_loc_conf = extern struct {
     proxy: ngx_str_t,
+    audit_request: ngx_str_t,
+    replay_zone: [*c]core.ngx_shm_zone_t,
     apiclient_key: ngx_str_t,
     apiclient_serial: ngx_str_t,
     wechatpay_public_key: ngx_str_t,
@@ -266,6 +272,18 @@ fn wechatpay_create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     return null;
 }
 
+fn set_replay_zone(cf: [*c]ngx_conf_t, cmd: [*c]ngx_command_t, loc: ?*anyopaque) callconv(.c) [*c]u8 {
+    _ = cmd;
+    const config = core.castPtr(wechatpay_loc_conf, loc) orelse return NGX_CONF_ERROR;
+    var index: ngx_uint_t = 1;
+    const name = ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &index) orelse return NGX_CONF_ERROR;
+    const zone = shm.ngx_shared_memory_add(cf, name, WECHATPAY_REPLAY_ZONE_SIZE, @constCast(&ngx_http_wechatpay_module));
+    if (zone == null) return NGX_CONF_ERROR;
+    zone.*.init = replay_zone_init;
+    config.*.replay_zone = zone;
+    return conf.NGX_CONF_OK;
+}
+
 fn ngx_conf_set_wechatpay_access(
     cf: [*c]ngx_conf_t,
     cmd: [*c]ngx_command_t,
@@ -276,7 +294,6 @@ fn ngx_conf_set_wechatpay_access(
         lccf.*.access_control = 1;
         var i: ngx_uint_t = 1;
         while (ngx.array.ngx_array_next(ngx_str_t, cf.*.args, &i)) |arg| {
-            ngx.log.ngx_http_conf_debug(cf, "aes key %V", .{arg});
             lccf.*.aes_secret = arg.*;
             break;
         }
@@ -308,6 +325,8 @@ fn config_check(
 }
 
 inline fn merge_loc(ch: [*c]wechatpay_loc_conf, pr: [*c]wechatpay_loc_conf) void {
+    if (ch.*.replay_zone == null) ch.*.replay_zone = pr.*.replay_zone;
+    conf.ngx_conf_merge_str_value(&ch.*.audit_request, &pr.*.audit_request, ngx_string(""));
     conf.ngx_conf_merge_str_value(&ch.*.apiclient_key, &pr.*.apiclient_key, ngx_string(""));
     conf.ngx_conf_merge_str_value(&ch.*.apiclient_serial, &pr.*.apiclient_serial, ngx_string(""));
     conf.ngx_conf_merge_str_value(&ch.*.wechatpay_public_key, &pr.*.wechatpay_public_key, ngx_string(""));
@@ -494,7 +513,9 @@ fn sign_request(
     const tstr = try timestamp(r.*.pool);
     var write: [*c]u8 = data;
     write = ngx_sprintf(write, "%V\n", &r.*.method_name);
-    write = ngx_sprintf(write, "%V?%V\n", &r.*.uri, &r.*.args);
+    write = ngx_sprintf(write, "%V", &r.*.uri);
+    if (r.*.args.len > 0) write = ngx_sprintf(write, "?%V", &r.*.args);
+    write = ngx_sprintf(write, "\n");
     write = ngx_sprintf(write, "%V\n", &tstr);
     write = ngx_sprintf(write, "%V\n", &nstr);
     const body = read_body(r);
@@ -519,10 +540,8 @@ fn build_request(
     lccf: [*c]wechatpay_loc_conf,
     r: [*c]ngx_http_request_t,
 ) !ngx_str_t {
-    var content_length: usize = 1024;
-    if (!r.*.flags1.discard_body and r.*.headers_in.content_length_n > 0) {
-        content_length += @intCast(r.*.headers_in.content_length_n);
-    }
+    const body = read_body(r);
+    const content_length: usize = 2048 + body.len + r.*.uri.len + r.*.args.len;
     if (core.castPtr(
         u8,
         core.ngx_pmemalign(
@@ -535,14 +554,16 @@ fn build_request(
 
         const sign = try sign_request(lccf, r, data);
         var write: [*c]u8 = data;
-        write = ngx_sprintf(write, "%V %V?%V HTTP/1.1\r\n", &r.*.method_name, &r.*.uri, &r.*.args);
-        // Use main request headers: subrequest headers_in is a struct-copy whose
-        // embedded part and last pointer diverge (list inconsistent for iteration).
-        var headers = NList(ngx_table_elt_t).init0(&r.*.main.*.headers_in.headers);
-        var it = headers.iterator();
-        while (it.next()) |h| {
-            write = ngx_sprintf(write, "%V: %V\r\n", &h.*.key, &h.*.value);
+        write = ngx_sprintf(write, "%V %V", &r.*.method_name, &r.*.uri);
+        if (r.*.args.len > 0) write = ngx_sprintf(write, "?%V", &r.*.args);
+        const provider = get_host(lccf.*.proxy);
+        write = ngx_sprintf(write, " HTTP/1.1\r\nHost: %V", &provider.host);
+        if ((provider.ssl and provider.port != 443) or (!provider.ssl and provider.port != 80)) {
+            write = ngx_sprintf(write, ":%ui", @as(ngx_uint_t, provider.port));
         }
+        write = ngx_sprintf(write, "\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: %uz\r\nConnection: close\r\n", body.len);
+        // A payment subrequest never forwards user JWTs, cookies, caller Host,
+        // forged provider Authorization or any other main-request headers.
         write = ngx_sprintf(write, "%V\r\n", &sign);
         const len = core.ngz_len(data, write);
         return ngx.string.ngx_string_from_pool(data, len, r.*.pool);
@@ -569,8 +590,7 @@ fn verify_request(
     data: [*c]u8,
 ) !bool {
     const w_serial = try find_header(headers, ngx_string("Wechatpay-Serial"));
-    const req_id = try find_header(headers, ngx_string("Request-ID"));
-    if (req_id.len == 0 or !ngx.string.eql(w_serial, lccf.*.wechatpay_serial)) {
+    if (!ngx.string.eql(w_serial, lccf.*.wechatpay_serial)) {
         return false;
     }
     const w_nonce = try find_header(headers, ngx_string("Wechatpay-Nonce"));
@@ -588,11 +608,11 @@ fn verify_request(
     const len = core.ngz_len(data, write);
     const rsa = lccf.*.ctx.*.rsa;
     if (!try rsa.*.verify_sha256(w_signature, ngx_str_t{ .data = data, .len = len }, pool)) return false;
-    return acceptFreshNonce(core.slicify(u8, w_nonce.data, w_nonce.len), now);
+    return acceptFreshNonce(lccf.*.replay_zone, core.slicify(u8, w_nonce.data, w_nonce.len), now);
 }
 
 fn send_header(r: [*c]ngx_http_request_t) ngx_int_t {
-    r.*.headers_out.status = http.NGX_HTTP_OK;
+    if (r.*.headers_out.status == 0) r.*.headers_out.status = http.NGX_HTTP_OK;
     http.ngx_http_clear_content_length(r);
     http.ngx_http_clear_accept_ranges(r);
 
@@ -621,7 +641,33 @@ fn send_body(r: [*c]ngx_http_request_t, chain: [*c]ngx_chain_t) ngx_int_t {
     }
 }
 
+fn wechatpay_audit_variable(r: [*c]ngx_http_request_t, v: [*c]http.ngx_http_variable_value_t, data: core.uintptr_t) callconv(.c) ngx_int_t {
+    const ctx = core.castPtr(wechatpay_request_context, r.*.ctx[ngx_http_wechatpay_module.ctx_index]) orelse {
+        v.*.flags.not_found = true;
+        return NGX_OK;
+    };
+    const value = switch (data) {
+        0 => ctx.*.captured_request,
+        1 => ctx.*.captured_response,
+        3 => ctx.*.verified_notification,
+        else => if (ctx.*.sig_verify == .SIG_VERIFICATION_SUCCESS) ngx_string("success") else ngx_string("unverified"),
+    };
+    v.*.data = value.data;
+    v.*.flags.len = @intCast(value.len);
+    v.*.flags.valid = true;
+    v.*.flags.no_cacheable = true;
+    v.*.flags.not_found = false;
+    return NGX_OK;
+}
+
 fn wechatpay_preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
+    const names = [_][]const u8{ "wechatpay_request", "wechatpay_response", "wechatpay_verification", "wechatpay_notification" };
+    for (names, 0..) |name, index| {
+        var key = ngx_str_t{ .data = @constCast(name.ptr), .len = name.len };
+        const v = http.ngx_http_add_variable(cf, &key, http.NGX_HTTP_VAR_NOCACHEABLE) orelse return NGX_ERROR;
+        v.*.get_handler = wechatpay_audit_variable;
+        v.*.data = index;
+    }
     ssl.SSL_LOG = cf.*.log;
     wechatpay_replay_zone = core.nullptr(core.ngx_shm_zone_t);
     return NGX_OK;
@@ -636,8 +682,7 @@ fn ngx_http_wechatpay_preaccess_handler(r: [*c]ngx_http_request_t) callconv(.c) 
     if (lccf.*.access_control == 0) return NGX_DECLINED;
     if (r == r.*.main) return NGX_DECLINED;
 
-    ngx.log.ngz_log_error(ngx.log.NGX_LOG_WARN, r.*.connection.*.log, 0,
-        "wechatpay: subrequests are not supported on wechatpay-enabled locations", .{});
+    ngx.log.ngz_log_error(ngx.log.NGX_LOG_WARN, r.*.connection.*.log, 0, "wechatpay: subrequests are not supported on wechatpay-enabled locations", .{});
     return http.NGX_HTTP_FORBIDDEN;
 }
 
@@ -726,7 +771,7 @@ fn ngx_http_wechatpay_proxy_upstream_create_request(
         wechatpay_request_context,
         r.*.ctx[ngx_http_wechatpay_module.ctx_index],
     )) |rctx| {
-        const req = build_request(rctx.*.lccf, r) catch return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        const req = if (rctx.*.prepared_headers.len > 0) rctx.*.prepared_headers else build_request(rctx.*.lccf, r) catch return NGX_HTTP_INTERNAL_SERVER_ERROR;
         var chain = NChain.init(r.*.pool);
         var out = buf.ngx_chain_t{
             .buf = core.nullptr(ngx_buf_t),
@@ -895,6 +940,9 @@ fn ngx_http_wechatpay_proxy_upstream_finalize_request(
         wechatpay_request_context,
         r.*.ctx[ngx_http_wechatpay_module.ctx_index],
     )) |rctx| {
+        if (rctx.*.res != core.nullptr(ngx_chain_t)) {
+            rctx.*.captured_response = buf.ngz_chain_content(rctx.*.res, r.*.pool) catch ngx.string.ngx_null_str;
+        }
         if (rc != NGX_OK) {
             // Transport/framing failures are gateway errors, not signature
             // failures. BYPASS prevents the header filter rewriting 502 to 401.
@@ -929,7 +977,7 @@ fn ngx_http_wechatpay_proxy_upstream_finalize_request(
             r.*.pool,
         ) catch ngx.string.ngx_null_str;
 
-        if (body.len > 0) {
+        {
             if (core.castPtr(u8, core.ngx_pmemalign(
                 r.*.pool,
                 core.ngx_align(body.len + 1024, PAGE_SIZE),
@@ -949,6 +997,7 @@ fn ngx_http_wechatpay_proxy_upstream_finalize_request(
                 }
             }
         }
+        r.*.headers_out.status = u.*.headers_in.status_n;
         // send body explicitly
         if (last != core.nullptr(ngx_chain_t) and
             last.*.buf != core.nullptr(ngx_buf_t))
@@ -1008,6 +1057,41 @@ fn create_upstream(
     return core.NError.OOM;
 }
 
+// Finish a suspended in-memory njs subrequest without routing an nginx HTML
+// special response through its postponed body chain. There is no upstream yet.
+fn reject_audited_request(r: [*c]ngx_http_request_t, status: ngx_uint_t) void {
+    r.*.headers_out.status = status;
+    // Resume after the background audit's finalizer unwinds. Completing the
+    // njs payment sibling here re-enters its parent's promise/subrequest chain.
+    r.*.write_event_handler = resume_audit_rejection;
+    if (http.ngx_http_post_request(r, null) != NGX_OK) {
+        http.ngx_http_finalize_request(r, NGX_ERROR);
+    }
+}
+
+fn resume_audit_rejection(r: [*c]ngx_http_request_t) callconv(.c) void {
+    r.*.headers_out.content_length_n = 0;
+    const rc = http.ngx_http_send_header(r);
+    http.ngx_http_finalize_request(r, if (rc == NGX_ERROR) NGX_ERROR else NGX_OK);
+}
+
+// The configured internal audit handler commits the exact signed request
+// before upstream_init can dispatch it. Its failure closes the payment path.
+fn audit_request_done(sr: [*c]ngx_http_request_t, data: ?*anyopaque, rc: ngx_int_t) callconv(.c) ngx_int_t {
+    const parent = core.castPtr(ngx_http_request_t, data) orelse return NGX_ERROR;
+    const ctx = core.castPtr(wechatpay_request_context, parent.*.ctx[ngx_http_wechatpay_module.ctx_index]) orelse return NGX_ERROR;
+    if (rc != NGX_OK or sr.*.headers_out.status < 200 or sr.*.headers_out.status >= 300) {
+        reject_audited_request(parent, NGX_HTTP_SERVICE_UNAVAILABLE);
+        return NGX_OK;
+    }
+    const result = create_upstream(parent, ctx) catch {
+        reject_audited_request(parent, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return NGX_OK;
+    };
+    if (result != core.NGX_DONE) http.ngx_http_finalize_request(parent, result);
+    return NGX_OK;
+}
+
 export fn ngx_http_wechatpay_proxy_body_handler(
     r: [*c]ngx_http_request_t,
 ) callconv(.c) void {
@@ -1017,6 +1101,39 @@ export fn ngx_http_wechatpay_proxy_body_handler(
     )) |rctx| {
         if (request_body_exceeds_limit(r, rctx.*.lccf.*.body_max_size)) {
             http.ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+            return;
+        }
+        if (rctx.*.lccf.*.audit_request.len > 0) {
+            rctx.*.prepared_headers = build_request(rctx.*.lccf, r) catch {
+                http.ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                return;
+            };
+            const body = read_body(r);
+            const size = rctx.*.prepared_headers.len + body.len;
+            const raw = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, size)) orelse {
+                http.ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                return;
+            };
+            @memcpy(raw[0..rctx.*.prepared_headers.len], core.slicify(u8, rctx.*.prepared_headers.data, rctx.*.prepared_headers.len));
+            @memcpy(raw[rctx.*.prepared_headers.len..][0..body.len], core.slicify(u8, body.data, body.len));
+            rctx.*.captured_request = .{ .data = raw, .len = size };
+            const ps = core.ngz_pcalloc_c(http.ngx_http_post_subrequest_t, r.*.pool) orelse {
+                http.ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+                return;
+            };
+            ps.*.handler = audit_request_done;
+            ps.*.data = r;
+            var sr: [*c]ngx_http_request_t = undefined;
+            // njs captures this payment subrequest in memory. nginx forbids
+            // children of an in-memory request, so attach the audit as a
+            // background sibling under main. The callback retains the actual
+            // payment request and starts it only after the audit commits.
+            if (http.ngx_http_subrequest(r.*.main, &rctx.*.lccf.*.audit_request, null, &sr, ps, 4 | 16) != NGX_OK) {
+                http.ngx_http_finalize_request(r, NGX_HTTP_SERVICE_UNAVAILABLE);
+            } else {
+                sr.*.flags1.header_only = true;
+                sr.*.ctx[ngx_http_wechatpay_module.ctx_index] = rctx;
+            }
             return;
         }
         const rc = create_upstream(r, rctx) catch {
@@ -1135,6 +1252,9 @@ fn wechatpay_check_access(r: [*c]ngx_http_request_t) !ngx_int_t {
             }
 
             const new_body = try aes_decode(r, body, lccf.*.ctx.*.aes, data);
+            // njs may have cached the original body for an ACCESS audit. Expose
+            // the authenticated, decrypted envelope separately from that cache.
+            rctx.*.verified_notification = new_body;
             if (new_body.len > body.len) {
                 var chain = NChain.init(r.*.pool);
                 var out = buf.ngx_chain_t{
@@ -1302,6 +1422,22 @@ export const ngx_http_wechatpay_module_ctx = ngx_http_module_t{
 
 const CONF_PHASES = conf.NGX_HTTP_MAIN_CONF | conf.NGX_HTTP_SRV_CONF | conf.NGX_HTTP_LOC_CONF;
 export const ngx_http_wechatpay_commands = [_]ngx_command_t{
+    ngx_command_t{
+        .name = ngx_string("wechatpay_replay_zone"),
+        .type = CONF_PHASES | conf.NGX_CONF_TAKE1,
+        .set = set_replay_zone,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = 0,
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("wechatpay_audit_request"),
+        .type = CONF_PHASES | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(wechatpay_loc_conf, "audit_request"),
+        .post = null,
+    },
     ngx_command_t{
         .name = ngx_string("wechatpay_proxy_pass"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,

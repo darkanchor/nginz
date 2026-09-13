@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   startNginz,
   reloadNginz,
@@ -597,6 +598,24 @@ describe("pgrest module", () => {
     expect(body[0]).toHaveProperty("id");
     expect(body[0]).toHaveProperty("name");
     expect(body[0]).toHaveProperty("email");
+  });
+
+  test("pooled socket event logs survive the HTTP connections that opened them", async () => {
+    // Each caller closes its connection while its PostgreSQL socket is retained.
+    // Churn differently sized HTTP allocations over the released connection
+    // pools. A pool log borrowed from a caller can now point at reused memory.
+    for (let round = 0; round < 32; round++) {
+      const replies = await Promise.all(Array.from({ length: 8 }, (_, i) =>
+        fetchClose(`${TEST_URL}/api/users`, {
+          headers: { "X-Pool-Lifetime": String(round).padEnd(512 + i * 397, "x") },
+        }).then(async response => ({ status: response.status, body: await response.json() }))));
+      for (const reply of replies) {
+        expect(reply.status).toBe(200);
+        expect(reply.body[0].name).toBe("John Doe");
+      }
+    }
+    const logs = readFileSync("tests/pgrest/runtime/logs/error.log", "utf8");
+    expect(logs).not.toMatch(/exited on signal|signal 11|segmentation fault/i);
   });
 
   test("rejects a PostgreSQL result above the serialization bound without truncating JSON", async () => {

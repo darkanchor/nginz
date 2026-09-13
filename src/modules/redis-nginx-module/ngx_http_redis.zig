@@ -49,6 +49,7 @@ const RedisCommand = enum(c_int) {
     hget = 11, // HGET key field
     hset = 12, // HSET key field value
     hdel = 13, // HDEL key field
+    cache = 14, // bounded atomic token-cache/lease protocol
 };
 
 // Redis RESP parsing state
@@ -65,6 +66,8 @@ const redis_loc_conf = extern struct {
     host: ngx_str_t,
     port: ngx_uint_t,
     key: ngx_str_t,
+    username: ngx_str_t,
+    password: ngx_str_t,
     enabled: ngx_flag_t,
     command: RedisCommand,
     ups: http.ngx_http_upstream_conf_t,
@@ -86,6 +89,8 @@ const redis_request_ctx = extern struct {
     last_exists: u8,
     last_error: u8,
     conn_failed: u8,
+    auth_pending: u8,
+    authenticated_command: ngx_str_t,
 };
 
 const redis_hide_headers = [_]ngx_str_t{
@@ -190,6 +195,9 @@ fn merge_loc_conf(
 
     if (c.*.host.len == 0) c.*.host = prev.*.host;
     if (c.*.key.len == 0) c.*.key = prev.*.key;
+    if (c.*.username.len == 0) c.*.username = prev.*.username;
+    if (c.*.password.len == 0) c.*.password = prev.*.password;
+    if ((c.*.username.len == 0) != (c.*.password.len == 0)) return conf.NGX_CONF_ERROR;
     if (c.*.port == 6379 and prev.*.port != 6379) c.*.port = prev.*.port;
 
     // Setup upstream headers hash
@@ -301,6 +309,8 @@ fn ngx_conf_set_redis_command(
                 lccf.*.command = .hget;
             } else if (std.mem.eql(u8, s, "hset")) {
                 lccf.*.command = .hset;
+            } else if (std.mem.eql(u8, s, "cache")) {
+                lccf.*.command = .cache;
             } else if (std.mem.eql(u8, s, "hdel")) {
                 lccf.*.command = .hdel;
             } else {
@@ -347,6 +357,35 @@ fn write_bulk_string(out: [*c]u8, pos: *usize, str: ngx_str_t) void {
     pos.* += 1;
     out[pos.*] = '\n';
     pos.* += 1;
+}
+
+// The caller can select data, never a script. Publication and release compare
+// the lease owner atomically; a stale worker cannot replace a newer token.
+const CACHE_SCRIPT =
+    \\local a=cjson.decode(ARGV[1]); local k=KEYS[1]; local l=k..':lease';
+    \\if a.op=='get' then return redis.call('GET',k) end;
+    \\if type(a.owner)~='string' or #a.owner<1 or #a.owner>128 then return redis.error_reply('invalid owner') end;
+    \\if a.op=='acquire' then if redis.call('SET',l,a.owner,'NX','EX',30) then return 'acquired' else return false end end;
+    \\if a.op=='invalidate' then if redis.call('GET',k)==a.value then return redis.call('DEL',k) else return 0 end end;
+    \\if redis.call('GET',l)~=a.owner then return 0 end;
+    \\if a.op=='release' then return redis.call('DEL',l) end;
+    \\if a.op=='publish' and type(a.value)=='string' and #a.value<=8192 and type(a.ttl)=='number' and a.ttl>=1 and a.ttl<=86400 and a.ttl==math.floor(a.ttl) then
+    \\redis.call('SET',k,a.value,'EX',a.ttl); redis.call('DEL',l); return 1 end;
+    \\return redis.error_reply('invalid operation');
+;
+
+fn build_cache_command(key: ngx_str_t, value: ngx_str_t, pool: [*c]ngx_pool_t) !ngx_str_t {
+    const size = 256 + CACHE_SCRIPT.len + key.len + value.len;
+    const data = core.castPtr(u8, core.ngx_pnalloc(pool, size)) orelse return RedisError.OutOfMemory;
+    var pos: usize = 0;
+    const header = "*5\r\n$4\r\nEVAL\r\n";
+    @memcpy(data[0..header.len], header);
+    pos = header.len;
+    write_bulk_string(data, &pos, ngx_string(CACHE_SCRIPT));
+    write_bulk_string(data, &pos, ngx_string("1"));
+    write_bulk_string(data, &pos, key);
+    write_bulk_string(data, &pos, value);
+    return .{ .data = data, .len = pos };
 }
 
 // Build RESP GET command: *2\r\n$3\r\nGET\r\n$<len>\r\n<key>\r\n
@@ -623,6 +662,7 @@ fn ngx_http_redis_upstream_create_request(
             .strlen => build_two_arg_command("STRLEN", rctx.*.key, r.*.pool),
             .hget => build_hget_command(rctx.*.key, rctx.*.field, r.*.pool),
             .hset => build_hset_command(rctx.*.key, rctx.*.field, rctx.*.value, r.*.pool),
+            .cache => build_cache_command(rctx.*.key, rctx.*.value, r.*.pool),
             .hdel => build_hdel_command(rctx.*.key, rctx.*.field, r.*.pool),
         } catch return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
 
@@ -631,11 +671,26 @@ fn ngx_http_redis_upstream_create_request(
             .buf = core.nullptr(ngx_buf_t),
             .next = core.nullptr(ngx_chain_t),
         };
-        const last = chain.allocStr(cmd, &out) catch return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
+        var wire = cmd;
+        if (rctx.*.lccf.*.username.len > 0) {
+            rctx.*.authenticated_command = cmd;
+            rctx.*.auth_pending = 1;
+            const config = rctx.*.lccf;
+            const data = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, 128 + config.*.username.len + config.*.password.len)) orelse return NGX_ERROR;
+            const header = "*3\r\n$4\r\nAUTH\r\n";
+            @memcpy(data[0..header.len], header);
+            var pos: usize = header.len;
+            write_bulk_string(data, &pos, config.*.username);
+            write_bulk_string(data, &pos, config.*.password);
+            wire = .{ .data = data, .len = pos };
+        }
+        const last = chain.allocStr(wire, &out) catch return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
 
         last.*.buf.*.flags.last_buf = true;
         last.*.buf.*.flags.last_in_chain = true;
-        last.*.next = r.*.upstream.*.request_bufs;
+        // The value is already RESP-framed in cmd. Never append the original
+        // HTTP body: with AUTH it would execute as an unauthenticated command.
+        last.*.next = core.nullptr(ngx_chain_t);
         r.*.upstream.*.request_bufs = last;
 
         r.*.upstream.*.flags.header_sent = false;
@@ -660,7 +715,7 @@ fn build_json_response(rctx: [*c]redis_request_ctx, pool: [*c]ngx_pool_t) ?ngx_s
     }
 
     if (rctx.*.data.len == 0) {
-        return if (rctx.*.command == .set or rctx.*.command == .ping or rctx.*.command == .hset)
+        return if (rctx.*.command == .set or rctx.*.command == .ping or rctx.*.command == .hset or rctx.*.command == .cache)
             ngx_string("{\"ok\":true}")
         else
             ngx_string("{\"value\":\"\"}");
@@ -738,6 +793,24 @@ fn ngx_http_redis_upstream_process_header(
     )) |rctx| {
         const u = r.*.upstream;
         const b = &u.*.buffer;
+        if (rctx.*.auth_pending == 1) {
+            const length = @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
+            if (length < 5) return NGX_AGAIN;
+            if (!std.mem.eql(u8, b.*.pos[0..5], "+OK\r\n")) {
+                // Never pipeline a data command after AUTH: failed credentials
+                // must not execute that command as Redis's default user.
+                rctx.*.last_error = 1;
+                return http.NGX_HTTP_UPSTREAM_INVALID_HEADER;
+            }
+            rctx.*.auth_pending = 0;
+            b.*.pos += 5;
+            const command = rctx.*.authenticated_command;
+            const connection = u.*.peer.connection;
+            const sent = connection.*.send.?(connection, command.data, command.len);
+            // A short/nonblocking write fails closed; no complete RESP command
+            // exists on the connection and nginx closes the failed upstream.
+            if (sent < 0 or @as(usize, @intCast(sent)) != command.len) return NGX_ERROR;
+        }
         const received_len = @intFromPtr(b.*.last) - @intFromPtr(b.*.pos);
         const received = core.slicify(u8, b.*.pos, received_len);
 
@@ -1076,7 +1149,7 @@ export fn ngx_http_redis_body_handler(
         r.*.ctx[ngx_http_redis_module.ctx_index],
     )) |rctx| {
         // Extract value from request body for SET, EXPIRE, and HSET
-        if (rctx.*.command == .set or rctx.*.command == .expire or rctx.*.command == .hset) {
+        if (rctx.*.command == .set or rctx.*.command == .expire or rctx.*.command == .hset or rctx.*.command == .cache) {
             rctx.*.value = get_request_body(r);
             if (rctx.*.value.len == 0 and rctx.*.command == .set) {
                 // SET requires a value
@@ -1087,7 +1160,7 @@ export fn ngx_http_redis_body_handler(
                 // EXPIRE requires TTL - default to 60 seconds
                 rctx.*.value = ngx_string("60");
             }
-            if (rctx.*.value.len == 0 and rctx.*.command == .hset) {
+            if (rctx.*.value.len == 0 and (rctx.*.command == .hset or rctx.*.command == .cache)) {
                 // HSET requires a value
                 http.ngx_http_finalize_request(r, http.NGX_HTTP_BAD_REQUEST);
                 return;
@@ -1320,7 +1393,7 @@ export fn ngx_http_redis_handler(
                 return http.NGX_HTTP_NOT_ALLOWED;
             }
         },
-        .set, .incr, .decr, .expire, .hset => {
+        .set, .incr, .decr, .expire, .hset, .cache => {
             if (r.*.method != http.NGX_HTTP_POST) {
                 return http.NGX_HTTP_NOT_ALLOWED;
             }
@@ -1470,6 +1543,22 @@ export const ngx_http_redis_module_ctx = ngx_http_module_t{
 };
 
 export const ngx_http_redis_commands = [_]ngx_command_t{
+    ngx_command_t{
+        .name = ngx_string("redis_username"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(redis_loc_conf, "username"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("redis_password"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_str_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(redis_loc_conf, "password"),
+        .post = null,
+    },
     ngx_command_t{
         .name = ngx_string("redis_pass"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,

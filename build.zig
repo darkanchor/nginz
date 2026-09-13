@@ -184,6 +184,7 @@ pub fn build(b: *std.Build) void {
 
     const patch_step = patch.patchStep(b, docker);
     const nginz = exe.build_exe(b, target, optimize) catch unreachable;
+    nginz.root_module.strip = b.option(bool, "strip", "Strip executable symbols (defaults to the optimization mode)");
     nginz.step.dependOn(patch_step);
 
     const ngz_modules = b.addObject(.{

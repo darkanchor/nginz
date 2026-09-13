@@ -355,7 +355,7 @@ describe("wechatpay module", () => {
       expect(await res.text()).toBe(`verified:${body}`);
     });
 
-    test("rejects requests when Request-ID is missing", async () => {
+    test("accepts a valid provider signature without optional Request-ID", async () => {
       const body = JSON.stringify({ event: "payment.succeeded", id: "evt-no-request-id" });
       const headers = buildWechatpayHeaders(body);
       delete headers["Request-ID"];
@@ -366,7 +366,7 @@ describe("wechatpay module", () => {
         body,
       });
 
-      expect(res.status).toBe(401);
+      expect(res.status).toBe(200);
     });
 
     test("rejects requests when Wechatpay-Serial does not match configured platform serial", async () => {
@@ -505,7 +505,7 @@ describe("wechatpay module", () => {
       });
 
       expect(observedRequest).toBeTruthy();
-      expect(observedRequest.xTestHeader).toBe("present");
+      expect(observedRequest.xTestHeader).toBeNull(); // caller headers are not payment credentials
       expect(observedRequest.authorization).toBeTruthy();
       verifyProxyAuthorization(observedRequest.authorization, observedRequest);
 

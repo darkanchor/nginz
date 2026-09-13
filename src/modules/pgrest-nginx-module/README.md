@@ -714,7 +714,7 @@ location /api/ {
 }
 ```
 
-The first configured schema becomes the default schema when no profile header is provided. In that default case, pgrest keeps the generated SQL unqualified and relies on the selected schema as the request's effective search path. Requests that specify a different allowed schema are schema-qualified explicitly. Requests that specify a schema outside `pgrest_schemas` are rejected with the PostgREST-style `PGRST106` error.
+The first configured schema becomes the default schema when no profile header is provided. The default `public` schema preserves unqualified SQL for compatibility; a non-public default is explicitly qualified. Requests that specify a different allowed schema are schema-qualified explicitly. Requests that specify a schema outside `pgrest_schemas` are rejected with the PostgREST-style `PGRST106` error.
 
 #### Schema Profile Examples
 
@@ -1307,13 +1307,50 @@ Error responses:
 
 | Directive | Syntax | Context | Default | Description |
 |-----------|--------|---------|---------|-------------|
-| `pgrest_pass` | `pgrest_pass "conninfo"` | `location` | — | PostgreSQL connection string for the location. Registers the pgrest content handler. All `pgrest_pass` locations in a worker process share one connection pool; pointing two locations at different hosts is not supported while connections are active. |
-| `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum number of pooled connections (1–32). Inherited by nested locations. |
+| `pgrest_pass` | `pgrest_pass "conninfo"` | `location` | — | PostgreSQL connection string for the location. Registers the pgrest content handler. Pools are worker-local and keyed by the complete connection string plus pool size. Distinct databases, hosts or credentials use distinct pools; up to 16 distinct pool configurations are supported per worker. |
+| `pgrest_pool_size` | `pgrest_pool_size N` | `location` | 16 | Maximum connections (1–32) per distinct connection-string/size pool, per worker. A saturated pool immediately returns 503; there is no wait queue. Inherited by nested locations. |
+| `pgrest_json_scalar` | `pgrest_json_scalar on\|off` | `location` | `off` | Return a single JSON/JSONB scalar RPC column as the JSON value itself. Off preserves the ordinary wrapped result shape. |
 | `pgrest_timeout` | `pgrest_timeout 15s` | `location` | 15s | Connect/query socket timeout. Inherited by nested locations. The default accommodates dashboard-style analytical reads during sustained telemetry ingestion; latency-sensitive APIs can set a shorter value. |
 | `pgrest_schemas` | `pgrest_schemas "schema1, schema2"` | `location` | — | Allowlist of schemas. The first schema becomes the default. Disallowed schemas receive `PGRST106`. |
 | `pgrest_jwt_secret` | `pgrest_jwt_secret "secret"` | `location` | — | HS256 secret for JWT signature validation. When set, tokens are validated before role extraction. |
 | `pgrest_anon_role` | `pgrest_anon_role "role"` | `location` | — | PostgreSQL role to use when no valid JWT is provided. |
 | `pgrest_jwt_role_claim` | `pgrest_jwt_role_claim "claim"` | `location` | `role` | JWT claim name that contains the PostgreSQL role. |
+
+### Shared-container budgeting and stress regression
+
+Sum pool sizes across all distinct DSNs and workers, including reload overlap,
+and reserve PostgreSQL connections for other apps and administration. Same-named
+objects in different databases are isolated by their DSN; SQL grants and database
+CONNECT privileges must also prevent cross-app access. RPC metadata is looked up
+per request, with the argument subquery correlated to matching function OIDs;
+there is no cross-database function metadata cache.
+
+Pooled sockets and their read/write events use `ngx_cycle.log`. A previous path
+retained the first HTTP connection's logger after that connection was freed,
+causing SIGSEGV in posted-event logging under connection churn. The regression
+closes every HTTP connection while reusing PostgreSQL sockets. Reproduce with:
+
+```sh
+MALLOC_PERTURB_=165 GLIBC_TUNABLES=glibc.malloc.tcache_count=0 ZIG_OPTIMIZE=ReleaseSmall bun test tests/pgrest/pgrest.test.js
+```
+
+For an inspectable binary, `zig build -Doptimize=ReleaseSmall -Dstrip=false`
+retains symbols. The default strip behavior is unchanged. Local real-database
+and remote stress results are recorded in the adjacent Carve repository's
+`docs/pgrest-stress.md`.
+
+Asynchronous failure and timeout completion drains nginx posted requests just
+as the success path does. This prevents a failed SQL subrequest from leaving
+an njs parent asleep until the client disconnects. The Carve regression denies
+the audit-chunk function grant, checks that provider dispatch stops and HTTP
+fails promptly, then forces a SQL timeout and checks readiness recovery.
+
+Named JSON object arguments are bound as JSON text for JSON/JSONB parameters;
+strings and encoded nested objects above 2048 bytes, more than 16 named
+parameters, and JSON RPC bodies at or above 4096 bytes are rejected instead of
+silently truncating. Application SQLSTATE values PT400/401/403/404/409/422/429/503
+map to their HTTP statuses with generic error text; unrecognized states remain
+server errors.
 
 ### Runtime diagnostics
 

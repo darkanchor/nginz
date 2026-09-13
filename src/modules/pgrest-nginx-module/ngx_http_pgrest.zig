@@ -99,6 +99,7 @@ const NGX_CONF_UNSET: ngx_int_t = -1;
 const ngx_pgrest_loc_conf_t = extern struct {
     conninfo: ngx_str_t,
     schemas_raw: ngx_str_t,
+    json_scalar: ngx_flag_t,
     pool_size: ngx_int_t, // max pooled connections; NGX_CONF_UNSET means use default
     timeout: ngx_msec_t, // connect/query socket timeout
 
@@ -327,9 +328,7 @@ fn trace_pool_event(ctx: *PgRequestCtx, pool_conn: ?*PgPoolConn, event_name: []c
     const slot: usize = if (pool_conn) |pc| pool_slot_index(pc) else 9999;
     const fd: c_int = if (pool_conn) |pc| pc.fd else -1;
     const pool_state: c_int = if (pool_conn) |pc| @intFromEnum(pc.state) else -1;
-    log.ngz_log_debug(log.NGX_LOG_DEBUG_HTTP, r.*.connection.*.log, 0,
-        "pgrest-trace req=%uz slot=%uz fd=%d event=%*s qstate=%d pstate=%d qseq=%uz",
-        .{ ctx.*.trace_req_seq, slot, fd, @as(c_int, @intCast(ctx.*.trace_last_event_len)), &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state, ctx.*.trace_query_seq });
+    log.ngz_log_debug(log.NGX_LOG_DEBUG_HTTP, r.*.connection.*.log, 0, "pgrest-trace req=%uz slot=%uz fd=%d event=%*s qstate=%d pstate=%d qseq=%uz", .{ ctx.*.trace_req_seq, slot, fd, @as(c_int, @intCast(ctx.*.trace_last_event_len)), &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state, ctx.*.trace_query_seq });
 }
 
 fn dump_pooled_timeout(ctx: *PgRequestCtx) void {
@@ -340,18 +339,10 @@ fn dump_pooled_timeout(ctx: *PgRequestCtx) void {
     const pool_state: c_int = if (pool_conn) |pc| @intFromEnum(pc.state) else -1;
     const age = ngx_current_msec - ctx.*.trace_started_msec;
     const stalled = ngx_current_msec - ctx.*.trace_last_progress_msec;
-    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0,
-        "pgrest-timeout req=%uz slot=%uz fd=%d age=%M stalled=%M",
-        .{ ctx.*.trace_req_seq, slot, fd, age, stalled });
-    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0,
-        "pgrest-timeout-last req=%uz last=%*s qstate=%d pstate=%d",
-        .{ ctx.*.trace_req_seq, @as(c_int, @intCast(ctx.*.trace_last_event_len)), &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state });
-    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0,
-        "pgrest-timeout-stats req=%uz qseq=%uz flush=%d poll=%d rcalls=%uz wcalls=%uz",
-        .{ ctx.*.trace_req_seq, ctx.*.trace_query_seq, ctx.*.trace_last_flush_result, ctx.*.trace_last_poll_status, ctx.*.trace_read_calls, ctx.*.trace_write_calls });
-    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0,
-        "pgrest-timeout-end req=%uz finals=%uz releases=%uz",
-        .{ ctx.*.trace_req_seq, ctx.*.trace_finalize_calls, ctx.*.trace_release_calls });
+    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout req=%uz slot=%uz fd=%d age=%M stalled=%M", .{ ctx.*.trace_req_seq, slot, fd, age, stalled });
+    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-last req=%uz last=%*s qstate=%d pstate=%d", .{ ctx.*.trace_req_seq, @as(c_int, @intCast(ctx.*.trace_last_event_len)), &ctx.*.trace_last_event, @intFromEnum(ctx.*.query_state), pool_state });
+    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-stats req=%uz qseq=%uz flush=%d poll=%d rcalls=%uz wcalls=%uz", .{ ctx.*.trace_req_seq, ctx.*.trace_query_seq, ctx.*.trace_last_flush_result, ctx.*.trace_last_poll_status, ctx.*.trace_read_calls, ctx.*.trace_write_calls });
+    log.ngz_log_error(log.NGX_LOG_WARN, r.*.connection.*.log, 0, "pgrest-timeout-end req=%uz finals=%uz releases=%uz", .{ ctx.*.trace_req_seq, ctx.*.trace_finalize_calls, ctx.*.trace_release_calls });
 }
 
 const MAX_BACKEND_POOLS: usize = 16;
@@ -1182,15 +1173,15 @@ fn resolve_request_schema(
         if (schema.len == 0 or !is_valid_schema_identifier(schema)) continue;
         if (first_allowed == null) first_allowed = schema;
         if (requested.len > 0 and std.mem.eql(u8, requested, schema)) {
-            if (first_allowed != null and std.mem.eql(u8, schema, first_allowed.?)) {
-                return .{ .name = null, .disallowed = false, .allowed_raw = allowed_raw };
-            }
             return .{ .name = schema, .disallowed = false, .allowed_raw = allowed_raw };
         }
     }
 
     if (requested.len == 0) {
-        return .{ .name = null, .disallowed = false, .allowed_raw = allowed_raw };
+        // Preserve the existing unqualified public default. A non-public first
+        // schema must be selected explicitly instead of falling back to public.
+        const selected = if (first_allowed) |schema| (if (std.mem.eql(u8, schema, "public")) null else schema) else null;
+        return .{ .name = selected, .disallowed = false, .allowed_raw = allowed_raw };
     }
 
     return .{ .name = null, .disallowed = true, .allowed_raw = allowed_raw };
@@ -1616,7 +1607,11 @@ fn finalize_pooled_timeout(ctx: *PgRequestCtx) void {
     const rc = send_json_error(r, 504, "{\"message\":\"PostgreSQL connection timed out\"}");
     ctx.*.request = null;
     release_pooled_ctx(ctx, true);
+    // Like success, asynchronous errors must wake posted njs/auth parents.
+    // Save the connection before finalization can release the request pool.
+    const c = r.*.connection;
     http.ngx_http_finalize_request(r, rc);
+    http.ngx_http_run_posted_requests(c);
 }
 
 fn log_pooled_event_watch_state(ctx: *PgRequestCtx, pool_conn: *PgPoolConn, label: []const u8) void {
@@ -1730,9 +1725,22 @@ fn classify_connection_error_message(message: []const u8) FailureResponse {
     return .{ .status = http.NGX_HTTP_SERVICE_UNAVAILABLE, .body = "{\"message\":\"PostgreSQL connection failed\"}" };
 }
 
+fn application_error(sqlstate: []const u8) ?FailureResponse {
+    // Deliberately narrow application status contract. Never expose arbitrary
+    // PostgreSQL messages, DETAIL or HINT (which can contain row values).
+    const states = [_][]const u8{ "PT400", "PT401", "PT403", "PT404", "PT409", "PT422", "PT429", "PT503" };
+    const statuses = [_]ngx_uint_t{ 400, 401, 403, 404, 409, 422, 429, 503 };
+    for (states, statuses) |state, status| {
+        if (std.mem.eql(u8, sqlstate, state)) return .{ .status = status, .body = "{\"code\":\"application_rejected\"}" };
+    }
+    return null;
+}
+
 fn classify_result_error(result: *PGresult) FailureResponse {
     const sqlstate_ptr = pgResultErrorField(result, PG_DIAG_SQLSTATE);
     const sqlstate = if (sqlstate_ptr != null) std.mem.span(sqlstate_ptr) else "";
+    if (application_error(sqlstate)) |failure| return failure;
+    if (std.mem.startsWith(u8, sqlstate, "22")) return .{ .status = 400, .body = "{\"code\":\"invalid_input\"}" };
     if (std.mem.eql(u8, sqlstate, "42601")) {
         return .{ .status = http.NGX_HTTP_BAD_REQUEST, .body = "{\"message\":\"SQL syntax error\"}" };
     }
@@ -1791,7 +1799,11 @@ fn finalize_pooled_failure(ctx: *PgRequestCtx) void {
     const rc = send_json_error(r, failure.status, failure.body);
     ctx.*.request = null;
     release_pooled_ctx(ctx, true);
+    // Like success, asynchronous errors must wake posted njs/auth parents.
+    // Save the connection before finalization can release the request pool.
+    const c = r.*.connection;
     http.ngx_http_finalize_request(r, rc);
+    http.ngx_http_run_posted_requests(c);
 }
 
 fn set_active_query(ctx: *PgRequestCtx, query: []const u8) bool {
@@ -2012,12 +2024,17 @@ fn start_pooled_request(ctx: *PgRequestCtx, loc_conf: *ngx_pgrest_loc_conf_t) ng
         return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    const ngx_conn = http.ngx_get_connection(fd, ctx.*.request.?.*.connection.*.log);
+    // A PostgreSQL socket outlives the HTTP connection that first opened it.
+    // That connection's log (including handler/data) is allocated in its pool;
+    // borrowing it here leaves nginx event/timer logging pointing into freed
+    // memory after Connection: close. The worker-cycle log has the pool's life.
+    const pool_log = http.ngx_cycle.*.log;
+    const ngx_conn = http.ngx_get_connection(fd, pool_log);
     if (ngx_conn == core.nullptr(core.ngx_connection_t)) {
         pgFinish(conn);
         return http.NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
-    ngx_conn.*.log = ctx.*.request.?.*.connection.*.log;
+    ngx_conn.*.log = pool_log;
 
     pool_conn.conn = conn;
     pool_conn.state = .connecting;
@@ -2573,11 +2590,11 @@ fn format_result_as_json_smart(
     return format_result_as_json_with_options(result, ntuples, nfields, json_buf, strip_nulls, raw_json_fields, raw_json_field_lens, raw_json_field_count);
 }
 
-
 fn pgrest_create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
     if (core.ngz_pcalloc_c(ngx_pgrest_loc_conf_t, cf.*.pool)) |loc| {
         loc.*.jwt_role_claim = ngx_string("role");
         loc.*.jwt_role_claim_explicit = 0;
+        loc.*.json_scalar = NGX_CONF_UNSET;
         loc.*.pool_size = NGX_CONF_UNSET;
         loc.*.timeout = conf.NGX_CONF_UNSET_MSEC;
         return loc;
@@ -2602,6 +2619,7 @@ fn pgrest_merge_loc_conf(
         cur.*.jwt_role_claim = prev.*.jwt_role_claim;
         cur.*.jwt_role_claim_explicit = prev.*.jwt_role_claim_explicit;
     }
+    if (cur.*.json_scalar == NGX_CONF_UNSET) cur.*.json_scalar = if (prev.*.json_scalar == NGX_CONF_UNSET) 0 else prev.*.json_scalar;
     if (cur.*.pool_size == NGX_CONF_UNSET) cur.*.pool_size = prev.*.pool_size;
     if (cur.*.timeout == conf.NGX_CONF_UNSET_MSEC) cur.*.timeout = prev.*.timeout;
     return NGX_CONF_OK;
@@ -5610,6 +5628,7 @@ const RpcCall = struct {
     function_name: []const u8,
     params: [MAX_RPC_PARAMS]RpcParam,
     param_count: usize,
+    invalid_params: bool = false,
     prefer_single_object: bool = false, // Wrap parameters in single JSON object
     raw_body: [4096]u8 = std.mem.zeroes([4096]u8),
     raw_body_len: usize = 0,
@@ -5731,8 +5750,11 @@ fn build_rpc_metadata_query(
     @memcpy(query_buf[pos..][0..fallback_flag.len], fallback_flag);
     pos += fallback_flag.len;
 
+    // Correlate argument metadata with the matching function OID. Aggregating
+    // every pg_proc entry here made each small RPC scan the complete catalog.
+    // No cache: DDL changes and per-database metadata remain immediately visible.
     const middle_prefix =
-        " AND COALESCE(meta.unnamed_count, 0) = 1 AND COALESCE(meta.single_unnamed_kind, '') <> '' THEN 1 WHEN p.pronargs = 0 THEN 2 ELSE 3 END AS match_rank FROM pg_proc p JOIN pg_namespace pn ON pn.oid = p.pronamespace JOIN pg_type t ON t.oid = p.prorettype LEFT JOIN (SELECT p2.oid, COUNT(*) FILTER (WHERE COALESCE(a.name, '') = '') AS unnamed_count, MAX(CASE WHEN COALESCE(a.name, '') = '' THEN CASE format_type(a.type_oid, NULL) WHEN 'json' THEN 'json' WHEN 'jsonb' THEN 'json' WHEN 'text' THEN 'text' WHEN 'xml' THEN 'xml' WHEN 'bytea' THEN 'bytea' ELSE '' END ELSE '' END) AS single_unnamed_kind, MAX(CASE WHEN a.mode = 'v' THEN COALESCE(a.name, '') ELSE '' END) AS variadic_param_name, STRING_AGG(CASE WHEN COALESCE(a.name, '') <> '' THEN COALESCE(a.name, '') ELSE NULL END, ',' ORDER BY a.ord) AS input_param_names FROM pg_proc p2 LEFT JOIN LATERAL (SELECT ord, COALESCE(p2.proargnames[ord], '') AS name, COALESCE(p2.proallargtypes[ord], p2.proargtypes[ord - 1]) AS type_oid, COALESCE(p2.proargmodes[ord], 'i') AS mode FROM generate_series(1, COALESCE(array_length(p2.proallargtypes, 1), array_length(p2.proargnames, 1), p2.pronargs)) ord) a ON TRUE WHERE a.type_oid IS NOT NULL AND a.mode IN ('i','v') GROUP BY p2.oid) meta ON meta.oid = p.oid WHERE p.prokind = 'f' AND pn.nspname = ";
+        " AND COALESCE(meta.unnamed_count, 0) = 1 AND COALESCE(meta.single_unnamed_kind, '') <> '' THEN 1 WHEN p.pronargs = 0 THEN 2 ELSE 3 END AS match_rank FROM pg_proc p JOIN pg_namespace pn ON pn.oid = p.pronamespace JOIN pg_type t ON t.oid = p.prorettype LEFT JOIN LATERAL (SELECT p2.oid, COUNT(*) FILTER (WHERE COALESCE(a.name, '') = '') AS unnamed_count, MAX(CASE WHEN COALESCE(a.name, '') = '' THEN CASE format_type(a.type_oid, NULL) WHEN 'json' THEN 'json' WHEN 'jsonb' THEN 'json' WHEN 'text' THEN 'text' WHEN 'xml' THEN 'xml' WHEN 'bytea' THEN 'bytea' ELSE '' END ELSE '' END) AS single_unnamed_kind, MAX(CASE WHEN a.mode = 'v' THEN COALESCE(a.name, '') ELSE '' END) AS variadic_param_name, STRING_AGG(CASE WHEN COALESCE(a.name, '') <> '' THEN COALESCE(a.name, '') ELSE NULL END, ',' ORDER BY a.ord) AS input_param_names FROM pg_proc p2 LEFT JOIN LATERAL (SELECT ord, COALESCE(p2.proargnames[ord], '') AS name, COALESCE(p2.proallargtypes[ord], p2.proargtypes[ord - 1]) AS type_oid, COALESCE(p2.proargmodes[ord], 'i') AS mode FROM generate_series(1, COALESCE(array_length(p2.proallargtypes, 1), array_length(p2.proargnames, 1), p2.pronargs)) ord) a ON TRUE WHERE p2.oid = p.oid AND a.type_oid IS NOT NULL AND a.mode IN ('i','v') GROUP BY p2.oid) meta ON TRUE WHERE p.prokind = 'f' AND pn.nspname = ";
     @memcpy(query_buf[pos..][0..middle_prefix.len], middle_prefix);
     pos += middle_prefix.len;
     pos = append_sql_quoted(query_buf, pos, schema_name orelse "public");
@@ -6193,6 +6215,7 @@ fn parse_rpc_json_body(
     body: []const u8,
     rpc_call: *RpcCall,
 ) void {
+    rpc_call.invalid_params = true;
     if (body.len == 0) return;
 
     if (rpc_call.prefer_single_object) {
@@ -6204,6 +6227,7 @@ fn parse_rpc_json_body(
         rpc_call.params[0].is_numeric = false;
         rpc_call.params[0].is_boolean = false;
         rpc_call.param_count = 1;
+        rpc_call.invalid_params = false;
         return;
     }
 
@@ -6227,7 +6251,7 @@ fn parse_rpc_json_body(
     var count: usize = 0;
 
     while (it.next()) |item| {
-        if (count >= MAX_RPC_PARAMS) break;
+        if (count >= MAX_RPC_PARAMS) return;
 
         // Get field name
         if (item.*.string != core.nullptr(u8)) {
@@ -6254,7 +6278,8 @@ fn parse_rpc_json_body(
             } else if (cjson.cJSON_IsString(item) == 1) {
                 if (cjson.cJSON_GetStringValue(item)) |str| {
                     var str_len: usize = 0;
-                    while (str[str_len] != 0 and str_len < 1024) : (str_len += 1) {}
+                    while (str[str_len] != 0 and str_len <= 2048) : (str_len += 1) {}
+                    if (str_len > 2048) return;
                     rpc_call.params[count].value = str[0..str_len];
                 } else {
                     rpc_call.params[count].value = "";
@@ -6268,6 +6293,16 @@ fn parse_rpc_json_body(
                 rpc_call.params[count].is_null = false;
                 rpc_call.params[count].is_numeric = false;
                 rpc_call.params[count].is_boolean = true;
+                rpc_call.params[count].is_raw = false;
+            } else if (cjson.cJSON_IsObject(item) == 1) {
+                // Send nested JSON as an unknown-typed, bound parameter. The
+                // selected function's json/jsonb argument supplies the type.
+                const encoded = json_parser.encode(item) catch return;
+                if (encoded.len > 2048) return;
+                rpc_call.params[count].value = core.slicify(u8, encoded.data, encoded.len);
+                rpc_call.params[count].is_null = false;
+                rpc_call.params[count].is_numeric = false;
+                rpc_call.params[count].is_boolean = false;
                 rpc_call.params[count].is_raw = false;
             } else if (cjson.cJSON_IsArray(item) == 1) {
                 // Support for array parameters - store as ARRAY constructor syntax
@@ -6341,6 +6376,7 @@ fn parse_rpc_json_body(
     }
 
     rpc_call.param_count = count;
+    rpc_call.invalid_params = false;
 }
 
 /// Parse query string parameters as RPC function arguments
@@ -8212,6 +8248,7 @@ fn handle_rpc_call_upstream(
     // Parse RPC parameters from query string or POST body
     var rpc_call: RpcCall = undefined;
     rpc_call.param_count = 0;
+    rpc_call.invalid_params = false;
     rpc_call.function_name = function_name;
     rpc_call.prefer_single_object = opts.prefer.params_single_object;
     const body_data = get_request_body_slice(r);
@@ -8220,6 +8257,8 @@ fn handle_rpc_call_upstream(
     if (body_data) |payload| {
         parse_rpc_body_params(body_format, payload, r.*.pool, &rpc_call);
     }
+
+    if (rpc_call.invalid_params) return send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"code\":\"invalid_rpc_parameters\"}");
 
     // If no body parameters, parse query string
     if (rpc_call.param_count == 0) {
@@ -8372,8 +8411,7 @@ fn ngx_http_pgrest_upstream_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_
     // is never embedded in the INSERT ON CONFLICT SQL, so don't accumulate
     // params here — they would be unreferenced in the final query.
     var where_buf: [MAX_QUERY_SIZE]u8 = undefined;
-    const where_result = build_where_clause_from_args(&where_buf, r.*.args,
-        if (r.*.method == http.NGX_HTTP_PUT) null else ctx);
+    const where_result = build_where_clause_from_args(&where_buf, r.*.args, if (r.*.method == http.NGX_HTTP_PUT) null else ctx);
     if (where_result.invalid) {
         return send_json_error(r, http.NGX_HTTP_BAD_REQUEST, "{\"message\":\"Invalid filter parameter\"}");
     }
@@ -8987,6 +9025,7 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
 
         var rpc_call: RpcCall = undefined;
         rpc_call.param_count = 0;
+        rpc_call.invalid_params = false;
         rpc_call.function_name = function_name;
         rpc_call.prefer_single_object = opts.prefer.params_single_object;
         const body_format = parse_content_type_from_request(r);
@@ -9197,7 +9236,19 @@ fn finalize_pg_response(ctx: *PgRequestCtx) void {
     };
     const response_storage = response_body_buf.*.last[0..response_buffer_size];
 
-    response_len = format_result_for_response(
+    const scalar_conf = core.castPtr(ngx_pgrest_loc_conf_t, conf.ngx_http_get_module_loc_conf(r, &ngx_http_pgrest_module));
+    const json_scalar = scalar_conf != null and scalar_conf.?.*.json_scalar == 1 and
+        is_rpc_endpoint(r.*.uri) and ntuples == 1 and nfields == 1 and
+        (pgFtype(result, 0) == 114 or pgFtype(result, 0) == 3802) and opts.response_format == .json;
+    if (json_scalar) {
+        if (pgGetisnull(result, 0, 0) != 0) {
+            @memcpy(response_storage[0..4], "null");
+            response_len = 4;
+        } else {
+            response_len = @intCast(pgGetlength(result, 0, 0));
+            @memcpy(response_storage[0..response_len], pgGetvalue(result, 0, 0)[0..response_len]);
+        }
+    } else response_len = format_result_for_response(
         result,
         ntuples,
         nfields,
@@ -9349,6 +9400,14 @@ export const ngx_http_pgrest_commands = [_]ngx_command_t{
         .post = null,
     },
     ngx_command_t{
+        .name = ngx_string("pgrest_json_scalar"),
+        .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_FLAG,
+        .set = conf.ngx_conf_set_flag_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(ngx_pgrest_loc_conf_t, "json_scalar"),
+        .post = null,
+    },
+    ngx_command_t{
         .name = ngx_string("pgrest_timeout"),
         .type = conf.NGX_HTTP_LOC_CONF | conf.NGX_CONF_TAKE1,
         .set = conf.ngx_conf_set_msec_slot,
@@ -9480,7 +9539,7 @@ test "build_where_clause_from_args supports logical operators and not" {
     const result = build_where_clause_from_args(&buf_out, ngx_string("or=(age.lt.18,not.and(age.gte.11,age.lte.17))"), null);
 
     try expect(!result.invalid);
-    try expectEqualStrings("(age < '18' OR NOT (age >= '11' AND age <= '17'))" , buf_out[0..result.len]);
+    try expectEqualStrings("(age < '18' OR NOT (age >= '11' AND age <= '17'))", buf_out[0..result.len]);
 }
 
 test "build_where_clause_from_args supports any modifier and wildcard like" {
@@ -9708,7 +9767,7 @@ test "build_insert_rows_query renders merge duplicates upsert" {
         .{ .value = "Sara B.", .is_null = false, .is_number = false, .is_boolean = false, .use_default = false },
     };
     const rows = [_][]const WriteScalar{row[0..]};
-    const len = build_insert_rows_query(&query_buf, "users", &.{ "id", "name" }, rows[0..], &.{ "id" }, .merge_duplicates, true, null);
+    const len = build_insert_rows_query(&query_buf, "users", &.{ "id", "name" }, rows[0..], &.{"id"}, .merge_duplicates, true, null);
 
     try expectEqualStrings(
         "INSERT INTO users (id,name) VALUES (1,'Sara B.') ON CONFLICT (id) DO UPDATE SET id=EXCLUDED.id,name=EXCLUDED.name RETURNING *",
@@ -9895,4 +9954,12 @@ test "estimated_json_string_size with escapes" {
     try expectEqual(@as(usize, 6), estimated_json_string_size("a\"b"));
     try expectEqual(@as(usize, 6), estimated_json_string_size("a\\b"));
     try expectEqual(@as(usize, 9), estimated_json_string_size("a\nb\tc"));
+}
+
+test "application SQLSTATE contract is narrow and does not disclose SQL errors" {
+    try std.testing.expectEqual(@as(ngx_uint_t, 422), application_error("PT422").?.status);
+    try std.testing.expectEqual(@as(ngx_uint_t, 401), application_error("PT401").?.status);
+    try std.testing.expect(application_error("PT200") == null);
+    try std.testing.expect(application_error("PT599") == null);
+    try std.testing.expect(application_error("P0001") == null);
 }
