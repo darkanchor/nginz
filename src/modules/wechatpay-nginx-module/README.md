@@ -60,6 +60,18 @@
 
 ### Deployment
 
+Provider requests include `User-Agent: nginz-wechatpay/1.0` and use
+`wechatpay_serial` as the `Wechatpay-Serial` request header. For public-key
+mode, configure the complete `PUB_KEY_ID_...` identifier with its matching
+public key. This also selects public-key response signing during a merchant's
+migration from platform certificates. See WeChat Pay's
+[request rules](https://pay.weixin.qq.com/doc/v3/merchant/4012081709) and
+[public-key migration guide](https://pay.weixin.qq.com/doc/v3/merchant/4012154180).
+
+Successful response verification is available as `$wechatpay_verification`
+(`success`), including for signed business errors such as `404 ORDER_NOT_EXIST`.
+A business error does not itself mean that signing or verification failed.
+
 Instead of providing standard nginx building routines, the project artifacts are module object files,
 with which one shall build into a target `nginx` binary.
 

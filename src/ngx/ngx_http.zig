@@ -148,6 +148,9 @@ pub fn ngz_set_upstream_header(
                 return handle(r, h, h0.*.offset);
             }
         }
+        // Valid extension headers need no nginx-specific handler. Preserve
+        // them just like ngx_http_proxy_process_header does.
+        return NGX_OK;
     }
     h.*.hash = 0;
     return core.NGX_ERROR;

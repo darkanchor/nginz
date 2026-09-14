@@ -561,7 +561,10 @@ fn build_request(
         if ((provider.ssl and provider.port != 443) or (!provider.ssl and provider.port != 80)) {
             write = ngx_sprintf(write, ":%ui", @as(ngx_uint_t, provider.port));
         }
-        write = ngx_sprintf(write, "\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: %uz\r\nConnection: close\r\n", body.len);
+        write = ngx_sprintf(write, "\r\nContent-Type: application/json\r\nAccept: application/json\r\nUser-Agent: nginz-wechatpay/1.0\r\nContent-Length: %uz\r\nConnection: close\r\n", body.len);
+        // Select the configured verification key, including public-key mode
+        // while the merchant is migrating away from platform certificates.
+        write = ngx_sprintf(write, "Wechatpay-Serial: %V\r\n", &lccf.*.wechatpay_serial);
         // A payment subrequest never forwards user JWTs, cookies, caller Host,
         // forged provider Authorization or any other main-request headers.
         write = ngx_sprintf(write, "%V\r\n", &sign);
@@ -952,6 +955,9 @@ fn ngx_http_wechatpay_proxy_upstream_finalize_request(
                 http.ngx_http_clear_content_length(r);
                 http.ngx_http_clear_accept_ranges(r);
                 _ = http.ngx_http_send_header(r);
+                // Upstream core owns finalization after this callback. Tell it
+                // that the gateway response has already been emitted.
+                r.*.upstream.*.flags.header_sent = true;
                 _ = http.ngx_http_send_special(r, http.NGX_HTTP_LAST);
             }
             return;

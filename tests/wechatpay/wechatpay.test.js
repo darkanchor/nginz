@@ -441,6 +441,47 @@ describe("wechatpay module", () => {
   });
 
   describe("proxy signing and response verification", () => {
+    test("returns a signed provider business error through an njs subrequest", async () => {
+      const responseBody = JSON.stringify({ code: "ORDER_NOT_EXIST", message: "订单不存在" });
+      upstreamMock.post("/proxy", async (req, url) => {
+        verifyProxyAuthorization(req.headers.get("authorization"), {
+          method: req.method, path: url.pathname, query: "", body: await req.text(),
+        });
+        expect(req.headers.get("user-agent")).toBe("nginz-wechatpay/1.0");
+        expect(req.headers.get("wechatpay-serial")).toBe(PLATFORM_SERIAL);
+        return signedUpstreamResponse(responseBody, {
+          status: 404,
+          extraHeaders: { "X-Content-Type-Options": "nosniff", "Content-Language": "zh-CN" },
+        });
+      });
+      const res = await fetchClose(`${TEST_URL}/subrequest`, { method: "POST", body: '{"probe":true}' });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ status: 404, verification: "success", body: responseBody });
+    });
+
+    test("completes a failed upstream subrequest without sending headers twice", async () => {
+      await withRawGateway(() => "HTTP/1.1 INVALID\r\n\r\n", async () => {
+        const res = await fetchClose(`${TEST_URL}/subrequest?raw=1`, {
+          method: "POST", body: "probe", signal: AbortSignal.timeout(3000),
+        });
+        expect(res.status).toBe(200);
+        const reply = await res.json();
+        expect(reply.status).toBe(502);
+        expect(reply.verification).toBe("unverified");
+        const log = readFileSync(join(process.cwd(), "tests/wechatpay/runtime/logs/error.log"), "utf8");
+        expect(log).not.toContain("header already sent");
+        expect(log).not.toContain("pending events while closing request");
+      });
+    });
+
+    test("rejects an invalid provider signature through an njs subrequest", async () => {
+      upstreamMock.post("/proxy", () => signedUpstreamResponse('{"untrusted":true}', { signature: "bad" }));
+      const res = await fetchClose(`${TEST_URL}/subrequest`, { method: "POST", body: "probe" });
+      const reply = await res.json();
+      expect(reply.status).toBe(401);
+      expect(reply.verification).toBe("unverified");
+    });
+
     test("rejects upstream bodies above wechatpay_body_max_size", async () => {
       const responseBody = "x".repeat(128);
       upstreamMock.post("/proxy-bounded", async () => signedUpstreamResponse(responseBody));
@@ -478,6 +519,8 @@ describe("wechatpay module", () => {
         const body = await req.text();
         observedRequest = {
           authorization: req.headers.get("authorization"),
+          userAgent: req.headers.get("user-agent"),
+          platformSerial: req.headers.get("wechatpay-serial"),
           xTestHeader: req.headers.get("x-test-header"),
           method: req.method,
           path: url.pathname,
@@ -494,6 +537,8 @@ describe("wechatpay module", () => {
         headers: {
           "Content-Type": "application/json",
           "X-Test-Header": "present",
+          "User-Agent": "untrusted-caller",
+          "Wechatpay-Serial": "forged-platform-key",
         },
         body: requestBody,
       });
@@ -507,6 +552,8 @@ describe("wechatpay module", () => {
       expect(observedRequest).toBeTruthy();
       expect(observedRequest.xTestHeader).toBeNull(); // caller headers are not payment credentials
       expect(observedRequest.authorization).toBeTruthy();
+      expect(observedRequest.userAgent).toBe("nginz-wechatpay/1.0");
+      expect(observedRequest.platformSerial).toBe(PLATFORM_SERIAL);
       verifyProxyAuthorization(observedRequest.authorization, observedRequest);
 
       const logged = upstreamMock.getLastRequest();
@@ -623,6 +670,9 @@ describe("wechatpay module", () => {
           requestId: "wechatpay-resp-123",
           extraHeaders: {
             "Wechatpay-Signature-Type": "WECHATPAY2-SHA256-RSA2048",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Language": "zh-CN",
+            "X-Wechatpay-Future-Header": "extension",
           },
         });
       });
@@ -640,6 +690,9 @@ describe("wechatpay module", () => {
       expect(res.headers.get("wechatpay-serial")).toBe(PLATFORM_SERIAL);
       expect(res.headers.get("wechatpay-signature")).toBeTruthy();
       expect(res.headers.get("wechatpay-signature-type")).toBe("WECHATPAY2-SHA256-RSA2048");
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(res.headers.get("content-language")).toBe("zh-CN");
+      expect(res.headers.get("x-wechatpay-future-header")).toBe("extension");
     });
 
     test("signs spilled request bodies with the full body content", async () => {
