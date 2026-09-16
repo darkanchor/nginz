@@ -1,6 +1,6 @@
 ## Wechatpay
 
-`wechatpay` is a nginx proxy module to the upstream [wechat pay][1] gateway. It provides **3** major functionalies
+`wechatpay` is a nginx proxy module to the upstream [wechat pay][1] gateway. It provides **4** major functionalities
 
 1. A upstream proxy which signs the request as [wechat pay][1] gateway requires,
    meanwhile it verifies the signature in the upstream response.
@@ -9,6 +9,8 @@
    Optionally it decrypts every `AES-GCM-256` ciphertxt which might present in the request body on the fly.
 3. Provides content handlers which either encrypt to or decrypt from the base64 encoded ciphertxt
    found in a request body using **RSA** algorithm specified by [wechat pay][1]
+
+4. XPay upstream pass-through for Mini Program virtual-payment server APIs: injects the app access token and signs the exact request body with the selected AppKey.
 
 ### Synopsis
 
@@ -242,3 +244,110 @@ request body, decrypts and appends plaintxt for the location's content handler, 
 ### Engineering Audit Verdict (2026-07-12)
 
 **Verdict: S0 TRANSPORT/AUTHENTICITY FIXED; S1 CORE BOUNDS FIXED.** HTTPS upstreams use system CA trust, SNI, certificate verification, and hostname validation; plain HTTP requires explicit `wechatpay_allow_insecure_http on`. Signed requests and upstream responses outside a ±300-second window are rejected. Successfully verified nonces enter a 1,024-entry shared-memory replay window, fail closed at capacity without overwriting fresh entries, and reclaim only expired slots. `wechatpay_body_max_size` bounds fixed-length and chunked request/upstream bodies before signature-path allocations; focused 413/502 regressions keep transport failures distinct from authentication failures. The 24-case focused suite is green; capacity telemetry and TLS-negative integration remain proof work.
+
+### XPay virtual-payment server APIs
+
+`wechatpay_xpay_proxy_pass` forwards JSON POST requests to WeChat's XPay APIs.
+It shares the bounded upstream transport with API v3, but uses separate
+credentials and does not apply API v3 response verification or decryption.
+No merchant RSA key, merchant ID, or platform serial is needed for XPay.
+
+```nginx
+http {
+    resolver 223.5.5.5;
+    # Raw AppKey bytes, without an added newline. Relative paths use the
+    # nginx configuration directory. Files are loaded at startup/reload.
+    wechatpay_xpay_live_key_file /run/app/xpay-live.key;
+    wechatpay_xpay_sandbox_key_file /run/app/xpay-sandbox.key; # optional
+    wechatpay_xpay_env 0; # default: live; sandbox is explicitly 1
+
+    # Define/populate this private variable in the application before making
+    # the payment subrequest. Token acquisition/refresh stays in the app.
+    js_var $private_app_access_token "";
+    wechatpay_xpay_access_token $private_app_access_token;
+
+    server {
+        listen 8080;
+        location = /xpay/query_order {
+            internal;
+            wechatpay_xpay_auth appkey;
+            wechatpay_audit_request /_payment/audit_request;
+            wechatpay_xpay_proxy_pass https://api.weixin.qq.com;
+        }
+        location = /xpay/notify_provide_goods {
+            internal;
+            wechatpay_xpay_auth token;
+            wechatpay_audit_request /_payment/audit_request;
+            wechatpay_xpay_proxy_pass https://api.weixin.qq.com;
+        }
+        # Define /_payment/audit_request in the application. It must commit
+        # $wechatpay_request and return 2xx before dispatch is allowed.
+    }
+}
+```
+
+Send the final JSON body, including integer `env: 0`, to the internal location.
+The URI must be `/xpay/<endpoint>`; rewrites must finish before the handler runs.
+The configured upstream is an origin (scheme, DNS/IPv4 hostname, optional port),
+without a path, query, or user information. HTTPS verifies the peer and hostname;
+HTTP requires the existing `wechatpay_allow_insecure_http on` test override.
+
+| Directive | Context | Behavior |
+| --- | --- | --- |
+| `wechatpay_xpay_proxy_pass origin` | location | XPay handler; cannot share a location with v3 proxy/access/OAEP handlers |
+| `wechatpay_xpay_auth appkey\|token` | http/server/location | Required explicit policy, inherited; `appkey` adds `pay_sig`, `token` adds only `access_token` |
+| `wechatpay_xpay_access_token value` | http/server/location | Required nginx complex value; evaluated per request; empty or >8192-byte token fails with 500 |
+| `wechatpay_xpay_env 0\|1` | http/server/location | Inherited, defaults to live `0`; body `env` must match |
+| `wechatpay_xpay_live_key_file path` | http/server/location | Literal live AppKey file; required when selected in `appkey` mode |
+| `wechatpay_xpay_sandbox_key_file path` | http/server/location | Literal sandbox AppKey file; required when selected in `appkey` mode |
+
+In `appkey` mode the signature is lowercase HMAC-SHA256 over
+`upstream_path + "&" + exact_body`, keyed by the configured AppKey. The module
+URL-encodes the private access token and attaches it with `pay_sig`. The
+forwarded body is the same immutable byte buffer that was signed, including
+whitespace and UTF-8 text. Caller cookies, Authorization, and Wechatpay headers
+are not forwarded. The body must be a valid JSON object with one integer `env`
+(`0` or `1`, not a string, decimal, or exponent). Duplicate JSON members,
+root-level `access_token`/`pay_sig`/`signature`, environment mismatches, and
+incoming query strings return 400. Other methods return 405.
+
+Use `appkey` for `query_order`, `start_upload_goods`, `query_upload_goods`,
+`start_publish_goods`, and `query_publish_goods`. The reviewed
+`notify_provide_goods` specification requires token-only authentication.
+The module deliberately requires an explicit policy rather than inferring one
+from the endpoint name. Session-key/user-signature modes (coin/balance and
+refund-specific requirements) are not implemented.
+
+`wechatpay_body_max_size` limits both request and response bodies (default 1 MiB).
+Request overflow returns 413. Incomplete, invalid, oversized, or timed-out
+upstream responses return 502. Connect/send/read timeouts are each 60 seconds.
+There is one upstream attempt and no automatic mutation retry. Complete HTTP
+responses retain their status and body, including HTTP 200 with nonzero
+`errcode`; the application interprets business outcomes.
+
+With `wechatpay_audit_request`, any non-2xx audit result prevents dispatch and
+returns 503. XPay audit evidence contains the exact path and body plus protocol,
+authentication mode, and environment, **without** AppKeys, access tokens, or
+`pay_sig`. It is a redacted evidence record, not the authenticated wire request.
+The following variables are available to the audit handler and the completed
+payment subrequest:
+
+| Variable | XPay value |
+| --- | --- |
+| `$wechatpay_protocol` | `xpay` (`v3` on existing API v3 requests) |
+| `$wechatpay_request` | Redacted request evidence and exact JSON body |
+| `$wechatpay_response` | Captured response body; may be partial on transport failure |
+| `$wechatpay_transport` | `complete` after a full response; otherwise `incomplete` |
+| `$wechatpay_verification` | Always `unverified`; HTTPS is not an API v3 signature |
+
+Header-only subrequests cannot establish body completeness and remain
+`incomplete`. Use an ordinary body-capturing subrequest for payments. Standard
+nginx debug logging can expose evaluated variables; keep credential-bearing
+variables out of application/access logs and disable debug logging in production.
+
+Client `wx.requestVirtualPayment` parameter signing, session storage, token
+refresh, catalog consistency, order validation, and fulfillment stay in the
+application. See [the design and official references](XPAY-PROPOSAL.md).
+
+Validation: `zig test src/modules/wechatpay-nginx-module/xpay.zig -lc` and
+`bun test tests/xpay/ tests/wechatpay/` (the Bun suite builds nginz first).

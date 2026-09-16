@@ -401,3 +401,9 @@ test "http" {
     try expectEqual(@sizeOf(ngx_ssl_ticket_key_t), 96);
     try expectEqual(@sizeOf(ngx_http_module_t), 64);
 }
+
+// Complex configuration values and the stock HTTP chunk parser.
+pub const ngx_http_chunked_t = ngx.ngx_http_chunked_t;
+pub extern fn ngx_http_parse_chunked(r: [*c]ngx_http_request_t, b: [*c]ngx.ngx_buf_t, ctx: [*c]ngx_http_chunked_t, keep_trailers: ngx_uint_t) ngx_int_t;
+pub extern fn ngx_http_complex_value(r: [*c]ngx_http_request_t, val: [*c]ngx_http_complex_value_t, out: [*c]ngx_str_t) ngx_int_t;
+pub extern fn ngx_http_set_complex_value_slot(cf: [*c]ngx_conf_t, cmd: [*c]ngx.ngx_command_t, config: ?*anyopaque) [*c]u8;

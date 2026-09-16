@@ -585,6 +585,19 @@ describe("wechatpay module", () => {
       expect(res.status).toBe(401);
     });
 
+    test("verifies signatures over decoded HTTP chunks", async () => {
+      const body = '{"code":"ORDER_NOT_EXIST"}';
+      const signed = signedUpstreamResponse(body);
+      const headers = Object.entries(signed.headers).map(([key, value]) => `${key}: ${value}\r\n`).join("");
+      await withRawGateway(() => `HTTP/1.1 200 OK\r\n${headers}Transfer-Encoding: chunked\r\n\r\n${body.length.toString(16)}\r\n${body}\r\n0\r\n\r\n`, async () => {
+        const res = await fetchClose(`${TEST_URL}/subrequest?raw=1`, { method: "POST", body: "query" });
+        const reply = await res.json();
+        expect(reply.status).toBe(200);
+        expect(reply.verification).toBe("success");
+        expect(reply.body).toBe(body);
+      });
+    });
+
     test("forwards verified chunked upstream responses", async () => {
       upstreamMock.post("/proxy", async (req) => {
         const body = await req.text();
