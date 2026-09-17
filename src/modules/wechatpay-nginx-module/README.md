@@ -148,6 +148,16 @@ requires an explicit `$request_uri`, *wechatpay_proxy_pass* does not need them a
 *context: http, server, location*
 
 Bounds request bodies used for signing, access verification, and OAEP operations, and bounds upstream response bodies retained for signature verification. Oversized client bodies return 413; oversized or invalidly framed upstream responses return 502. The limit applies to both fixed-length and chunked bodies.
+
+#### wechatpay_read_timeout
+
+*syntax: wechatpay_read_timeout time*
+
+*default: 60s*
+
+*context: http, server, location*
+
+Upstream read timeout for `wechatpay_proxy_pass` and `wechatpay_xpay_proxy_pass`. A timed-out, incomplete, or invalidly framed upstream response returns 502. Connect and send timeouts remain 60 seconds.
 the signature and it makes little sense to modify them. The module uses the *method*, *uri path* and *uri args* of the original request
 for the upstream.
 
@@ -300,6 +310,7 @@ HTTP requires the existing `wechatpay_allow_insecure_http on` test override.
 | `wechatpay_xpay_env 0\|1` | http/server/location | Inherited, defaults to live `0`; body `env` must match |
 | `wechatpay_xpay_live_key_file path` | http/server/location | Literal live AppKey file; required when selected in `appkey` mode |
 | `wechatpay_xpay_sandbox_key_file path` | http/server/location | Literal sandbox AppKey file; required when selected in `appkey` mode |
+| `wechatpay_read_timeout time` | http/server/location | Upstream read timeout; default 60s; timed-out responses return 502 |
 
 In `appkey` mode the signature is lowercase HMAC-SHA256 over
 `upstream_path + "&" + exact_body`, keyed by the configured AppKey. The module
@@ -322,7 +333,8 @@ refund-specific requirements) are not implemented.
 
 `wechatpay_body_max_size` limits both request and response bodies (default 1 MiB).
 Request overflow returns 413. Incomplete, invalid, oversized, or timed-out
-upstream responses return 502. Connect/send/read timeouts are each 60 seconds.
+upstream responses return 502. Connect and send timeouts are 60 seconds.
+`wechatpay_read_timeout` defaults to 60 seconds and can be lowered per location.
 There is one upstream attempt and no automatic mutation retry. Complete HTTP
 responses retain their status and body, including HTTP 200 with nonzero
 `errcode`; the application interprets business outcomes.

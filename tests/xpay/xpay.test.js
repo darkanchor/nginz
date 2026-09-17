@@ -275,7 +275,10 @@ describe('XPay pass-through', () => {
         });
         await new Promise((resolve) => server.listen(19005, '127.0.0.1', resolve));
         try {
+            const started = Date.now();
             const result = await call('{"env":0}', '/xpay/raw');
+            expect(Date.now() - started).toBeGreaterThan(4000);
+            expect(Date.now() - started).toBeLessThan(10000);
             expect(result.status).toBe(502);
             expect(result.transport).toBe('incomplete');
             expect(count).toBe(1);
@@ -283,7 +286,7 @@ describe('XPay pass-through', () => {
             for (const socket of sockets) socket.destroy();
             await new Promise((resolve) => server.close(resolve));
         }
-    }, 70000);
+    }, 15000);
 
     test('fails incomplete, malformed and oversized framing without replay', async () => {
         for (const wire of [
@@ -325,6 +328,7 @@ describe('XPay configuration', () => {
         wechatpay_xpay_live_key_file ${key};`;
     test('works without API v3 credentials and token-only mode needs no AppKey', () => {
         expect(check(base).output).toContain("test is successful");
+        expect(check(base + 'wechatpay_read_timeout 5s;').output).toContain("test is successful");
         expect(check('wechatpay_xpay_proxy_pass https://api.weixin.qq.com; wechatpay_xpay_access_token test; wechatpay_xpay_auth token;').output).toContain('test is successful');
     });
     test('fails closed for missing credentials, invalid policies, mixed modes and unsafe origins', () => {

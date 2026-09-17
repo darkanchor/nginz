@@ -216,7 +216,7 @@ fn init_upstream_conf(cf: [*c]http.ngx_http_upstream_conf_t) void {
     cf.*.ssl_session_reuse = 1;
     cf.*.connect_timeout = 60000;
     cf.*.send_timeout = 60000;
-    cf.*.read_timeout = 60000;
+    cf.*.read_timeout = conf.NGX_CONF_UNSET_MSEC;
     cf.*.module = ngx_string("ngx_http_wechatpay_module");
     cf.*.hide_headers = conf.NGX_CONF_UNSET_PTR;
     cf.*.pass_headers = conf.NGX_CONF_UNSET_PTR;
@@ -356,6 +356,12 @@ inline fn merge_loc(ch: [*c]wechatpay_loc_conf, pr: [*c]wechatpay_loc_conf) void
             WECHATPAY_DEFAULT_BODY_MAX_SIZE
         else
             pr.*.body_max_size;
+    }
+    if (ch.*.ups.read_timeout == conf.NGX_CONF_UNSET_MSEC) {
+        ch.*.ups.read_timeout = if (pr.*.ups.read_timeout == conf.NGX_CONF_UNSET_MSEC)
+            60000
+        else
+            pr.*.ups.read_timeout;
     }
 }
 
@@ -1654,6 +1660,14 @@ export const ngx_http_wechatpay_commands = [_]ngx_command_t{
         .set = conf.ngx_conf_set_size_slot,
         .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
         .offset = @offsetOf(wechatpay_loc_conf, "body_max_size"),
+        .post = null,
+    },
+    ngx_command_t{
+        .name = ngx_string("wechatpay_read_timeout"),
+        .type = CONF_PHASES | conf.NGX_CONF_TAKE1,
+        .set = conf.ngx_conf_set_msec_slot,
+        .conf = conf.NGX_HTTP_LOC_CONF_OFFSET,
+        .offset = @offsetOf(wechatpay_loc_conf, "ups") + @offsetOf(http.ngx_http_upstream_conf_t, "read_timeout"),
         .post = null,
     },
     ngx_command_t{
