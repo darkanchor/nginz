@@ -232,6 +232,7 @@ typedef struct
     size_t length;
     size_t offset;
     size_t depth; /* How deeply nested (in arrays/objects) is the input at the current offset. */
+    cJSON_bool strict;
     internal_hooks hooks;
 } parse_buffer;
 
@@ -248,7 +249,8 @@ static cJSON_bool parse_number(cJSON * const item, parse_buffer * const input_bu
 {
     double number = 0;
     unsigned char *after_end = NULL;
-    unsigned char number_c_string[64];
+    unsigned char number_buffer[64];
+    unsigned char *number_c_string = number_buffer;
     unsigned char decimal_point = get_decimal_point();
     size_t i = 0;
 
@@ -257,10 +259,52 @@ static cJSON_bool parse_number(cJSON * const item, parse_buffer * const input_bu
         return false;
     }
 
+    if (input_buffer->strict)
+    {
+        /* JSON number grammar; strtod alone accepts leading zeros and 1. */
+        const unsigned char *text = buffer_at_offset(input_buffer);
+        size_t length = input_buffer->length - input_buffer->offset;
+        size_t end = (text[0] == '-') ? 1 : 0;
+        size_t digits;
+        if (end >= length) return false;
+        if (text[end] == '0') end++;
+        else
+        {
+            digits = end;
+            while (end < length && text[end] >= '0' && text[end] <= '9') end++;
+            if (end == digits) return false;
+        }
+        if (end < length && text[end] == '.')
+        {
+            digits = ++end;
+            while (end < length && text[end] >= '0' && text[end] <= '9') end++;
+            if (end == digits) return false;
+        }
+        if (end < length && (text[end] == 'e' || text[end] == 'E'))
+        {
+            end++;
+            if (end < length && (text[end] == '+' || text[end] == '-')) end++;
+            digits = end;
+            while (end < length && text[end] >= '0' && text[end] <= '9') end++;
+            if (end == digits) return false;
+        }
+        number_c_string = (unsigned char*)input_buffer->hooks.allocate(end + 1, input_buffer->hooks.ctx);
+        if (number_c_string == NULL) return false;
+        memcpy(number_c_string, text, end);
+        number_c_string[end] = '\0';
+        item->valuestring = (char*)number_c_string;
+        /* Keep the original spelling for callers that require integer tokens. */
+        for (i = 0; i < end; i++) if (number_c_string[i] == '.') number_c_string[i] = decimal_point;
+        number = strtod((const char*)number_c_string, (char**)&after_end);
+        for (i = 0; i < end; i++) number_c_string[i] = text[i];
+        if ((size_t)(after_end - number_c_string) != end) return false;
+        goto number_parsed;
+    }
+
     /* copy the number into a temporary buffer and replace '.' with the decimal point
      * of the current locale (for strtod)
      * This also takes care of '\0' not necessarily being available for marking the end of the input */
-    for (i = 0; (i < (sizeof(number_c_string) - 1)) && can_access_at_index(input_buffer, i); i++)
+    for (i = 0; (i < (sizeof(number_buffer) - 1)) && can_access_at_index(input_buffer, i); i++)
     {
         switch (buffer_at_offset(input_buffer)[i])
         {
@@ -298,6 +342,7 @@ loop_end:
         return false; /* parse_error */
     }
 
+number_parsed:
     item->valuedouble = number;
 
     /* use saturation in case of overflow */
@@ -726,7 +771,7 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
     unsigned char *output = NULL;
 
     /* not a string */
-    if (buffer_at_offset(input_buffer)[0] != '\"')
+    if (cannot_access_at_index(input_buffer, 0) || buffer_at_offset(input_buffer)[0] != '\"')
     {
         goto fail;
     }
@@ -770,6 +815,7 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
     {
         if (*input_pointer != '\\')
         {
+            if (input_buffer->strict && *input_pointer < 32) goto fail;
             *output_pointer++ = *input_pointer++;
         }
         /* escape sequence */
@@ -820,6 +866,9 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
             input_pointer += sequence_length;
         }
     }
+
+    /* cJSON cannot represent embedded NULs without truncating strings/keys. */
+    if (input_buffer->strict && memchr(output, '\0', (size_t)(output_pointer - output)) != NULL) goto fail;
 
     /* zero terminate the output */
     *output_pointer = '\0';
@@ -998,10 +1047,12 @@ static parse_buffer *buffer_skip_whitespace(parse_buffer * const buffer)
 
     while (can_access_at_index(buffer, 0) && (buffer_at_offset(buffer)[0] <= 32))
     {
+       unsigned char ch = buffer_at_offset(buffer)[0];
+       if (buffer->strict && ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') break;
        buffer->offset++;
     }
 
-    if (buffer->offset == buffer->length)
+    if (!buffer->strict && buffer->offset == buffer->length)
     {
         buffer->offset--;
     }
@@ -1041,9 +1092,9 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return
 }
 
 /* Parse an object - create a new root, and populate. */
-CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated, Allocator *alloc)
+static cJSON *parse_with_length_opts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated, cJSON_bool strict, Allocator *alloc)
 {
-    parse_buffer buffer = { 0, 0, 0, 0, { 0, 0, 0, 0 } };
+    parse_buffer buffer = { 0 };
     cJSON *item = NULL;
 
     /* reset error position */
@@ -1058,6 +1109,7 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
     buffer.content = (const unsigned char*)value;
     buffer.length = buffer_length;
     buffer.offset = 0;
+    buffer.strict = strict;
     buffer.hooks = *alloc;
 
     item = cJSON_New_Item(alloc);
@@ -1066,11 +1118,13 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
         goto fail;
     }
 
-    if (!parse_value(item, buffer_skip_whitespace(skip_utf8_bom(&buffer))))
+    if (!parse_value(item, buffer_skip_whitespace(strict ? &buffer : skip_utf8_bom(&buffer))))
     {
         /* parse failure. ep is set. */
         goto fail;
     }
+
+    if (strict && buffer_skip_whitespace(&buffer)->offset != buffer.length) goto fail;
 
     /* if we require null-terminated JSON without appended garbage, skip and then check for a null terminator */
     if (require_null_terminated)
@@ -1118,6 +1172,16 @@ fail:
     }
 
     return NULL;
+}
+
+CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated, Allocator *alloc)
+{
+    return parse_with_length_opts(value, buffer_length, return_parse_end, require_null_terminated, false, alloc);
+}
+
+CJSON_PUBLIC(cJSON *) cJSON_ParseStrict(const char *value, size_t length, Allocator *alloc)
+{
+    return parse_with_length_opts(value, length, NULL, false, true, alloc);
 }
 
 /* Default options for cJSON_Parse */

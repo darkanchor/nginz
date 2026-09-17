@@ -225,6 +225,38 @@ pub const HMAC_Update = ngx.HMAC_Update;
 pub const HMAC_Final = ngx.HMAC_Final;
 pub const EVP_MD = ngx.EVP_MD;
 
+extern fn EVP_Digest(data: ?*const anyopaque, count: usize, md: [*c]u8, size: *c_uint, kind: ?*const EVP_MD, impl: ?*ngx.ENGINE) c_int;
+extern fn CRYPTO_memcmp(a: *const anyopaque, b: *const anyopaque, len: usize) c_int;
+
+pub fn sha256(input: []const u8) ![32]u8 {
+    var digest: [32]u8 = undefined;
+    var len: c_uint = 0;
+    if (EVP_Digest(input.ptr, input.len, &digest, &len, EVP_sha256(), null) != 1 or len != digest.len)
+        return core.NError.SSL_ERROR;
+    return digest;
+}
+
+pub fn hmacSha256(key: []const u8, parts: []const []const u8) ![32]u8 {
+    if (key.len > std.math.maxInt(c_int)) return core.NError.SSL_ERROR;
+    const ctx = HMAC_CTX_new() orelse return core.NError.SSL_ERROR;
+    defer HMAC_CTX_free(ctx);
+    if (HMAC_Init_ex(ctx, key.ptr, @intCast(key.len), EVP_sha256(), null) != 1)
+        return core.NError.SSL_ERROR;
+    for (parts) |part| {
+        if (HMAC_Update(ctx, part.ptr, part.len) != 1) return core.NError.SSL_ERROR;
+    }
+    var digest: [32]u8 = undefined;
+    var len: c_uint = 0;
+    if (HMAC_Final(ctx, &digest, &len) != 1 or len != digest.len) return core.NError.SSL_ERROR;
+    return digest;
+}
+
+/// Lengths are public; equal-length contents are compared in constant time.
+pub fn timingSafeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    return a.len == 0 or CRYPTO_memcmp(a.ptr, b.ptr, a.len) == 0;
+}
+
 const ERR_get_error = ngx.ERR_get_error;
 const ERR_error_string_n = ngx.ERR_error_string_n;
 const ERR_print_errors_cb = ngx.ERR_print_errors_cb;
@@ -684,4 +716,23 @@ test "ssl" {
     const bb = try aes.encrypt(ngx_string(aes_256_gcm[2]), ngx_string(aes_256_gcm[1]), ngx_string(aes_256_gcm[3]), pool);
     const tt = try aes.decrypt(bb, ngx_string(aes_256_gcm[1]), ngx_string(aes_256_gcm[3]), pool);
     try std.testing.expectEqualSlices(u8, core.slicify(u8, tt.data, tt.len), aes_256_gcm[2]);
+}
+
+test "OpenSSL SHA256 and multipart HMAC-SHA256 vectors" {
+    try std.testing.expectEqualStrings("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", &std.fmt.bytesToHex(try sha256(""), .lower));
+    try std.testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", &std.fmt.bytesToHex(try sha256("abc"), .lower));
+    // RFC 4231 cases 1 and 6 cover multipart input and keys longer than a block.
+    const key = [_]u8{0x0b} ** 20;
+    try std.testing.expectEqualStrings("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", &std.fmt.bytesToHex(try hmacSha256(&key, &.{ "Hi", "", " There" }), .lower));
+    const long_key = [_]u8{0xaa} ** 131;
+    try std.testing.expectEqualStrings("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54", &std.fmt.bytesToHex(try hmacSha256(&long_key, &.{"Test Using Larger Than Block-Size Key - Hash Key First"}), .lower));
+    try std.testing.expectEqualStrings("b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad", &std.fmt.bytesToHex(try hmacSha256("", &.{}), .lower));
+}
+
+test "OpenSSL timing-safe equality" {
+    try std.testing.expect(timingSafeEql("", ""));
+    try std.testing.expect(timingSafeEql("secret", "secret"));
+    try std.testing.expect(!timingSafeEql("secret", "Secret"));
+    try std.testing.expect(!timingSafeEql("secret", "secreT"));
+    try std.testing.expect(!timingSafeEql("secret", "secrets"));
 }

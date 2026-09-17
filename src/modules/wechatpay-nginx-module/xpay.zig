@@ -1,32 +1,26 @@
 const std = @import("std");
+const ngx = @import("ngx");
+const CJSON = ngx.cjson.CJSON;
 
 // Parsing is only for validation/key selection. Never reserialize the signed body.
-pub fn requestEnv(body: []const u8) !u1 {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, body, .{
-        .allocate = .alloc_always,
-        .duplicate_field_behavior = .@"error",
-        .parse_numbers = false,
-    }) catch return error.InvalidRequest;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidRequest;
-    const obj = parsed.value.object;
-    for ([_][]const u8{ "access_token", "pay_sig", "signature" }) |field| {
-        if (obj.contains(field)) return error.InvalidRequest;
+pub fn requestEnv(pool: [*c]ngx.core.ngx_pool_t, body: []const u8) !u1 {
+    var cj = CJSON.init(pool);
+    const obj = cj.decodeStrict(ngx.string.ngx_string(body)) catch |err| return switch (err) {
+        error.JSON_ERROR => error.InvalidRequest,
+        else => err,
+    };
+    if (CJSON.objValue(obj) == null) return error.InvalidRequest;
+    for ([_][:0]const u8{ "access_token", "pay_sig", "signature" }) |field| {
+        if (ngx.cjson.cJSON_GetObjectItemCaseSensitive(obj, field.ptr) != null) return error.InvalidRequest;
     }
-    const env = obj.get("env") orelse return error.InvalidRequest;
-    if (env != .number_string) return error.InvalidRequest;
-    if (std.mem.eql(u8, env.number_string, "0")) return 0;
-    if (std.mem.eql(u8, env.number_string, "1")) return 1;
+    const env = CJSON.numberLiteral(ngx.cjson.cJSON_GetObjectItemCaseSensitive(obj, "env")) orelse return error.InvalidRequest;
+    if (std.mem.eql(u8, env, "0")) return 0;
+    if (std.mem.eql(u8, env, "1")) return 1;
     return error.InvalidRequest;
 }
 
-pub fn sign(key: []const u8, path: []const u8, body: []const u8) [64]u8 {
-    var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(key);
-    hmac.update(path);
-    hmac.update("&");
-    hmac.update(body);
-    var digest: [32]u8 = undefined;
-    hmac.final(&digest);
+pub fn sign(key: []const u8, path: []const u8, body: []const u8) ![64]u8 {
+    const digest = try ngx.ssl.hmacSha256(key, &.{ path, "&", body });
     return std.fmt.bytesToHex(digest, .lower);
 }
 
@@ -72,11 +66,14 @@ pub fn validOrigin(origin: []const u8) bool {
 }
 
 test "strict XPay environment and authentication fields" {
-    try std.testing.expectEqual(@as(u1, 0), try requestEnv("{\"env\":0,\"text\":\"中文\"}"));
-    try std.testing.expectEqual(@as(u1, 1), try requestEnv("{\"env\":1}"));
+    const log = ngx.core.ngx_log_init(ngx.core.c_str(""), ngx.core.c_str(""));
+    const pool = ngx.core.ngx_create_pool(4096, log) orelse return error.OutOfMemory;
+    defer ngx.core.ngx_destroy_pool(pool);
+    try std.testing.expectEqual(@as(u1, 0), try requestEnv(pool, "{\"env\":0,\"text\":\"中文\"}"));
+    try std.testing.expectEqual(@as(u1, 1), try requestEnv(pool, "{\"env\":1}"));
     for ([_][]const u8{
         "",                      "{}",                          "[]",                            "null",                            "{\"env\":0}junk",                    "{\"env\":0}\x00",
         "{\"env\":0.0}",         "{\"env\":1e0}",               "{\"env\":-0}",                  "{\"env\":2}",                     "{\"env\":true}",                     "{\"env\":\"0\"}",
         "{\"env\":0,\"env\":1}", "{\"env\":0,\"e\\u006ev\":0}", "{\"env\":0,\"pay_sig\":\"x\"}", "{\"env\":0,\"signature\":\"x\"}", "{\"env\":0,\"access_token\":\"x\"}",
-    }) |body| try std.testing.expectError(error.InvalidRequest, requestEnv(body));
+    }) |body| try std.testing.expectError(error.InvalidRequest, requestEnv(pool, body));
 }

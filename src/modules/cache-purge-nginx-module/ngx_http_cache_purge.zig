@@ -1,5 +1,4 @@
 const std = @import("std");
-const posix = std.posix;
 const ngx = @import("ngx");
 
 const core = ngx.core;
@@ -290,25 +289,6 @@ fn purge_matching_tags(store: [*c]cache_tags_store, target: []const u8, mode: Ma
     return total;
 }
 
-fn cidr_contains(input_addr: std.Io.net.IpAddress, cidr: core.ngx_cidr_t) bool {
-    return switch (input_addr) {
-        .ip4 => |ip4| blk: {
-            if (cidr.family != posix.AF.INET) break :blk false;
-            const input_bits: u32 = @bitCast(ip4.bytes);
-            break :blk (input_bits & cidr.u.in.mask) == cidr.u.in.addr;
-        },
-        .ip6 => |ip6| blk: {
-            if (cidr.family != posix.AF.INET6) break :blk false;
-            const cidr_addr = cidr.u.in6.addr.__in6_u.__u6_addr8[0..];
-            const cidr_mask = cidr.u.in6.mask.__in6_u.__u6_addr8[0..];
-            for (0..16) |i| {
-                if ((ip6.bytes[i] & cidr_mask[i]) != cidr_addr[i]) break :blk false;
-            }
-            break :blk true;
-        },
-    };
-}
-
 fn request_matches_allowlist(r: [*c]ngx_http_request_t, lccf: *cache_purge_loc_conf) bool {
     if (!lccf.allowlist_entries.inited() or lccf.allowlist_entries.size() == 0) return false;
     if (r.*.connection == core.nullptr(core.ngx_connection_t)) return false;
@@ -317,7 +297,7 @@ fn request_matches_allowlist(r: [*c]ngx_http_request_t, lccf: *cache_purge_loc_c
     if (addr_text.len == 0 or addr_text.data == null) return false;
 
     const remote_addr = core.slicify(u8, addr_text.data, addr_text.len);
-    const input_addr = std.Io.net.IpAddress.parse(remote_addr, 0) catch return false;
+    const input_addr = core.IpAddress.parse(remote_addr) orelse return false;
 
     var it = lccf.allowlist_entries.iterator();
     while (it.next()) |entry| {
@@ -325,7 +305,7 @@ fn request_matches_allowlist(r: [*c]ngx_http_request_t, lccf: *cache_purge_loc_c
         var cidr = std.mem.zeroes(core.ngx_cidr_t);
         const rc = core.ngx_ptocidr(&cidr_text, &cidr);
         if (rc != NGX_OK and rc != NGX_DONE) continue;
-        if (cidr_contains(input_addr, cidr)) return true;
+        if (input_addr.inCidr(cidr)) return true;
     }
 
     return false;

@@ -91,6 +91,7 @@ pub extern fn cJSON_Parse(value: [*c]const u8, alloc: [*c]Allocator) [*c]cJSON;
 pub extern fn cJSON_ParseWithLength(value: [*c]const u8, buffer_length: usize, alloc: [*c]Allocator) [*c]cJSON;
 pub extern fn cJSON_ParseWithOpts(value: [*c]const u8, return_parse_end: [*c][*c]const u8, require_null_terminated: cJSON_bool, alloc: [*c]Allocator) [*c]cJSON;
 pub extern fn cJSON_ParseWithLengthOpts(value: [*c]const u8, buffer_length: usize, return_parse_end: [*c][*c]const u8, require_null_terminated: cJSON_bool, alloc: [*c]Allocator) [*c]cJSON;
+pub extern fn cJSON_ParseStrict(value: [*c]const u8, length: usize, alloc: [*c]Allocator) [*c]cJSON;
 pub extern fn cJSON_Print(item: [*c]const cJSON, alloc: [*c]Allocator) [*c]u8;
 pub extern fn cJSON_PrintUnformatted(item: [*c]const cJSON, alloc: [*c]Allocator) [*c]u8;
 pub extern fn cJSON_PrintBuffered(item: [*c]const cJSON, prebuffer: c_int, fmt: cJSON_bool, alloc: [*c]Allocator) [*c]u8;

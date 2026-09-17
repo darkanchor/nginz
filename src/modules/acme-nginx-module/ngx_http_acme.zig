@@ -1,5 +1,6 @@
 const std = @import("std");
 const ngx = @import("ngx");
+const file = ngx.file;
 
 const core = ngx.core;
 const conf = ngx.conf;
@@ -163,11 +164,7 @@ pub fn base64url_decode(pool: [*c]ngx_pool_t, input: ngx_str_t) ?ngx_str_t {
 // SHA256 hashing
 // ============================================================================
 
-pub fn sha256_hash(input: []const u8) [32]u8 {
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(input, &hash, .{});
-    return hash;
-}
+pub const sha256_hash = ssl.sha256;
 
 // ============================================================================
 // JWK Thumbprint (RFC 7638)
@@ -204,7 +201,7 @@ pub fn compute_jwk_thumbprint(pool: [*c]ngx_pool_t, e: []const u8, n: []const u8
     @memcpy(json_buf[pos .. pos + suffix.len], suffix);
 
     // SHA256 hash the JSON
-    const hash = sha256_hash(core.slicify(u8, json_buf, json_len));
+    const hash = sha256_hash(core.slicify(u8, json_buf, json_len)) catch return null;
 
     // Base64url encode the hash
     return base64url_encode(pool, &hash);
@@ -799,39 +796,26 @@ pub const AcmeStorage = struct {
 
     storage_path: []const u8,
 
-    fn localIo() std.Io {
-        return std.Io.Threaded.global_single_threaded.io();
-    }
-
     pub fn init(path: []const u8) Self {
         return Self{ .storage_path = path };
     }
 
     /// Ensure storage directories exist
     pub fn ensureDirectories(self: *Self) !void {
-        const io = localIo();
-
         // Create base directory
-        std.Io.Dir.cwd().createDirPath(io, self.storage_path) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
+        try file.createDirPath(self.storage_path);
 
         // Create certs subdirectory
         var path_buf: [512]u8 = undefined;
         const certs_path = std.fmt.bufPrint(&path_buf, "{s}/certs", .{self.storage_path}) catch return error.PathTooLong;
-        std.Io.Dir.cwd().createDirPath(io, certs_path) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
+        try file.createDirPath(certs_path);
     }
 
     /// Ensure domain directory exists
     pub fn ensureDomainDir(self: *Self, domain: []const u8) !void {
-        const io = localIo();
         var path_buf: [512]u8 = undefined;
         const domain_path = std.fmt.bufPrint(&path_buf, "{s}/certs/{s}", .{ self.storage_path, domain }) catch return error.PathTooLong;
-        std.Io.Dir.cwd().createDirPath(io, domain_path) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
+        try file.createDirPath(domain_path);
     }
 
     // ---- Account Key ----
@@ -840,47 +824,23 @@ pub const AcmeStorage = struct {
         return std.fmt.bufPrint(buf, "{s}/account.key", .{self.storage_path}) catch return error.PathTooLong;
     }
 
-    fn writeFileAtomic(path: []const u8, pem: []const u8, mode: std.posix.mode_t) !void {
-        const io = localIo();
-        var tmp_buf: [1024]u8 = undefined;
-        const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return error.PathTooLong;
-
-        var file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .permissions = .fromMode(mode) });
-        defer file.close(io);
-        try file.writeStreamingAll(io, pem);
-
-        var old_z: [1024]u8 = undefined;
-        @memcpy(old_z[0..tmp_path.len], tmp_path);
-        old_z[tmp_path.len] = 0;
-        var new_z: [1024]u8 = undefined;
-        @memcpy(new_z[0..path.len], path);
-        new_z[path.len] = 0;
-
-        if (std.c.rename(@ptrCast(&old_z[0]), @ptrCast(&new_z[0])) != 0) {
-            return error.RenameFailed;
-        }
-    }
-
     pub fn saveAccountKey(self: *Self, pem: []const u8) !void {
         var path_buf: [512]u8 = undefined;
         const path = try self.accountKeyPath(&path_buf);
-        try writeFileAtomic(path, pem, 0o600);
+        try file.writeFileAtomic(path, pem, 0o600);
     }
 
     pub fn loadAccountKey(self: *Self, buf: []u8) ![]const u8 {
-        const io = localIo();
         var path_buf: [512]u8 = undefined;
         const path = try self.accountKeyPath(&path_buf);
 
-        return std.Io.Dir.cwd().readFile(io, path, buf) catch return error.AccountKeyNotFound;
+        return file.readFile(path, buf) catch return error.AccountKeyNotFound;
     }
 
     pub fn accountKeyExists(self: *Self) bool {
-        const io = localIo();
         var path_buf: [512]u8 = undefined;
         const path = self.accountKeyPath(&path_buf) catch return false;
-        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-        return true;
+        return file.exists(path);
     }
 
     // ---- Domain Key ----
@@ -893,23 +853,20 @@ pub const AcmeStorage = struct {
         try self.ensureDomainDir(domain);
         var path_buf: [512]u8 = undefined;
         const path = try self.domainKeyPath(domain, &path_buf);
-        try writeFileAtomic(path, pem, 0o600);
+        try file.writeFileAtomic(path, pem, 0o600);
     }
 
     pub fn loadDomainKey(self: *Self, domain: []const u8, buf: []u8) ![]const u8 {
-        const io = localIo();
         var path_buf: [512]u8 = undefined;
         const path = try self.domainKeyPath(domain, &path_buf);
 
-        return std.Io.Dir.cwd().readFile(io, path, buf) catch return error.DomainKeyNotFound;
+        return file.readFile(path, buf) catch return error.DomainKeyNotFound;
     }
 
     pub fn domainKeyExists(self: *Self, domain: []const u8) bool {
-        const io = localIo();
         var path_buf: [512]u8 = undefined;
         const path = self.domainKeyPath(domain, &path_buf) catch return false;
-        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-        return true;
+        return file.exists(path);
     }
 
     // ---- Certificate ----
@@ -922,39 +879,32 @@ pub const AcmeStorage = struct {
         try self.ensureDomainDir(domain);
         var path_buf: [512]u8 = undefined;
         const path = try self.certPath(domain, &path_buf);
-        try writeFileAtomic(path, pem, 0o644);
+        try file.writeFileAtomic(path, pem, 0o644);
     }
 
     pub fn loadCertificate(self: *Self, domain: []const u8, buf: []u8) ![]const u8 {
-        const io = localIo();
         var path_buf: [512]u8 = undefined;
         const path = try self.certPath(domain, &path_buf);
 
-        return std.Io.Dir.cwd().readFile(io, path, buf) catch return error.CertNotFound;
+        return file.readFile(path, buf) catch return error.CertNotFound;
     }
 
     pub fn certExists(self: *Self, domain: []const u8) bool {
-        const io = localIo();
         var path_buf: [512]u8 = undefined;
         const path = self.certPath(domain, &path_buf) catch return false;
-        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-        return true;
+        return file.exists(path);
     }
 
     /// Remove all storage for a domain
     pub fn removeDomain(self: *Self, domain: []const u8) !void {
-        const io = localIo();
         var path_buf: [512]u8 = undefined;
         const domain_path = std.fmt.bufPrint(&path_buf, "{s}/certs/{s}", .{ self.storage_path, domain }) catch return error.PathTooLong;
-        std.Io.Dir.cwd().deleteTree(io, domain_path) catch |err| {
-            if (err != error.FileNotFound) return err;
-        };
+        try file.removeTree(domain_path);
     }
 
     /// Clean up entire storage (for testing)
     pub fn removeAll(self: *Self) void {
-        const io = localIo();
-        std.Io.Dir.cwd().deleteTree(io, self.storage_path) catch {};
+        file.removeTree(self.storage_path) catch {};
     }
 };
 
@@ -3429,13 +3379,13 @@ test "base64url decode" {
 
 test "sha256 hash" {
     // Test vector: SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-    const hash_empty = sha256_hash("");
+    const hash_empty = try sha256_hash("");
     try std.testing.expectEqual(hash_empty[0], 0xe3);
     try std.testing.expectEqual(hash_empty[1], 0xb0);
     try std.testing.expectEqual(hash_empty[31], 0x55);
 
     // Test vector: SHA256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-    const hash_abc = sha256_hash("abc");
+    const hash_abc = try sha256_hash("abc");
     try std.testing.expectEqual(hash_abc[0], 0xba);
     try std.testing.expectEqual(hash_abc[1], 0x78);
     try std.testing.expectEqual(hash_abc[31], 0xad);
@@ -3873,21 +3823,16 @@ test "CSR with different domain" {
 test "AcmeStorage directory creation" {
     const test_path = "/tmp/acme-test-storage";
     var storage = AcmeStorage.init(test_path);
-    const io = std.Io.Threaded.global_single_threaded.io();
     defer storage.removeAll();
 
     // Create directories
     try storage.ensureDirectories();
 
     // Verify base dir exists
-    std.Io.Dir.cwd().access(io, test_path, .{}) catch {
-        return error.TestFailed;
-    };
+    try std.testing.expect(file.exists(test_path));
 
     // Verify certs dir exists
-    std.Io.Dir.cwd().access(io, test_path ++ "/certs", .{}) catch {
-        return error.TestFailed;
-    };
+    try std.testing.expect(file.exists(test_path ++ "/certs"));
 }
 
 test "AcmeStorage account key save/load" {

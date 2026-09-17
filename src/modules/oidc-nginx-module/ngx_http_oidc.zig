@@ -105,9 +105,7 @@ const X509_V_OK_C: c_long = 0;
 fn timingSafeTokenEql(a: []const u8, b: []const u8) bool {
     const token_hex_len = STATE_SIZE * 2;
     if (a.len != token_hex_len or b.len != token_hex_len) return false;
-    const a_fixed: *const [token_hex_len]u8 = @ptrCast(a.ptr);
-    const b_fixed: *const [token_hex_len]u8 = @ptrCast(b.ptr);
-    return std.crypto.timing_safe.eql([token_hex_len]u8, a_fixed.*, b_fixed.*);
+    return ssl.timingSafeEql(a, b);
 }
 
 // Headers to pass through from upstream
@@ -133,7 +131,7 @@ fn oidcLastError() []const u8 {
     return oidc_last_error_buf[0..oidc_last_error_len];
 }
 
-fn extractHttpResponseBody(response: []const u8) ?[]u8 {
+fn extractHttpResponseBody(response: []u8) ?[]u8 {
     const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse {
         setOidcLastError("missing response header terminator");
         return null;
@@ -147,10 +145,11 @@ fn extractHttpResponseBody(response: []const u8) ?[]u8 {
         setOidcLastError("non-200 response");
         return null;
     }
-    return std.heap.c_allocator.dupe(u8, response[header_end + 4 ..]) catch null;
+    return response[header_end + 4 ..];
 }
 
-fn fetchHttpsBody(fd: c_int, host: []const u8, request: []const u8) ?[]u8 {
+fn fetchHttpsBody(pool: [*c]ngx_pool_t, fd: c_int, host: []const u8, request: []const u8) ?[]u8 {
+    const allocator = core.poolAllocator(pool);
     const ctx = SSL_CTX_new(TLS_client_method()) orelse return null;
     defer SSL_CTX_free(ctx);
     if (SSL_CTX_set_default_verify_paths(ctx) != 1) return null;
@@ -160,8 +159,8 @@ fn fetchHttpsBody(fd: c_int, host: []const u8, request: []const u8) ?[]u8 {
     defer SSL_free(conn);
     if (SSL_set_fd(conn, fd) != 1) return null;
 
-    const host_z = std.heap.c_allocator.dupeZ(u8, host) catch return null;
-    defer std.heap.c_allocator.free(host_z);
+    const host_z = allocator.dupeZ(u8, host) catch return null;
+    defer allocator.free(host_z);
     if (SSL_ctrl(conn, SSL_CTRL_SET_TLSEXT_HOSTNAME_C, TLSEXT_NAMETYPE_HOST_NAME_C, host_z.ptr) != 1) return null;
     if (SSL_set1_host(conn, host_z.ptr) != 1) return null;
     if (SSL_connect(conn) != 1 or SSL_get_verify_result(conn) != X509_V_OK_C) {
@@ -177,8 +176,8 @@ fn fetchHttpsBody(fd: c_int, host: []const u8, request: []const u8) ?[]u8 {
         sent += @intCast(wrote);
     }
 
-    var response = std.ArrayList(u8).initCapacity(std.heap.c_allocator, 4096) catch return null;
-    defer response.deinit(std.heap.c_allocator);
+    var response = std.ArrayList(u8).initCapacity(allocator, 4096) catch return null;
+    // The response buffer is owned by the request pool and backs the returned body.
     var chunk: [4096]u8 = undefined;
     while (true) {
         const n = SSL_read(conn, &chunk, chunk.len);
@@ -187,7 +186,7 @@ fn fetchHttpsBody(fd: c_int, host: []const u8, request: []const u8) ?[]u8 {
             setOidcLastError("metadata response too large");
             return null;
         }
-        response.appendSlice(std.heap.c_allocator, chunk[0..@intCast(n)]) catch return null;
+        response.appendSlice(allocator, chunk[0..@intCast(n)]) catch return null;
     }
     return extractHttpResponseBody(response.items);
 }
@@ -216,7 +215,9 @@ const oidc_loc_conf = extern struct {
     authorization_endpoint: ngx_str_t,
     token_endpoint: ngx_str_t,
     jwks_uri: ngx_str_t,
-    metadata_owned: ngx_flag_t,
+    config_pool: [*c]ngx_pool_t,
+    metadata_pool: [*c]ngx_pool_t,
+    jwks_pool: [*c]ngx_pool_t,
     discovery_loaded_at: i64,
     jwks_loaded_at: i64,
     jwks_keys: [MAX_JWKS_KEYS]oidc_jwks_key,
@@ -450,55 +451,41 @@ fn appendJsonEscaped(out: []u8, offset: *usize, value: []const u8) bool {
     return true;
 }
 
-fn allocPersistentBytes(bytes: []const u8) ?[*]u8 {
-    const duped = std.heap.c_allocator.dupe(u8, bytes) catch return null;
-    return duped.ptr;
-}
-
-fn allocPersistentNgxStr(bytes: []const u8) ?ngx_str_t {
+fn poolString(pool: [*c]ngx_pool_t, bytes: []const u8) ?ngx_str_t {
     if (bytes.len == 0) return ngx_null_str;
-    const duped = std.heap.c_allocator.dupe(u8, bytes) catch return null;
-    return ngx_str_t{ .len = duped.len, .data = duped.ptr };
-}
-
-fn freePersistentNgxStr(str: *ngx_str_t) void {
-    if (str.*.len == 0 or str.*.data == core.nullptr(u8)) {
-        str.* = ngx_null_str;
-        return;
-    }
-
-    std.heap.c_allocator.free(str.*.data[0..str.*.len]);
-    str.* = ngx_null_str;
+    const copied = core.poolAllocator(pool).dupe(u8, bytes) catch return null;
+    return ngx_str_t{ .len = copied.len, .data = copied.ptr };
 }
 
 fn clearOwnedMetadata(lccf: *oidc_loc_conf) void {
-    if (lccf.metadata_owned == 1) {
-        freePersistentNgxStr(&lccf.issuer);
-        freePersistentNgxStr(&lccf.authorization_endpoint);
-        freePersistentNgxStr(&lccf.token_endpoint);
-        freePersistentNgxStr(&lccf.jwks_uri);
-    }
-
-    lccf.metadata_owned = 0;
+    if (lccf.metadata_pool != null) core.ngx_destroy_pool(lccf.metadata_pool);
+    lccf.metadata_pool = null;
+    lccf.issuer = ngx_null_str;
+    lccf.authorization_endpoint = ngx_null_str;
+    lccf.token_endpoint = ngx_null_str;
+    lccf.jwks_uri = ngx_null_str;
     lccf.discovery_loaded_at = 0;
 }
 
 fn clearJwksCache(lccf: *oidc_loc_conf) void {
-    var idx: usize = 0;
-    while (idx < lccf.jwks_key_count and idx < MAX_JWKS_KEYS) : (idx += 1) {
-        freePersistentNgxStr(&lccf.jwks_keys[idx].kid);
-        freePersistentNgxStr(&lccf.jwks_keys[idx].n);
-        freePersistentNgxStr(&lccf.jwks_keys[idx].e);
-    }
-
+    if (lccf.jwks_pool != null) core.ngx_destroy_pool(lccf.jwks_pool);
+    lccf.jwks_pool = null;
+    lccf.jwks_keys = std.mem.zeroes(@TypeOf(lccf.jwks_keys));
     lccf.jwks_key_count = 0;
     lccf.jwks_loaded_at = 0;
 }
 
-fn fetchUrlBody(url: []const u8) ?[]u8 {
+fn cleanupMetadata(data: ?*anyopaque) callconv(.c) void {
+    const lccf: *oidc_loc_conf = @ptrCast(@alignCast(data orelse return));
+    clearJwksCache(lccf);
+    clearOwnedMetadata(lccf);
+}
+
+fn fetchUrlBody(pool: [*c]ngx_pool_t, url: []const u8) ?[]u8 {
+    const allocator = core.poolAllocator(pool);
     if (std.mem.indexOf(u8, url, "://") == null) {
-        const path_z = std.heap.c_allocator.dupeZ(u8, url) catch return null;
-        defer std.heap.c_allocator.free(path_z);
+        const path_z = allocator.dupeZ(u8, url) catch return null;
+        defer allocator.free(path_z);
 
         const mode = "rb";
         const file = fopen(path_z.ptr, mode) orelse {
@@ -512,8 +499,8 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
             return null;
         }
         const size = ftell(file);
-        if (size < 0) {
-            setOidcLastError("ftell failed");
+        if (size < 0 or size > MAX_METADATA_RESPONSE_SIZE) {
+            setOidcLastError("invalid metadata file size");
             return null;
         }
         if (fseek(file, 0, 0) != 0) {
@@ -521,8 +508,7 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
             return null;
         }
 
-        const body = std.heap.c_allocator.alloc(u8, @intCast(size)) catch return null;
-        errdefer std.heap.c_allocator.free(body);
+        const body = allocator.alloc(u8, @intCast(size)) catch return null;
         const read_n = fread(body.ptr, 1, body.len, file);
         if (read_n != body.len) {
             setOidcLastError("fread short read");
@@ -535,13 +521,13 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
 
     const host_slice = core.slicify(u8, parsed_host.host.data, parsed_host.host.len);
     const path_slice = core.slicify(u8, parsed_host.path.data, parsed_host.path.len);
-    const host_z = std.heap.c_allocator.dupeZ(u8, host_slice) catch return null;
-    defer std.heap.c_allocator.free(host_z);
+    const host_z = allocator.dupeZ(u8, host_slice) catch return null;
+    defer allocator.free(host_z);
 
     var port_buf: [16]u8 = undefined;
     const port_slice = std.fmt.bufPrint(&port_buf, "{d}", .{parsed_host.port}) catch return null;
-    const port_z = std.heap.c_allocator.dupeZ(u8, port_slice) catch return null;
-    defer std.heap.c_allocator.free(port_z);
+    const port_z = allocator.dupeZ(u8, port_slice) catch return null;
+    defer allocator.free(port_z);
 
     var hints: std.posix.addrinfo = .{
         .flags = .{ .NUMERICSERV = true },
@@ -575,10 +561,10 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
     }
     defer _ = close(fd);
 
-    const request = std.fmt.allocPrint(std.heap.c_allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\nConnection: close\r\n\r\n", .{ path_slice, host_slice }) catch return null;
-    defer std.heap.c_allocator.free(request);
+    const request = std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: application/json\r\nConnection: close\r\n\r\n", .{ path_slice, host_slice }) catch return null;
+    defer allocator.free(request);
 
-    if (parsed_host.ssl) return fetchHttpsBody(fd, host_slice, request);
+    if (parsed_host.ssl) return fetchHttpsBody(pool, fd, host_slice, request);
 
     var sent: usize = 0;
     while (sent < request.len) {
@@ -590,8 +576,8 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
         sent += @intCast(wrote);
     }
 
-    var response = std.ArrayList(u8).initCapacity(std.heap.c_allocator, 4096) catch return null;
-    defer response.deinit(std.heap.c_allocator);
+    var response = std.ArrayList(u8).initCapacity(allocator, 4096) catch return null;
+    // The response buffer is owned by the request pool and backs the returned body.
 
     var chunk: [4096]u8 = undefined;
     while (true) {
@@ -605,7 +591,7 @@ fn fetchUrlBody(url: []const u8) ?[]u8 {
             setOidcLastError("metadata response too large");
             return null;
         }
-        response.appendSlice(std.heap.c_allocator, chunk[0..@intCast(n)]) catch return null;
+        response.appendSlice(allocator, chunk[0..@intCast(n)]) catch return null;
     }
     return extractHttpResponseBody(response.items);
 }
@@ -616,7 +602,7 @@ fn endpointTransportAllowed(value: []const u8, allow_insecure_http: bool) bool {
     return allow_insecure_http and std.mem.startsWith(u8, value, "http://");
 }
 
-fn loadDiscoveryMetadata(lccf: *oidc_loc_conf, force_refresh: bool) bool {
+fn loadDiscoveryMetadata(pool: [*c]ngx_pool_t, lccf: *oidc_loc_conf, force_refresh: bool) bool {
     if (lccf.discovery_url.len == 0) return false;
 
     const now = time(null);
@@ -636,62 +622,65 @@ fn loadDiscoveryMetadata(lccf: *oidc_loc_conf, force_refresh: bool) bool {
         setOidcLastError("insecure discovery transport is disabled");
         return false;
     }
-    const body = fetchUrlBody(discovery_url) orelse return false;
-    defer std.heap.c_allocator.free(body);
+    const body = fetchUrlBody(pool, discovery_url) orelse return false;
 
-    const DiscoveryDoc = struct {
-        issuer: []const u8,
-        authorization_endpoint: []const u8,
-        token_endpoint: []const u8,
-        jwks_uri: []const u8,
-    };
+    return updateDiscoveryMetadata(pool, lccf, body, now);
+}
 
-    const parsed = std.json.parseFromSlice(DiscoveryDoc, std.heap.c_allocator, body, .{ .ignore_unknown_fields = true }) catch {
+fn jsonStringField(object: [*c]cjson.cJSON, name: [:0]const u8) ?[]const u8 {
+    const value = CJSON.stringValue(cjson.cJSON_GetObjectItemCaseSensitive(object, name.ptr)) orelse return null;
+    return value.data[0..value.len];
+}
+
+fn updateDiscoveryMetadata(pool: [*c]ngx_pool_t, lccf: *oidc_loc_conf, body: []const u8, now: i64) bool {
+    var cj = CJSON.init(pool);
+    const doc = cj.decodeStrict(ngx_string(body)) catch {
         setOidcLastError("discovery json parse failed");
         return false;
     };
-    defer parsed.deinit();
-
-    if (parsed.value.issuer.len == 0 or
-        parsed.value.authorization_endpoint.len == 0 or
-        parsed.value.token_endpoint.len == 0 or
-        parsed.value.jwks_uri.len == 0)
-    {
-        setOidcLastError("discovery missing required fields");
+    if (CJSON.objValue(doc) == null) {
+        setOidcLastError("discovery json parse failed");
         return false;
     }
-
-    if (!endpointTransportAllowed(parsed.value.authorization_endpoint, lccf.allow_insecure_http == 1) or
-        !endpointTransportAllowed(parsed.value.token_endpoint, lccf.allow_insecure_http == 1) or
-        !endpointTransportAllowed(parsed.value.jwks_uri, lccf.allow_insecure_http == 1))
-    {
-        setOidcLastError("insecure OIDC metadata endpoint is disabled");
-        return false;
+    const fields = [_][:0]const u8{ "issuer", "authorization_endpoint", "token_endpoint", "jwks_uri" };
+    var values: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |field, i| {
+        values[i] = jsonStringField(doc, field) orelse {
+            setOidcLastError("discovery missing required fields");
+            return false;
+        };
+        if (values[i].len == 0) {
+            setOidcLastError("discovery missing required fields");
+            return false;
+        }
+        if (i > 0 and !endpointTransportAllowed(values[i], lccf.allow_insecure_http == 1)) {
+            setOidcLastError("insecure OIDC metadata endpoint is disabled");
+            return false;
+        }
     }
 
-    var issuer = allocPersistentNgxStr(parsed.value.issuer) orelse return false;
-    errdefer freePersistentNgxStr(&issuer);
-    var authorization_endpoint = allocPersistentNgxStr(parsed.value.authorization_endpoint) orelse return false;
-    errdefer freePersistentNgxStr(&authorization_endpoint);
-    var token_endpoint = allocPersistentNgxStr(parsed.value.token_endpoint) orelse return false;
-    errdefer freePersistentNgxStr(&token_endpoint);
-    var jwks_uri = allocPersistentNgxStr(parsed.value.jwks_uri) orelse return false;
-    errdefer freePersistentNgxStr(&jwks_uri);
+    // Build the replacement in its own pool; retain the old cache on failure.
+    const cache_pool = core.ngx_create_pool(PAGE_SIZE, lccf.config_pool.*.log) orelse return false;
+    var committed = false;
+    defer if (!committed) core.ngx_destroy_pool(cache_pool);
+    var owned: [fields.len]ngx_str_t = undefined;
+    for (values, &owned) |value, *dest| dest.* = poolString(cache_pool, value) orelse return false;
 
     clearOwnedMetadata(lccf);
     clearJwksCache(lccf);
 
-    lccf.issuer = issuer;
-    lccf.authorization_endpoint = authorization_endpoint;
-    lccf.token_endpoint = token_endpoint;
-    lccf.jwks_uri = jwks_uri;
-    lccf.metadata_owned = 1;
+    lccf.issuer = owned[0];
+    lccf.authorization_endpoint = owned[1];
+    lccf.token_endpoint = owned[2];
+    lccf.jwks_uri = owned[3];
+    committed = true;
+    lccf.metadata_pool = cache_pool;
     lccf.discovery_loaded_at = now;
     return true;
 }
 
-fn loadJwksKeys(lccf: *oidc_loc_conf, force_refresh: bool) bool {
-    if (lccf.jwks_uri.len == 0 and !loadDiscoveryMetadata(lccf, force_refresh)) {
+fn loadJwksKeys(pool: [*c]ngx_pool_t, lccf: *oidc_loc_conf, force_refresh: bool) bool {
+    if (lccf.jwks_uri.len == 0 and !loadDiscoveryMetadata(pool, lccf, force_refresh)) {
         return false;
     }
 
@@ -705,58 +694,68 @@ fn loadJwksKeys(lccf: *oidc_loc_conf, force_refresh: bool) bool {
     }
 
     const jwks_uri = core.slicify(u8, lccf.jwks_uri.data, lccf.jwks_uri.len);
-    const body = fetchUrlBody(jwks_uri) orelse return false;
-    defer std.heap.c_allocator.free(body);
+    const body = fetchUrlBody(pool, jwks_uri) orelse return false;
 
-    const JwkDoc = struct {
-        keys: []const struct {
-            kty: []const u8 = "",
-            kid: ?[]const u8 = null,
-            alg: ?[]const u8 = null,
-            use: ?[]const u8 = null,
-            n: ?[]const u8 = null,
-            e: ?[]const u8 = null,
-        },
-    };
+    return updateJwksKeys(pool, lccf, body, now);
+}
 
-    const parsed = std.json.parseFromSlice(JwkDoc, std.heap.c_allocator, body, .{ .ignore_unknown_fields = true }) catch return false;
-    defer parsed.deinit();
+fn updateJwksKeys(pool: [*c]ngx_pool_t, lccf: *oidc_loc_conf, body: []const u8, now: i64) bool {
+    var cj = CJSON.init(pool);
+    const doc = cj.decodeStrict(ngx_string(body)) catch return false;
+    if (CJSON.objValue(doc) == null) return false;
+    const keys = CJSON.arrValue(cjson.cJSON_GetObjectItemCaseSensitive(doc, "keys")) orelse return false;
 
-    clearJwksCache(lccf);
+    // Validate types before replacing the cache, including keys we won't use.
+    var it = CJSON.Iterator.init(keys);
+    while (it.next()) |key| {
+        if (CJSON.objValue(key) == null) return false;
+        const kty = cjson.cJSON_GetObjectItemCaseSensitive(key, "kty");
+        if (kty != null and CJSON.stringValue(kty) == null) return false;
+        for ([_][:0]const u8{ "kid", "alg", "use", "n", "e" }) |name| {
+            const field = cjson.cJSON_GetObjectItemCaseSensitive(key, name.ptr);
+            if (field != null and cjson.cJSON_IsNull(field) != 1 and CJSON.stringValue(field) == null) return false;
+        }
+    }
+    const cache_pool = core.ngx_create_pool(PAGE_SIZE, lccf.config_pool.*.log) orelse return false;
+    var committed = false;
+    defer if (!committed) core.ngx_destroy_pool(cache_pool);
+    var cached = std.mem.zeroes([MAX_JWKS_KEYS]oidc_jwks_key);
+    var count: usize = 0;
 
-    for (parsed.value.keys) |key| {
-        if (lccf.jwks_key_count >= MAX_JWKS_KEYS) break;
-        const kid = key.kid orelse continue;
-        const n = key.n orelse continue;
-        const e = key.e orelse continue;
-        if (!std.mem.eql(u8, key.kty, "RSA")) continue;
-        if (key.alg) |alg| {
+    it = CJSON.Iterator.init(keys);
+    while (it.next()) |key| {
+        if (count >= MAX_JWKS_KEYS) break;
+        const kid = jsonStringField(key, "kid") orelse continue;
+        const n = jsonStringField(key, "n") orelse continue;
+        const e = jsonStringField(key, "e") orelse continue;
+        const kty = jsonStringField(key, "kty") orelse continue;
+        if (!std.mem.eql(u8, kty, "RSA")) continue;
+        if (jsonStringField(key, "alg")) |alg| {
             if (!std.mem.eql(u8, alg, "RS256")) continue;
         }
-        if (key.use) |use| {
+        if (jsonStringField(key, "use")) |use| {
             if (!std.mem.eql(u8, use, "sig")) continue;
         }
 
-        const idx = lccf.jwks_key_count;
-        lccf.jwks_keys[idx].kid = allocPersistentNgxStr(kid) orelse continue;
-        lccf.jwks_keys[idx].n = allocPersistentNgxStr(n) orelse {
-            freePersistentNgxStr(&lccf.jwks_keys[idx].kid);
-            continue;
+        cached[count] = .{
+            .kid = poolString(cache_pool, kid) orelse return false,
+            .n = poolString(cache_pool, n) orelse return false,
+            .e = poolString(cache_pool, e) orelse return false,
         };
-        lccf.jwks_keys[idx].e = allocPersistentNgxStr(e) orelse {
-            freePersistentNgxStr(&lccf.jwks_keys[idx].kid);
-            freePersistentNgxStr(&lccf.jwks_keys[idx].n);
-            continue;
-        };
-        lccf.jwks_key_count += 1;
+        count += 1;
     }
 
+    clearJwksCache(lccf);
+    lccf.jwks_pool = cache_pool;
+    lccf.jwks_keys = cached;
+    lccf.jwks_key_count = count;
+    committed = true;
     lccf.jwks_loaded_at = now;
     return lccf.jwks_key_count > 0;
 }
 
-fn findJwksKey(lccf: *oidc_loc_conf, kid: []const u8, allow_refresh: bool) ?*oidc_jwks_key {
-    if (!loadJwksKeys(lccf, false)) return null;
+fn findJwksKey(pool: [*c]ngx_pool_t, lccf: *oidc_loc_conf, kid: []const u8, allow_refresh: bool) ?*oidc_jwks_key {
+    if (!loadJwksKeys(pool, lccf, false)) return null;
 
     var idx: usize = 0;
     while (idx < lccf.jwks_key_count) : (idx += 1) {
@@ -764,7 +763,7 @@ fn findJwksKey(lccf: *oidc_loc_conf, kid: []const u8, allow_refresh: bool) ?*oid
         if (std.mem.eql(u8, cached_kid, kid)) return &lccf.jwks_keys[idx];
     }
 
-    if (!allow_refresh or !loadJwksKeys(lccf, true)) return null;
+    if (!allow_refresh or !loadJwksKeys(pool, lccf, true)) return null;
 
     idx = 0;
     while (idx < lccf.jwks_key_count) : (idx += 1) {
@@ -1022,9 +1021,7 @@ fn checkSession(r: [*c]ngx_http_request_t, lccf: *oidc_loc_conf, rctx: *oidc_req
 // ============================================================================
 
 fn generateCodeChallenge(pool: [*c]ngx_pool_t, code_verifier: []const u8) ?ngx_str_t {
-    // SHA256 hash of code_verifier using Zig's std.crypto
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(code_verifier, &hash, .{});
+    const hash = ssl.sha256(code_verifier) catch return null;
 
     // Base64url encode
     return base64urlEncode(pool, &hash);
@@ -1034,12 +1031,12 @@ fn generateCodeChallenge(pool: [*c]ngx_pool_t, code_verifier: []const u8) ?ngx_s
 // Authorization Redirect
 // ============================================================================
 
-fn ensureOidcMetadataReady(lccf: *oidc_loc_conf) bool {
+fn ensureOidcMetadataReady(pool: [*c]ngx_pool_t, lccf: *oidc_loc_conf) bool {
     if (lccf.discovery_url.len == 0 or lccf.client_id.len == 0 or lccf.redirect_uri.len == 0 or lccf.cookie_secret.len == 0) {
         return false;
     }
 
-    return loadDiscoveryMetadata(lccf, false);
+    return loadDiscoveryMetadata(pool, lccf, false);
 }
 
 fn sendRedirect(r: [*c]ngx_http_request_t, location: ngx_str_t) ngx_int_t {
@@ -1155,7 +1152,7 @@ fn buildAuthorizationUrl(
 }
 
 fn redirectToAuthorization(r: [*c]ngx_http_request_t, lccf: *oidc_loc_conf, rctx: *oidc_request_ctx) ngx_int_t {
-    if (!ensureOidcMetadataReady(lccf)) {
+    if (!ensureOidcMetadataReady(r.*.pool, lccf)) {
         return sendError(r, 500, "OIDC discovery metadata unavailable");
     }
 
@@ -1168,10 +1165,9 @@ fn redirectToAuthorization(r: [*c]ngx_http_request_t, lccf: *oidc_loc_conf, rctx
     var code_verifier: ?ngx_str_t = null;
 
     if (lccf.use_pkce == 1) {
-        code_verifier = generateRandomHex(r.*.pool, 32);
-        if (code_verifier) |cv| {
-            code_challenge = generateCodeChallenge(r.*.pool, core.slicify(u8, cv.data, cv.len));
-        }
+        const cv = generateRandomHex(r.*.pool, 32) orelse return NGX_ERROR;
+        code_verifier = cv;
+        code_challenge = generateCodeChallenge(r.*.pool, core.slicify(u8, cv.data, cv.len)) orelse return NGX_ERROR;
     }
 
     // Build authorization URL
@@ -1642,7 +1638,7 @@ fn process_token_response_and_setup_redirect(r: [*c]ngx_http_request_t, rctx: [*
     u.*.headers_in.status_n = NGX_HTTP_MOVED_TEMPORARILY;
     u.*.headers_in.status_line = ngx_string("302 Moved Temporarily");
     u.*.headers_in.content_length_n = 0;
- 
+
     r.*.headers_out.status = NGX_HTTP_MOVED_TEMPORARILY;
     r.*.headers_out.content_length_n = 0;
 
@@ -1852,7 +1848,7 @@ fn validateIdToken(pool: [*c]ngx_pool_t, lccf: *oidc_loc_conf, token: []const u8
     if (!std.mem.eql(u8, alg, "RS256")) return null;
 
     const kid = core.slicify(u8, header.kid.data, header.kid.len);
-    const jwk = findJwksKey(lccf, kid, true) orelse return null;
+    const jwk = findJwksKey(pool, lccf, kid, true) orelse return null;
 
     const signing_input = token[0 .. first_dot + 1 + second_dot];
     if (!verifyRs256Signature(pool, jwk, signing_input, signature_b64)) return null;
@@ -2014,7 +2010,7 @@ fn isCallbackUri(r: [*c]ngx_http_request_t, lccf: *oidc_loc_conf) bool {
 }
 
 fn handleCallback(r: [*c]ngx_http_request_t, lccf: *oidc_loc_conf, rctx: *oidc_request_ctx) ngx_int_t {
-    if (!ensureOidcMetadataReady(lccf)) {
+    if (!ensureOidcMetadataReady(r.*.pool, lccf)) {
         return sendError(r, 500, "OIDC discovery metadata unavailable");
     }
 
@@ -2179,7 +2175,7 @@ export fn ngx_http_oidc_handler(r: [*c]ngx_http_request_t) callconv(.c) ngx_int_
     rctx.*.pending_cookie_count = 0;
 
     // Validate required config and discovery-backed metadata fail-closed.
-    if (!ensureOidcMetadataReady(lccf)) {
+    if (!ensureOidcMetadataReady(r.*.pool, lccf)) {
         rctx.*.done = 1;
         return sendError(r, 500, oidcLastError());
     }
@@ -2332,7 +2328,14 @@ fn create_loc_conf(cf: [*c]ngx_conf_t) callconv(.c) ?*anyopaque {
         p.*.authorization_endpoint = ngx_null_str;
         p.*.token_endpoint = ngx_null_str;
         p.*.jwks_uri = ngx_null_str;
-        p.*.metadata_owned = 0;
+        // Read the cycle pool's logger when creating caches: nginx updates it
+        // after configuration, and it outlives individual request connections.
+        p.*.config_pool = cf.*.pool;
+        p.*.metadata_pool = null;
+        p.*.jwks_pool = null;
+        const cleanup = core.ngx_pool_cleanup_add(cf.*.pool, 0) orelse return null;
+        cleanup.*.handler = cleanupMetadata;
+        cleanup.*.data = p;
         p.*.discovery_loaded_at = 0;
         p.*.jwks_loaded_at = 0;
         p.*.jwks_key_count = 0;
@@ -2394,7 +2397,8 @@ fn merge_loc_conf(
     c.*.authorization_endpoint = ngx_null_str;
     c.*.token_endpoint = ngx_null_str;
     c.*.jwks_uri = ngx_null_str;
-    c.*.metadata_owned = 0;
+    c.*.metadata_pool = null;
+    c.*.jwks_pool = null;
     c.*.discovery_loaded_at = 0;
     c.*.jwks_loaded_at = 0;
     c.*.jwks_key_count = 0;
@@ -2625,4 +2629,67 @@ test "hexToBytes invalid" {
     var out: [4]u8 = undefined;
     try expect(!hexToBytes("zzzzzzzz", &out));
     try expect(!hexToBytes("dead", &out)); // Wrong length
+}
+
+test "discovery and JWKS parsing keep cached strings after the request pool is destroyed" {
+    const log = core.ngx_log_init(core.c_str(""), core.c_str(""));
+    const config_pool = core.ngx_create_pool(4096, log) orelse return error.OutOfMemory;
+    defer core.ngx_destroy_pool(config_pool);
+    var lc = std.mem.zeroes(oidc_loc_conf);
+    lc.config_pool = config_pool;
+    defer cleanupMetadata(&lc);
+    const metadata = "{\"issuer\":\"https://idp\",\"authorization_endpoint\":\"https://idp/auth\",\"token_endpoint\":\"https://idp/token\",\"jwks_uri\":\"https://idp/keys\",\"unknown\":true}";
+    {
+        var request_log = log.*;
+        const pool = core.ngx_create_pool(4096, &request_log) orelse return error.OutOfMemory;
+        defer core.ngx_destroy_pool(pool);
+        try std.testing.expect(updateDiscoveryMetadata(pool, &lc, metadata, 1));
+        try std.testing.expect(updateJwksKeys(pool, &lc, "{\"keys\":[{\"kty\":\"EC\"},{\"kty\":\"RSA\",\"kid\":\"key-\\u0031\",\"n\":\"AQAB\",\"e\":\"AQAB\",\"alg\":null,\"use\":\"sig\"}]}", 2));
+        try std.testing.expect(lc.metadata_pool.*.log == log);
+        try std.testing.expect(lc.jwks_pool.*.log == log);
+    }
+    try std.testing.expectEqualStrings("https://idp", lc.issuer.data[0..lc.issuer.len]);
+    try std.testing.expectEqualStrings("https://idp/keys", lc.jwks_uri.data[0..lc.jwks_uri.len]);
+    try std.testing.expectEqual(@as(usize, 1), lc.jwks_key_count);
+    try std.testing.expectEqualStrings("key-1", lc.jwks_keys[0].kid.data[0..lc.jwks_keys[0].kid.len]);
+    const pool = core.ngx_create_pool(4096, log) orelse return error.OutOfMemory;
+    defer core.ngx_destroy_pool(pool);
+    for ([_][]const u8{
+        "[]",                                                        "{}",                                                                                                                                                     metadata ++ "junk",
+        "{\"issuer\":null}",                                         "{\"issuer\":1}",                                                                                                                                         "{\"Issuer\":\"https://idp\"}",
+        "{\"issuer\":\"https://idp\",\"issuer\":\"https://other\"}", "{\"issuer\":\"https://idp\",\"authorization_endpoint\":\"http://idp/auth\",\"token_endpoint\":\"https://idp/token\",\"jwks_uri\":\"https://idp/keys\"}",
+    }) |invalid| try std.testing.expect(!updateDiscoveryMetadata(pool, &lc, invalid, 3));
+    for ([_][]const u8{
+        "[]",                "{}",                          "{\"Keys\":[]}",             "{\"keys\":null}",              "{\"keys\":{}}",                              "{\"keys\":[]}junk",
+        "{\"keys\":[null]}", "{\"keys\":[{\"kty\":null}]}", "{\"keys\":[{\"kid\":42}]}", "{\"keys\":[{\"alg\":false}]}", "{\"keys\":[{\"kid\":\"a\",\"kid\":\"b\"}]}",
+    }) |invalid| try std.testing.expect(!updateJwksKeys(pool, &lc, invalid, 3));
+    try std.testing.expectEqual(@as(i64, 1), lc.discovery_loaded_at);
+    try std.testing.expectEqual(@as(i64, 2), lc.jwks_loaded_at);
+    try std.testing.expectEqual(@as(usize, 1), lc.jwks_key_count);
+    try std.testing.expect(updateJwksKeys(pool, &lc, "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"key-2\",\"n\":\"AQAB\",\"e\":\"AQAB\"}]}", 4));
+    try std.testing.expectEqualStrings("key-2", lc.jwks_keys[0].kid.data[0..lc.jwks_keys[0].kid.len]);
+    try std.testing.expect(lc.metadata_pool != null and lc.metadata_pool != pool);
+    try std.testing.expect(lc.jwks_pool != null and lc.jwks_pool != lc.metadata_pool);
+    // A valid empty JWKS revokes all cached keys.
+    try std.testing.expect(!updateJwksKeys(pool, &lc, "{\"keys\":[]}", 5));
+    try std.testing.expectEqual(@as(usize, 0), lc.jwks_key_count);
+    try std.testing.expect(updateDiscoveryMetadata(pool, &lc, metadata, 6));
+    try std.testing.expect(lc.jwks_pool == null);
+    cleanupMetadata(&lc);
+    try std.testing.expect(lc.metadata_pool == null and lc.jwks_pool == null);
+}
+
+test "PKCE S256 challenge and fixed-length state comparison" {
+    const log = core.ngx_log_init(core.c_str(""), core.c_str(""));
+    const pool = core.ngx_create_pool(4096, log) orelse return error.OutOfMemory;
+    defer core.ngx_destroy_pool(pool);
+    // RFC 7636 Appendix B.
+    const challenge = generateCodeChallenge(pool, "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") orelse return error.SSL_ERROR;
+    try std.testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", challenge.data[0..challenge.len]);
+    const token = "a" ** 64;
+    try std.testing.expect(timingSafeTokenEql(token, token));
+    try std.testing.expect(!timingSafeTokenEql(token, "b" ++ "a" ** 63));
+    try std.testing.expect(!timingSafeTokenEql(token, "a" ** 63 ++ "b"));
+    try std.testing.expect(!timingSafeTokenEql("", ""));
+    try std.testing.expect(!timingSafeTokenEql(token, "a" ** 63));
 }

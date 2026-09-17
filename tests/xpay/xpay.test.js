@@ -97,6 +97,16 @@ describe('XPay pass-through', () => {
         expect(observed.headers.host).toBe('127.0.0.1:19001');
     });
 
+    test('accepts escaped environment keys and preserves JSON whitespace and number spellings', async () => {
+        const body = ' \t{"e\\u006ev":0,"Env":1,"data":[1.25e2,-0,1e1000],"text":"中文"}\r\n';
+        mock.post('/xpay/query_order', async (req, url) => {
+            expect(await req.text()).toBe(body);
+            expect(url.searchParams.get('pay_sig')).toBe(expectedSig(LIVE_KEY, '/xpay/query_order', body));
+            return { body: '{}' };
+        });
+        expect((await post('/xpay/query_order', body)).status).toBe(200);
+    });
+
     test('selects sandbox only at an explicitly configured sandbox location', async () => {
         const body = '{"env":1}';
         mock.post('/xpay/sandbox', (req, url) => {
@@ -152,7 +162,11 @@ describe('XPay pass-through', () => {
         }
         for (const body of ['', '{}', '[]', '{"env":0}garbage', '{"env":0.0}', '{"env":"0"}',
             '{"env":0,"env":1}', '{"env":0,"e\\u006ev":0}', '{"env":0,"pay_sig":"forged"}',
-            '{"env":0,"access_token":"forged"}', '{"env":0,"signature":"forged"}']) {
+            '{"env":0,"access_token":"forged"}', '{"env":0,"signature":"forged"}',
+            '{"env":-0}', '{"env":1e0}', '{"env":00}', '{"env":0.}',
+            '{"env":0}\0', '{"env":0}\0garbage', '{"env":0,"Env":1,"pay_\\u0073ig":"forged"}',
+            '{"env":0,"nested":{"x":1,"x":2}}', '{"env":0,"x":"raw\nnewline"}',
+            '{"env":0,"x":"\\u0000"}', '{"env":0,"x":"\\uXXXX"}', '{"env":0,"x":01}']) {
             expect((await post('/xpay/query_order', body)).status).toBe(400);
         }
         expect(mock.requestCount).toBe(0);

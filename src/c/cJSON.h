@@ -162,6 +162,9 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLength(const char *value, size_t buffer_len
 /* If you supply a ptr in return_parse_end and parsing fails, then return_parse_end will contain a pointer to the error so will match cJSON_GetErrorPtr(). */
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return_parse_end, cJSON_bool require_null_terminated, Allocator *alloc);
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer_length, const char **return_parse_end, cJSON_bool require_null_terminated, Allocator *alloc);
+/* Strict length-delimited JSON. Number spelling is retained in valuestring;
+ * decoded NULs are rejected because cJSON strings are NUL-terminated. */
+CJSON_PUBLIC(cJSON *) cJSON_ParseStrict(const char *value, size_t length, Allocator *alloc);
 
 /* Render a cJSON entity to text for transfer/storage. */
 CJSON_PUBLIC(char *) cJSON_Print(const cJSON *item, Allocator *alloc);

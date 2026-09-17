@@ -307,7 +307,9 @@ URL-encodes the private access token and attaches it with `pay_sig`. The
 forwarded body is the same immutable byte buffer that was signed, including
 whitespace and UTF-8 text. Caller cookies, Authorization, and Wechatpay headers
 are not forwarded. The body must be a valid JSON object with one integer `env`
-(`0` or `1`, not a string, decimal, or exponent). Duplicate JSON members,
+(`0` or `1`, not a string, decimal, or exponent). Parsing uses the nginx pool-backed
+cJSON wrapper; HMAC-SHA256 uses the OpenSSL wrapper. Embedded NULs (including
+`\u0000`) are rejected because cJSON strings are NUL-terminated. Duplicate JSON members,
 root-level `access_token`/`pay_sig`/`signature`, environment mismatches, and
 incoming query strings return 400. Other methods return 405.
 

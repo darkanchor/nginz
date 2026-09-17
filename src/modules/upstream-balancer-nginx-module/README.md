@@ -29,7 +29,7 @@ This module should **not** own:
 - Directives are parsed into `BalancerSrvConf` stored in `uscf->srv_conf[ctx_index]`.
 - The module wraps nginx's upstream callback chain: `init_upstream` → `init_peer` → `get_peer` / `free_peer`.
 - When sticky mode is off, behavior is identical to stock nginx round-robin.
-- When sticky mode is cookie or header, the affinity key is extracted via the nginx variable system (`cookie_<name>` / `http_<name>`), hashed with CRC32-IsoHdlc, and mapped across the eligible peer weight space to select a peer deterministically.
+- When sticky mode is cookie or header, the affinity key is extracted via the nginx variable system (`cookie_<name>` / `http_<name>`), hashed with SHA-256 (first 32 bits, big-endian), and mapped across the eligible peer weight space to select a peer deterministically.
 - Sticky selection still honors nginx peer runtime gates before a peer can be chosen: tried-bit exclusion, `max_fails` / `fail_timeout`, and `max_conns`.
 - Healthcheck integration is conservative during recovery: a peer stays out of sticky rotation until its configured slow-start window completes.
 - `upstream_balancer_fallback next`: affinity miss falls back to round-robin for that request.
@@ -148,7 +148,7 @@ Allocated from `r->pool` per request in `init_peer`:
 
 ### Affinity Contract
 
-**Hash function**: `CRC32-IsoHdlc` (`std.hash.crc.Crc32.hash(key)`) — the same algorithm as Ethernet/ZIP CRC32. The hash is mapped across the total weight of currently eligible peers, where eligible means the peer is not `down`, not already tried for this request, not over `max_conns`, not inside nginx's `max_fails` / `fail_timeout` suppression window, and not excluded by healthcheck. This contract is stable within one configuration generation.
+**Hash function**: SHA-256 through the SSL wrapper, taking the first four digest bytes as a big-endian unsigned 32-bit value. Upgrading from CRC32 changes the mapping of affinity keys to peers; direct peer cookies still identify the same peer. The hash is mapped across the total weight of currently eligible peers, where eligible means the peer is not `down`, not already tried for this request, not over `max_conns`, not inside nginx's `max_fails` / `fail_timeout` suppression window, and not excluded by healthcheck. This contract is stable within one configuration generation.
 
 - `upstream_balancer_fallback next` means fallback applies to the current request only; a retry will call the original round-robin picker.
 - `upstream_balancer_fallback off` means the module returns `NGX_BUSY` rather than silently selecting a different peer, which nginx upstream translates to a 502 response without retrying.
@@ -166,7 +166,7 @@ Allocated from `r->pool` per request in `init_peer`:
 | Sticky selection is deterministic across repeated requests | "cookie affinity: same key routes to same backend" test (5 iterations) |
 | Fallback semantics are explicit | "cookie absent, fallback next → 200" and "cookie absent, fallback off → 502" tests |
 | Invalid directive combinations are rejected at parse time | nginx `-t` stderr check in "config validation" describe block |
-| Affinity hash is named and stable | This README: CRC32-IsoHdlc, `hash % eligible_peer_count` |
+| Affinity hash is named and stable | This README: SHA-256 (first 32 bits, big-endian), `hash % total_eligible_weight` |
 | Affinity is consistent across workers | "multi-worker consistency" describe block — 20 requests × 2 workers, same key, same backend |
 | Backup peer fallback is explicit | "backup peer semantics" describe block + `tests/upstream-balancer/nginx-backup.conf` |
 | Retry/failure accounting is preserved | "retry and failure accounting" describe block + `tests/upstream-balancer/nginx-retry-failure.conf` |
@@ -234,7 +234,7 @@ Implement one deterministic affinity policy at a time: cookie first, then header
 
 - [x] Implement cookie extraction via nginx variable system (`cookie_<name>`)
 - [x] Implement header extraction via nginx variable system (`http_<lowercased_name>`, `-` → `_`)
-- [x] Map affinity keys to peer identity deterministically (CRC32-IsoHdlc `hash % eligible_peer_count`)
+- [x] Map affinity keys to peer identity deterministically (SHA-256 (first 32 bits, big-endian) `hash % total_eligible_weight`)
 - [x] Apply explicit fallback semantics for miss / invalid key / unavailable peer
 - [x] Emit clear debug logging for affinity hit, miss, and fallback paths
 
@@ -318,13 +318,13 @@ Performance note:
 
 This section is the stability contract that `dynamic-upstreams` must preserve.
 
-**Identity definition**: A peer's identity is its position among eligible peers in `ngx_http_upstream_rr_peers_t.peer` linked list, counted at request time. That position is implicit — there is no stable peer ID field. The mapping from cookie/header key to peer is: `CRC32(key) % eligible_peer_count` where eligible means the peer passes nginx's normal runtime peer gates and `ngz_healthcheck_is_peer_eligible(peer.name) == 1`.
+**Identity definition**: A peer's identity is its position among eligible peers in `ngx_http_upstream_rr_peers_t.peer` linked list, counted at request time. That position is implicit — there is no stable peer ID field. The mapping from cookie/header key to peer is: `uint32_be(SHA256(key)[0..4]) % total_eligible_weight` where eligible means the peer passes nginx's normal runtime peer gates and `ngz_healthcheck_is_peer_eligible(peer.name) == 1`.
 
 **Generation boundary**: A configuration reload is a generation boundary. After a reload, `init_upstream` is called again, the peer list is rebuilt, and `eligible_peer_count` may change. Any keys that previously mapped to peer index N may now map to a different peer if the list length or peer ordering changed. **This is acceptable, documented behavior — affinity is not guaranteed across config reloads.**
 
 **Contract for `dynamic-upstreams`**: The balancer now exposes a runtime peer-source boundary. A future control-plane module may register a `PeerSourceVTable` through `upstream_balancer_register_peer_source()`, and the balancer will pin one active peer graph per request and release it when the request finishes. The control plane must still preserve complete peer graphs, stable order within one generation, and clean add/remove semantics across generations.
 
-**Worker consistency**: All nginx workers fork from the master after config parsing. The peer list and its order are identical across workers for a given generation. Because the hash is pure (CRC32 is deterministic, no per-worker state), every worker resolves the same key to the same peer index. This is verified empirically by the multi-worker tests.
+**Worker consistency**: All nginx workers fork from the master after config parsing. The peer list and its order are identical across workers for a given generation. Because the hash is pure (SHA-256 is deterministic, no per-worker state), every worker resolves the same key to the same peer index. This is verified empirically by the multi-worker tests.
 
 ### Healthcheck Integration
 
@@ -377,7 +377,7 @@ This section explains the reasoning behind the design in plain terms, including 
 
 That separation matters because mixing these responsibilities into one module creates entangled state and makes each piece harder to audit. For example, `healthcheck` does active TCP probing on timers — that logic has no business being inside a per-request selection callback.
 
-**Why CRC32 and not a better hash**: CRC32-IsoHdlc is fast, available in Zig's standard library with no external dependency, and is deterministic across all platforms. For the sticky use case, hash quality (uniform distribution) matters but collision resistance does not. With CRC32 the distribution is good enough for typical upstream counts (2–10 peers), and the algorithm is well-understood. If distribution becomes a problem at larger peer counts, the hash can be swapped at the cost of one line of code.
+**Hash implementation**: OpenSSL provides SHA-256 through the shared SSL wrapper. The fixed byte order keeps peer selection deterministic across platforms and workers.
 
 **The hard parts**:
 
@@ -388,7 +388,7 @@ That separation matters because mixing these responsibilities into one module cr
 - *Retry handling*: `sticky_used == 1` signals that sticky selection already ran for this request. A retry (e.g., TCP connect failure) delegates to the original round-robin picker. Without this flag, the balancer would keep re-selecting the same failed peer on every retry attempt.
 - *Backup behavior without inventing new policy*: Sticky selection only reasons about the primary chain. When primaries are exhausted or temporarily unusable, the module falls back to nginx's native round-robin path, which already knows how to enter the backup chain. That keeps backup semantics compatible with stock nginx instead of creating a second failover model.
 
-- *Peer identity stability across workers*: Because nginx workers fork from the master after config parsing, the peer linked list is byte-for-byte identical in every worker. The CRC32 hash and `% eligible_peer_count` are pure functions of config-time data, so every worker resolves the same key to the same peer independently and without coordination.
+- *Peer identity stability across workers*: Because nginx workers fork from the master after config parsing, the peer linked list is byte-for-byte identical in every worker. The SHA-256-derived hash and `% total_eligible_weight` are pure functions of config-time data, so every worker resolves the same key to the same peer independently and without coordination.
 
 - *The generation problem*: Peer identity is currently positional — peer index 0 is the first non-down peer in the list. If `dynamic-upstreams` changes that list (adds a peer, removes one, reorders), the mapping shifts. The Peer Identity Contract section above defines the generation boundary and what `dynamic-upstreams` must do to respect it.
 
@@ -474,7 +474,7 @@ Reduce avoidable sticky remapping when `dynamic-upstreams` starts applying parti
 
 - [x] Audit date: 2026-05-07
 - [x] Phases 1, 2, 3, and balancer-side Phase 4 handoff implemented and verified (24/24 Bun tests plus Zig helper tests).
-- [x] Affinity hash function named: CRC32-IsoHdlc (`std.hash.crc.Crc32`), mapped across eligible peer weight.
+- [x] Affinity hash function named: SHA-256 (first 32 bits, big-endian), mapped across eligible peer weight.
 - [x] Fallback semantics documented and test-backed for both `next` and `off`.
 - [x] Mutual-exclusion config error is detected and reported at parse time.
 - [x] Multi-worker affinity consistency verified empirically (20 requests, 2 workers).

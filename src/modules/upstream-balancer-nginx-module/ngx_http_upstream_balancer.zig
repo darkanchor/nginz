@@ -937,9 +937,10 @@ export fn upstream_balancer_get_peer(
         direct_target = key[DIRECT_COOKIE_PREFIX.len..];
     }
 
-    // Deterministic mapping: crc32(key) across weighted eligible peers unless
+    // Deterministic mapping: the first 32 SHA-256 bits across weighted eligible peers unless
     // this is one of our direct peer cookies.
-    const hash = std.hash.crc.Crc32.hash(key);
+    const digest = ngx.ssl.sha256(key) catch return core.NGX_ERROR;
+    const hash = std.mem.readInt(u32, digest[0..4], .big);
 
     pc.*.flags.cached = false;
     pc.*.connection = null;

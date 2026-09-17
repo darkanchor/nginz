@@ -617,7 +617,7 @@ fn str_slice(value: ngx_str_t) []const u8 {
 fn prepare_xpay_request(r: [*c]ngx_http_request_t, ctx: [*c]wechatpay_request_context) !void {
     const lc = ctx.*.lccf;
     const body = read_body(r);
-    const env = try xpay.requestEnv(str_slice(body));
+    const env = try xpay.requestEnv(r.*.pool, str_slice(body));
     if (env != lc.*.xpay_env) return error.InvalidRequest;
     var token: ngx_str_t = ngx.string.ngx_null_str;
     if (http.ngx_http_complex_value(r, lc.*.xpay_access_token, &token) != NGX_OK or token.len == 0 or token.len > 8192)
@@ -625,8 +625,6 @@ fn prepare_xpay_request(r: [*c]ngx_http_request_t, ctx: [*c]wechatpay_request_co
     const key = if (env == 0) lc.*.xpay_live_key else lc.*.xpay_sandbox_key;
     const signed = std.mem.eql(u8, str_slice(lc.*.xpay_auth), "appkey");
     if (signed and key.len == 0) return error.InvalidCredentials;
-    const digest = xpay.sign(str_slice(key), str_slice(r.*.uri), str_slice(body));
-    const hex = ngx_str_t{ .data = @constCast(&digest), .len = digest.len };
     const escaped_buf = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, token.len * 3)) orelse return error.OutOfMemory;
     const escaped = xpay.escapeToken(str_slice(token), escaped_buf[0 .. token.len * 3]);
     const escaped_token = ngx_str_t{ .data = escaped_buf, .len = escaped.len };
@@ -634,7 +632,11 @@ fn prepare_xpay_request(r: [*c]ngx_http_request_t, ctx: [*c]wechatpay_request_co
     const capacity = 512 + r.*.uri.len + escaped.len + provider.host.len;
     const data = core.castPtr(u8, core.ngx_pnalloc(r.*.pool, capacity)) orelse return error.OutOfMemory;
     var write = ngx_sprintf(data, "POST %V?access_token=%V", &r.*.uri, &escaped_token);
-    if (signed) write = ngx_sprintf(write, "&pay_sig=%V", &hex);
+    if (signed) {
+        const digest = try xpay.sign(str_slice(key), str_slice(r.*.uri), str_slice(body));
+        const hex = ngx_str_t{ .data = @constCast(&digest), .len = digest.len };
+        write = ngx_sprintf(write, "&pay_sig=%V", &hex);
+    }
     write = ngx_sprintf(write, " HTTP/1.1\r\nHost: %V", &provider.host);
     if ((provider.ssl and provider.port != 443) or (!provider.ssl and provider.port != 80)) {
         write = ngx_sprintf(write, ":%ui", @as(ngx_uint_t, provider.port));

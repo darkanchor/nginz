@@ -406,30 +406,6 @@ fn activate_refresh_snapshot_json(
 
 // ── Journal persistence ───────────────────────────────────────────────────────
 
-fn writeFileAtomic(path_str: ngx_str_t, content: []const u8) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const path_slice = core.slicify(u8, path_str.data, path_str.len);
-
-    var tmp_buf: [1024]u8 = undefined;
-    if (path_str.len + 5 > tmp_buf.len) return error.PathTooLong;
-    @memcpy(tmp_buf[0..path_str.len], path_slice);
-    @memcpy(tmp_buf[path_str.len..][0..4], ".tmp");
-    tmp_buf[path_str.len + 4] = 0;
-    const tmp_path = tmp_buf[0..path_str.len + 4];
-
-    var final_buf: [1024]u8 = undefined;
-    @memcpy(final_buf[0..path_str.len], path_slice);
-    final_buf[path_str.len] = 0;
-
-    var f = try std.Io.Dir.cwd().createFile(io, tmp_path, .{});
-    defer f.close(io);
-    try f.writeStreamingAll(io, content);
-
-    if (std.c.rename(@ptrCast(tmp_buf[0..].ptr), @ptrCast(final_buf[0..].ptr)) != 0) {
-        return error.RenameFailed;
-    }
-}
-
 // Build and write journal JSON for the activated peer set.
 // Called after successful activation; best-effort (errors are silently ignored).
 fn write_journal_if_configured(
@@ -477,7 +453,7 @@ fn write_journal_if_configured(
     appendRaw(&w, w_end, "]}");
 
     const used = @intFromPtr(w) - @intFromPtr(&jbuf);
-    writeFileAtomic(lccf.*.journal_path, jbuf[0..used]) catch {};
+    file.writeFileAtomic(core.slicify(u8, lccf.*.journal_path.data, lccf.*.journal_path.len), jbuf[0..used], 0o644) catch {};
 }
 
 fn appendRaw(w: *[*]u8, end: [*]u8, s: []const u8) void {

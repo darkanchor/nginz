@@ -949,16 +949,21 @@ fn recordPeerProbeResult(entry: *PeerProbeEntry, result: ProbeResult) void {
     }
 }
 
-fn peerProbeHash(addr: []const u8) usize {
-    return @as(usize, std.hash.crc.Crc32.hash(addr)) % PEER_PROBE_INDEX_SLOTS;
+// A failed OpenSSL digest must not hide configured health state.
+var peer_probe_index_ready = false;
+
+fn peerProbeHash(addr: []const u8) ?usize {
+    const digest = ngx.ssl.sha256(addr) catch return null;
+    return @as(usize, std.mem.readInt(u32, digest[0..4], .big)) % PEER_PROBE_INDEX_SLOTS;
 }
 
 fn rebuildPeerProbeIndex() void {
+    peer_probe_index_ready = false;
     @memset(peer_probe_index_slots[0..], 0);
     for (0..peer_probe_count) |i| {
         const entry = &peer_probes[i];
         if (entry.addr_len == 0) continue;
-        var slot = peerProbeHash(entry.addr_buf[0..entry.addr_len]);
+        var slot = peerProbeHash(entry.addr_buf[0..entry.addr_len]) orelse return;
         var remaining = PEER_PROBE_INDEX_SLOTS;
         while (remaining > 0) : (remaining -= 1) {
             if (peer_probe_index_slots[slot] == 0) {
@@ -968,20 +973,28 @@ fn rebuildPeerProbeIndex() void {
             slot = (slot + 1) % PEER_PROBE_INDEX_SLOTS;
         }
     }
+    peer_probe_index_ready = true;
 }
 
 fn findPeerProbeEntry(addr: []const u8) ?*const PeerProbeEntry {
     if (peer_probe_count == 0) return null;
-    var slot = peerProbeHash(addr);
-    var remaining = PEER_PROBE_INDEX_SLOTS;
-    while (remaining > 0) : (remaining -= 1) {
-        const entry_idx_plus_one = peer_probe_index_slots[slot];
-        if (entry_idx_plus_one == 0) return null;
-        const entry = &peer_probes[entry_idx_plus_one - 1];
-        if (entry.addr_len == addr.len and std.mem.eql(u8, addr, entry.addr_buf[0..entry.addr_len])) {
-            return entry;
+    if (peer_probe_index_ready) {
+        if (peerProbeHash(addr)) |start| {
+            var slot = start;
+            var remaining = PEER_PROBE_INDEX_SLOTS;
+            while (remaining > 0) : (remaining -= 1) {
+                const entry_idx_plus_one = peer_probe_index_slots[slot];
+                if (entry_idx_plus_one == 0) return null;
+                const entry = &peer_probes[entry_idx_plus_one - 1];
+                if (std.mem.eql(u8, addr, entry.addr_buf[0..entry.addr_len])) return entry;
+                slot = (slot + 1) % PEER_PROBE_INDEX_SLOTS;
+            }
+            return null;
         }
-        slot = (slot + 1) % PEER_PROBE_INDEX_SLOTS;
+    }
+    // Preserve health filtering if the index or a lookup digest is unavailable.
+    for (peer_probes[0..peer_probe_count]) |*entry| {
+        if (std.mem.eql(u8, addr, entry.addr_buf[0..entry.addr_len])) return entry;
     }
     return null;
 }
@@ -1957,6 +1970,7 @@ fn preconfiguration(cf: [*c]ngx_conf_t) callconv(.c) ngx_int_t {
     healthcheck_worker_events_zone = ngx_str_t{ .len = 0, .data = core.nullptr(u8) };
     upstream_probe_count = 0;
     peer_probe_count = 0;
+    peer_probe_index_ready = false;
     @memset(peer_probe_index_slots[0..], 0);
     return NGX_OK;
 }
@@ -2348,4 +2362,28 @@ test "preconfiguration clears service probe state from the prior cycle" {
     try std.testing.expectEqual(@as(usize, 0), healthcheck_worker_events_channel.len);
     try std.testing.expectEqual(@as(usize, 0), upstream_probe_count);
     try std.testing.expectEqual(@as(usize, 0), peer_probe_count);
+}
+
+test "peer probe lookup retains entries without the SHA256 index" {
+    const previous_count = peer_probe_count;
+    const previous_entry = peer_probes[0];
+    const previous_slots = peer_probe_index_slots;
+    const previous_ready = peer_probe_index_ready;
+    defer {
+        peer_probe_count = previous_count;
+        peer_probes[0] = previous_entry;
+        peer_probe_index_slots = previous_slots;
+        peer_probe_index_ready = previous_ready;
+    }
+    const address = "127.0.0.1:8080";
+    peer_probe_count = 1;
+    peer_probes[0].addr_len = address.len;
+    @memcpy(peer_probes[0].addr_buf[0..address.len], address);
+    peer_probe_index_ready = false;
+    try std.testing.expect(findPeerProbeEntry(address) == &peer_probes[0]);
+    try std.testing.expect(findPeerProbeEntry("127.0.0.1:8081") == null);
+    rebuildPeerProbeIndex();
+    try std.testing.expect(peer_probe_index_ready);
+    try std.testing.expect(findPeerProbeEntry(address) == &peer_probes[0]);
+    try std.testing.expect(findPeerProbeEntry("127.0.0.1:8081") == null);
 }

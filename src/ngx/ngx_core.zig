@@ -281,6 +281,71 @@ pub fn NAllocator(comptime PAGE_SIZE: ngx_uint_t) type {
     };
 }
 
+/// Adapt an nginx pool to containers that take a Zig allocator. Small frees
+/// follow nginx pool lifetime; large allocations can be released immediately.
+pub fn poolAllocator(pool: [*c]ngx_pool_t) std.mem.Allocator {
+    return .{ .ptr = @ptrCast(pool), .vtable = &PoolAllocator.vtable };
+}
+
+const PoolAllocator = struct {
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+        const pool: *ngx_pool_t = @ptrCast(@alignCast(ctx));
+        const bytes = if (alignment.toByteUnits() <= NGX_ALIGNMENT)
+            ngx_palloc(pool, len)
+        else
+            ngx_pmemalign(pool, len, alignment.toByteUnits());
+        return @ptrCast(bytes);
+    }
+
+    fn resize(_: *anyopaque, bytes: []u8, _: std.mem.Alignment, new_len: usize, _: usize) bool {
+        return new_len <= bytes.len;
+    }
+
+    fn remap(_: *anyopaque, bytes: []u8, _: std.mem.Alignment, new_len: usize, _: usize) ?[*]u8 {
+        return if (new_len <= bytes.len) bytes.ptr else null;
+    }
+
+    fn free(ctx: *anyopaque, bytes: []u8, _: std.mem.Alignment, _: usize) void {
+        _ = ngx_pfree(@ptrCast(@alignCast(ctx)), bytes.ptr);
+    }
+};
+
+extern fn inet_pton(family: c_int, text: [*:0]const u8, address: *anyopaque) c_int;
+
+pub const IpAddress = union(enum) {
+    ip4: [4]u8,
+    ip6: [16]u8,
+
+    /// libc parses a single address, without accepting CIDR suffixes or ports.
+    pub fn parse(text: []const u8) ?IpAddress {
+        var storage: [46]u8 = undefined;
+        if (text.len == 0 or text.len >= storage.len or std.mem.indexOfScalar(u8, text, 0) != null) return null;
+        @memcpy(storage[0..text.len], text);
+        storage[text.len] = 0;
+        const terminated: [*:0]const u8 = @ptrCast(&storage);
+        var v4: [4]u8 = undefined;
+        if (inet_pton(std.posix.AF.INET, terminated, &v4) == 1) return .{ .ip4 = v4 };
+        var v6: [16]u8 = undefined;
+        if (inet_pton(std.posix.AF.INET6, terminated, &v6) == 1) return .{ .ip6 = v6 };
+        return null;
+    }
+
+    pub fn inCidr(self: IpAddress, cidr: ngx_cidr_t) bool {
+        return switch (self) {
+            .ip4 => |bytes| cidr.family == std.posix.AF.INET and (@as(u32, @bitCast(bytes)) & cidr.u.in.mask) == cidr.u.in.addr,
+            .ip6 => |bytes| blk: {
+                if (cidr.family != std.posix.AF.INET6) break :blk false;
+                for (bytes, cidr.u.in6.mask.__in6_u.__u6_addr8, cidr.u.in6.addr.__in6_u.__u6_addr8) |byte, mask, addr| {
+                    if (byte & mask != addr) break :blk false;
+                }
+                break :blk true;
+            },
+        };
+    }
+};
+
 test "allocator" {
     const log = ngx_log_init(c_str(""), c_str(""));
     ngx_time_init();
@@ -297,4 +362,46 @@ test "allocator" {
         try as.append(i);
     }
     try expectEqual(as.items.len, 10);
+}
+
+test "pool allocator grows containers and honors alignment" {
+    const logger = ngx_log_init(c_str(""), c_str(""));
+    const pool = ngx_create_pool(4096, logger) orelse return error.OutOfMemory;
+    defer ngx_destroy_pool(pool);
+    const allocator = poolAllocator(pool);
+    var values = std.ArrayList(u32).empty;
+    defer values.deinit(allocator);
+    for (0..10000) |i| try values.append(allocator, @intCast(i));
+    for (values.items, 0..) |value, i| try expectEqual(@as(u32, @intCast(i)), value);
+    const aligned = try allocator.alignedAlloc(u8, .@"64", 8192);
+    defer allocator.free(aligned);
+    try expectEqual(@as(usize, 0), @intFromPtr(aligned.ptr) % 64);
+    const terminated = try allocator.dupeZ(u8, "pool string");
+    defer allocator.free(terminated);
+    try std.testing.expectEqualStrings("pool string", std.mem.span(terminated.ptr));
+}
+
+test "libc address parsing and nginx CIDR masks" {
+    const Case = struct { address: []const u8, network: []const u8, matches: bool };
+    for ([_]Case{
+        .{ .address = "192.0.2.42", .network = "192.0.2.0/24", .matches = true },
+        .{ .address = "192.0.3.42", .network = "192.0.2.0/24", .matches = false },
+        .{ .address = "192.0.2.42", .network = "192.0.2.42/32", .matches = true },
+        .{ .address = "192.0.2.42", .network = "0.0.0.0/0", .matches = true },
+        .{ .address = "2001:db8::42", .network = "2001:db8::/32", .matches = true },
+        .{ .address = "2001:db9::42", .network = "2001:db8::/32", .matches = false },
+        .{ .address = "::1", .network = "::1/128", .matches = true },
+        .{ .address = "::1", .network = "::/0", .matches = true },
+        .{ .address = "::ffff:192.0.2.42", .network = "::ffff:192.0.2.0/120", .matches = true },
+        .{ .address = "::ffff:192.0.2.42", .network = "192.0.2.0/24", .matches = false },
+    }) |case| {
+        const address = IpAddress.parse(case.address) orelse return error.InvalidAddress;
+        var network = ngx_str_t{ .data = @constCast(case.network.ptr), .len = case.network.len };
+        var cidr = std.mem.zeroes(ngx_cidr_t);
+        try expectEqual(NGX_OK, ngx_ptocidr(&network, &cidr));
+        try expectEqual(case.matches, address.inCidr(cidr));
+    }
+    for ([_][]const u8{ "", "127.1", "256.0.0.1", "127.0.0.1/8", "127.0.0.1:80", "[::1]", "::1\x00junk", "not-an-ip" }) |invalid| {
+        try std.testing.expect(IpAddress.parse(invalid) == null);
+    }
 }

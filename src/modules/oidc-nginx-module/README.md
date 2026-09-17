@@ -7,6 +7,7 @@ OpenID Connect relying-party authentication for nginx locations.
 **Implemented with core RP security closure**
 
 - Discovery-backed metadata (`issuer`, `authorization_endpoint`, `token_endpoint`, `jwks_uri`)
+- Request buffers use nginx pools; discovery and JWKS caches own separate pools that are replaced on refresh and released on configuration cleanup
 - Authorization Code flow with state, nonce, and optional PKCE
 - RS256 ID token verification against JWKS
 - Required claim validation before session creation

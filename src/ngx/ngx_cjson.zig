@@ -16,6 +16,7 @@ const cJSON_Parse = cjson.cJSON_Parse;
 const cJSON_ParseWithLength = cjson.cJSON_ParseWithLength;
 const cJSON_ParseWithOpts = cjson.cJSON_ParseWithOpts;
 const cJSON_ParseWithLengthOpts = cjson.cJSON_ParseWithLengthOpts;
+const cJSON_ParseStrict = cjson.cJSON_ParseStrict;
 const cJSON_Print = cjson.cJSON_Print;
 const cJSON_PrintUnformatted = cjson.cJSON_PrintUnformatted;
 const cJSON_PrintBuffered = cjson.cJSON_PrintBuffered;
@@ -24,7 +25,7 @@ const cJSON_Delete = cjson.cJSON_Delete;
 pub const cJSON_GetArraySize = cjson.cJSON_GetArraySize;
 pub const cJSON_GetArrayItem = cjson.cJSON_GetArrayItem;
 pub const cJSON_GetObjectItem = cjson.cJSON_GetObjectItem;
-pub const cJSON_GetObjectItemCaseSensit = cjson.cJSON_GetObjectItemCaseSensit;
+pub const cJSON_GetObjectItemCaseSensitive = cjson.cJSON_GetObjectItemCaseSensitive;
 pub const cJSON_HasObjectItem = cjson.cJSON_HasObjectItem;
 pub const cJSON_GetErrorPtr = cjson.cJSON_GetErrorPtr;
 pub const cJSON_GetStringValue = cjson.cJSON_GetStringValue;
@@ -271,6 +272,49 @@ pub const CJSON = extern struct {
         return if (json == core.nullptr(cJSON)) core.NError.JSON_ERROR else json;
     }
 
+    /// Parse one complete UTF-8 document, rejecting duplicate object members
+    /// and embedded NULs. All nodes, strings and validation scratch use the pool.
+    pub fn decodeStrict(self: *Self, str: ngx_str_t) ![*c]cJSON {
+        if (str.len == 0 or str.data == null or !std.unicode.utf8ValidateSlice(str.data[0..str.len]))
+            return core.NError.JSON_ERROR;
+        const json = cJSON_ParseStrict(str.data, str.len, &self.alloc);
+        if (json == null) return core.NError.JSON_ERROR;
+        try self.validateUniqueKeys(json, 0);
+        return json;
+    }
+
+    /// Available for numbers parsed by decodeStrict, before modifying the node.
+    pub fn numberLiteral(j: [*c]cJSON) ?[]const u8 {
+        if (cJSON_IsNumber(j) != 1 or j.*.valuestring == null) return null;
+        return std.mem.span(j.*.valuestring);
+    }
+
+    fn keyLessThan(_: void, a: []const u8, b: []const u8) bool {
+        return std.mem.lessThan(u8, a, b);
+    }
+
+    fn validateUniqueKeys(self: *Self, json: [*c]cJSON, depth: usize) core.NError!void {
+        if (depth >= CJSON_DEPTH) return core.NError.JSON_ERROR;
+        if (cJSON_IsObject(json) == 1) {
+            const count: usize = @intCast(cJSON_GetArraySize(json));
+            if (count > 1) {
+                const pool = core.castPtr(core.ngx_pool_t, self.alloc.ctx) orelse return core.NError.OOM;
+                const raw = core.ngx_palloc(pool, count * @sizeOf([]const u8)) orelse return core.NError.OOM;
+                const keys: [*][]const u8 = @ptrCast(@alignCast(raw));
+                var it = Iterator.init(json);
+                var i: usize = 0;
+                while (it.next()) |child| : (i += 1) keys[i] = std.mem.span(child.*.string);
+                // Sorting scratch names avoids quadratic duplicate checks for large objects.
+                std.mem.sort([]const u8, keys[0..count], {}, keyLessThan);
+                for (keys[1..count], keys[0 .. count - 1]) |key, previous| {
+                    if (std.mem.eql(u8, key, previous)) return core.NError.JSON_ERROR;
+                }
+            }
+        }
+        var child = json.*.child;
+        while (child != null) : (child = child.*.next) try self.validateUniqueKeys(child, depth + 1);
+    }
+
     pub fn encode(self: *Self, j: [*c]cJSON) !ngx_str_t {
         const MAX_ENCODE_SIZE: usize = 16 * 1024 * 1024;
         if (core.castPtr(core.ngx_pool_t, self.alloc.ctx)) |pool| {
@@ -352,4 +396,32 @@ test "cjson" {
     try expectEqual(CJSON.query(parsed, long_key_path[0..]), null);
 
     cj.free(parsed);
+}
+
+test "strict cjson validates complete documents and preserves number spelling" {
+    const log = ngx_log_init(core.c_str(""), core.c_str(""));
+    const pool = ngx_create_pool(4096, log) orelse return error.OutOfMemory;
+    defer ngx_destroy_pool(pool);
+    var cj = CJSON.init(pool);
+    const doc = try cj.decodeStrict(ngx_string(" \t{\"e\\u006ev\":0,\"Env\":1,\"text\":\"中文\\uD83D\\uDE00\",\"values\":[-0,0.0,1e0]}\r\n"));
+    try std.testing.expectEqualStrings("0", CJSON.numberLiteral(cJSON_GetObjectItemCaseSensitive(doc, "env")).?);
+    try std.testing.expectEqualStrings("中文😀", std.mem.span(cJSON_GetObjectItemCaseSensitive(doc, "text").*.valuestring));
+    const values = cJSON_GetObjectItemCaseSensitive(doc, "values");
+    for ([_][]const u8{ "-0", "0.0", "1e0" }, 0..) |expected, i| {
+        try std.testing.expectEqualStrings(expected, CJSON.numberLiteral(cJSON_GetArrayItem(values, @intCast(i))).?);
+    }
+    const long_number = "1234567890" ** 10;
+    const number = try cj.decodeStrict(ngx_string(long_number));
+    try std.testing.expectEqualStrings(long_number, CJSON.numberLiteral(number).?);
+    _ = try cj.decodeStrict(ngx_string("[true,false,null,{},[],1.25e-4,1e999]"));
+    for ([_][]const u8{
+        "",                         " ",               "{",                   "{ ",                      "{\"x\" ",              "{\"x\": ",            "[",                       "[ ",
+        "{}junk",                   "{}\x00",          "{}\x00{}",            "\x0b{}",                  "\xef\xbb\xbf{}",       "[01]",                "[-01]",                   "[1.]",
+        "[1e]",                     "[1e+]",           "[+1]",                "[--1]",                   "[NaN]",                "{\"a\":1,\"a\":2}",   "{\"a\":1,\"\\u0061\":2}", "[{\"a\":1,\"a\":2}]",
+        "{\"x\":\"raw\nnewline\"}", "{\"x\":\"\\q\"}", "{\"x\":\"\\uXXXX\"}", "{\"x\":\"\\u0000tail\"}", "{\"x\\u0000tail\":1}", "{\"x\":\"\\ud800\"}", "{\"x\":\"\\udc00\"}",     "{\"x\":\"\xff\"}",
+    }) |invalid| {
+        try std.testing.expectError(core.NError.JSON_ERROR, cj.decodeStrict(ngx_string(invalid)));
+    }
+    // The existing decoder retains its permissive behavior for other callers.
+    _ = try cj.decode(ngx_string("{}junk"));
 }

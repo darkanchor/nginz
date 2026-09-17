@@ -1,5 +1,4 @@
 const std = @import("std");
-const posix = std.posix;
 const ngx = @import("ngx");
 const libinjection = @import("ngx_libinjection");
 
@@ -253,7 +252,7 @@ fn appendIpMatchEntry(out: *std.ArrayList(u8), allocator: std.mem.Allocator, ent
 }
 
 fn loadPmFromFiles(arg_text: []const u8, pool: [*c]core.ngx_pool_t, cf: [*c]ngx_conf_t) ?ngx_str_t {
-    const allocator = std.heap.page_allocator;
+    const allocator = core.poolAllocator(pool);
     var tokens = std.mem.tokenizeAny(u8, arg_text, " \t\r\n");
     var combined = std.ArrayList(u8).empty;
     defer combined.deinit(allocator);
@@ -280,7 +279,7 @@ fn loadPmFromFiles(arg_text: []const u8, pool: [*c]core.ngx_pool_t, cf: [*c]ngx_
 }
 
 fn loadIpMatchFromFiles(arg_text: []const u8, pool: [*c]core.ngx_pool_t, cf: [*c]ngx_conf_t) ?ngx_str_t {
-    const allocator = std.heap.page_allocator;
+    const allocator = core.poolAllocator(pool);
     var tokens = std.mem.tokenizeAny(u8, arg_text, " \t\r\n");
     var combined = std.ArrayList(u8).empty;
     defer combined.deinit(allocator);
@@ -542,27 +541,8 @@ fn numericCompare(normalized: []const u8, pattern_text: []const u8, operator: u8
     };
 }
 
-fn cidrContains(input_addr: std.Io.net.IpAddress, cidr: core.ngx_cidr_t) bool {
-    return switch (input_addr) {
-        .ip4 => |ip4| blk: {
-            if (cidr.family != posix.AF.INET) break :blk false;
-            const input_bits: u32 = @bitCast(ip4.bytes);
-            break :blk (input_bits & cidr.u.in.mask) == cidr.u.in.addr;
-        },
-        .ip6 => |ip6| blk: {
-            if (cidr.family != posix.AF.INET6) break :blk false;
-            const cidr_addr = cidr.u.in6.addr.__in6_u.__u6_addr8[0..];
-            const cidr_mask = cidr.u.in6.mask.__in6_u.__u6_addr8[0..];
-            for (0..16) |i| {
-                if ((ip6.bytes[i] & cidr_mask[i]) != cidr_addr[i]) break :blk false;
-            }
-            break :blk true;
-        },
-    };
-}
-
 fn ipMatchListContains(normalized: []const u8, pattern_text: []const u8) bool {
-    const input_addr = std.Io.net.IpAddress.parse(trimAscii(normalized), 0) catch return false;
+    const input_addr = core.IpAddress.parse(trimAscii(normalized)) orelse return false;
     var it = std.mem.tokenizeAny(u8, pattern_text, " ,\t\r\n");
     while (it.next()) |token| {
         if (token.len == 0) continue;
@@ -572,7 +552,7 @@ fn ipMatchListContains(normalized: []const u8, pattern_text: []const u8) bool {
         const rc = core.ngx_ptocidr(&token_text, &cidr);
         if (rc != NGX_OK and rc != NGX_DONE) continue;
 
-        if (cidrContains(input_addr, cidr)) return true;
+        if (input_addr.inCidr(cidr)) return true;
     }
     return false;
 }
