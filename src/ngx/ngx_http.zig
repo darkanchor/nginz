@@ -394,8 +394,8 @@ test "http" {
     try expectEqual(flag_byte_offset(ngx_http_upstream_rr_peer_t, "flags", "route"), 164);
     try expectEqual(flag_byte_offset(ngx_http_upstream_rr_peers_t, "flags", "single"), 64);
     try expectEqual(flag_byte_offset(ngx_http_conf_addr_t, "flags", "protocols"), 72);
-    try expectEqual(flag_byte_offset(vx.ngx_http_v2_state_t, "flags", "incomplete"), 25);
-    try expectEqual(flag_byte_offset(vx.ngx_http_v2_connection_t, "flags", "blocked"), 448);
+    try expectEqual(flag_byte_offset(vx.ngx_http_v2_state_t, "flags", "incomplete"), 33);
+    try expectEqual(flag_byte_offset(vx.ngx_http_v2_connection_t, "flags", "blocked"), 456);
     try expectEqual(flag_byte_offset(vx.ngx_http_v2_stream_t, "flags", "initialized"), 120);
     try expectEqual(flag_byte_offset(vx.ngx_http_v2_out_frame_t, "flags", "fin"), 48);
     try expectEqual(flag_byte_offset(vx.ngx_http_v3_session_t, "flags", "goaway"), 312);

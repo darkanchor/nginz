@@ -254,6 +254,19 @@ const offsetof_table = [_]OffsetEntry{
     // ngx_http_upstream_conf_t
     .{ .name = "ngx_http_upstream_conf_t", .field = "upstream", .zig_offset = @offsetOf(http.ngx_http_upstream_conf_t, "upstream") },
 
+    // HTTP/2 parser state and its containing connection
+    .{ .name = "ngx_http_v2_state_t", .field = "window_delta", .zig_offset = @offsetOf(vx.ngx_http_v2_state_t, "window_delta") },
+    .{ .name = "ngx_http_v2_state_t", .field = "header", .zig_offset = @offsetOf(vx.ngx_http_v2_state_t, "header") },
+    .{ .name = "ngx_http_v2_state_t", .field = "handler", .zig_offset = @offsetOf(vx.ngx_http_v2_state_t, "handler") },
+    .{ .name = "ngx_http_v2_connection_t", .field = "state", .zig_offset = @offsetOf(vx.ngx_http_v2_connection_t, "state") },
+    .{ .name = "ngx_http_v2_connection_t", .field = "hpack", .zig_offset = @offsetOf(vx.ngx_http_v2_connection_t, "hpack") },
+
+    // HTTP/3 data parser and its containing request parser
+    .{ .name = "ngx_http_v3_parse_data_t", .field = "skip", .zig_offset = @offsetOf(vx.ngx_http_v3_parse_data_t, "skip") },
+    .{ .name = "ngx_http_v3_parse_data_t", .field = "vlint", .zig_offset = @offsetOf(vx.ngx_http_v3_parse_data_t, "vlint") },
+    .{ .name = "ngx_http_v3_parse_t", .field = "body", .zig_offset = @offsetOf(vx.ngx_http_v3_parse_t, "body") },
+    .{ .name = "ngx_http_v3_parse_t", .field = "cookies", .zig_offset = @offsetOf(vx.ngx_http_v3_parse_t, "cookies") },
+
     // ngx_stream_session_t
     .{ .name = "ngx_stream_session_t", .field = "connection", .zig_offset = @offsetOf(vx.ngx_stream_session_t, "connection") },
     .{ .name = "ngx_stream_session_t", .field = "upstream", .zig_offset = @offsetOf(vx.ngx_stream_session_t, "upstream") },

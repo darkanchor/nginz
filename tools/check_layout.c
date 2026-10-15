@@ -355,6 +355,19 @@ int main(void) {
     /* === Key offsets: ngx_http_upstream_conf_t === */
     PRINT_OFFSETOF(ngx_http_upstream_conf_t, upstream);
 
+    /* === HTTP/2 parser state and its containing connection === */
+    PRINT_OFFSETOF(ngx_http_v2_state_t, window_delta);
+    PRINT_OFFSETOF(ngx_http_v2_state_t, header);
+    PRINT_OFFSETOF(ngx_http_v2_state_t, handler);
+    PRINT_OFFSETOF(ngx_http_v2_connection_t, state);
+    PRINT_OFFSETOF(ngx_http_v2_connection_t, hpack);
+
+    /* === HTTP/3 data parser and its containing request parser === */
+    PRINT_OFFSETOF(ngx_http_v3_parse_data_t, skip);
+    PRINT_OFFSETOF(ngx_http_v3_parse_data_t, vlint);
+    PRINT_OFFSETOF(ngx_http_v3_parse_t, body);
+    PRINT_OFFSETOF(ngx_http_v3_parse_t, cookies);
+
 #if (NGX_STREAM)
     /* === Key offsets: ngx_stream_session_t === */
     PRINT_OFFSETOF(ngx_stream_session_t, connection);

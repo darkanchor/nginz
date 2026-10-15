@@ -59,6 +59,7 @@ pub const ngx_http_v2_state_t = extern struct {
     sid: ngx_uint_t = 0,
     length: usize = 0,
     padding: usize = 0,
+    window_delta: isize = 0,
     flags: ngx_http_v2_state_flags_s = @bitCast(@as(u32, 0)),
     header: ngx_http_v2_header_t = .{},
     header_limit: usize = 0,
@@ -320,6 +321,7 @@ pub const ngx_http_v3_parse_data_t = extern struct {
     state: ngx_uint_t = 0,
     type: ngx_uint_t = 0,
     length: ngx_uint_t = 0,
+    skip: ngx_uint_t = 0,
     vlint: ngx_http_v3_parse_varlen_int_t = .{},
 };
 

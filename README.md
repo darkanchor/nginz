@@ -1,7 +1,7 @@
 ## Nginz
 
 nginz is a `nginx` module writer. It allows one to write nginx modules in `zig`. so far it 
-is based on official nginx release 1.30.5 and requires Zig 0.17.0 exactly. nginz is tested with linux only.
+is based on official nginx release 1.30.6 and requires Zig 0.17.0 exactly. nginz is tested with linux only.
 
 A companion project [nginz-njs](https://github.com/kaiwu/nginz-njs) provides the scripted
 Gleam/njs composition layer on top of the native primitives exposed here. It currently ships
@@ -230,7 +230,7 @@ make install
 
 ### Important Notes
 
-- **nginx version**: Modules are built against nginx 1.30.5. Using with other versions may cause
+- **nginx version**: Modules are built against nginx 1.30.6. Using with other versions may cause
   compatibility issues.
 - **Filter modules**: Modules containing filters (echoz, wechatpay, oidc, requestid, cache-tags,
   transform) have ordering dependencies. Their position relative to nginx's built-in filters is
