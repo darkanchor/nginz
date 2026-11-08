@@ -16,7 +16,7 @@ const check_layout = @import("project/build_check_layout.zig");
 const dynmod = @import("project/build_dynmod.zig");
 
 const NGINX = "src/ngx/nginx.zig";
-const required_zig_version = std.SemanticVersion{ .major = 0, .minor = 17, .patch = 0 };
+const required_zig_version = .{ .major = 0, .minor = 17 };
 const worker_events_test_file = "src/modules/worker-events-nginx-module/ngx_http_worker_events.zig";
 const healthcheck_test_file = "src/modules/healthcheck-nginx-module/ngx_http_healthcheck.zig";
 const upstream_balancer_test_file = "src/modules/upstream-balancer-nginx-module/ngx_http_upstream_balancer.zig";
@@ -151,10 +151,12 @@ fn requires_dynamic_upstreams_test_support(path: []const u8) bool {
 
 pub fn build(b: *std.Build) void {
     comptime {
-        if (builtin.zig_version.order(required_zig_version) != .eq) {
+        if (builtin.zig_version.major != required_zig_version.major or
+            builtin.zig_version.minor != required_zig_version.minor)
+        {
             @compileError(std.fmt.comptimePrint(
-                "nginz requires Zig {f}; found Zig {f}.",
-                .{ required_zig_version, builtin.zig_version },
+                "nginz requires Zig {d}.{d}.x; found Zig {f}.",
+                .{ required_zig_version.major, required_zig_version.minor, builtin.zig_version },
             ));
         }
     }

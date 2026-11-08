@@ -13,7 +13,8 @@ const BUILD_LOCK_PATH = join(process.cwd(), ".zig-build.lock");
 //   ZIG=/opt/zig-0.17.0/zig bun test tests/pgrest
 const ZIG = process.env.ZIG || "zig";
 // Keep in sync with required_zig_version in build.zig.
-const REQUIRED_ZIG_VERSION = "0.17.0";
+const REQUIRED_ZIG_SERIES = "0.17.x";
+const SUPPORTED_ZIG_VERSION = /^0\.17\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 function zigVersion(zig) {
   try {
@@ -54,11 +55,11 @@ function acquireBuildLock(timeoutMs = 120000) {
 // preserves the requested mode for both Zig modules and C libraries.
 export function ensureBuild() {
   const version = zigVersion(ZIG);
-  if (version !== REQUIRED_ZIG_VERSION) {
+  if (!version || !SUPPORTED_ZIG_VERSION.test(version)) {
     throw new Error(
-      `nginz requires Zig ${REQUIRED_ZIG_VERSION}, but \`${ZIG}\` reports ${version ?? "an unknown version"}.\n` +
+      `nginz requires Zig ${REQUIRED_ZIG_SERIES}, but \`${ZIG}\` reports ${version ?? "an unknown version"}.\n` +
         `Point the test harness at the required toolchain, e.g.\n` +
-        `  ZIG=/path/to/zig-x86_64-linux-${REQUIRED_ZIG_VERSION}/zig bun test <suite>\n` +
+        `  ZIG=/path/to/zig-x86_64-linux-${REQUIRED_ZIG_SERIES}/zig bun test <suite>\n` +
         `or put that directory first on PATH.`,
     );
   }

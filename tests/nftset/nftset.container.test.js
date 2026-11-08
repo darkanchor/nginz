@@ -59,7 +59,7 @@ function imageHasZig() {
   );
   if (result.exitCode !== 0) return false;
   const out = result.stdout ? Buffer.from(result.stdout).toString() : "";
-  return out.trim() === "0.17.0";
+  return /^0\.17\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(out.trim());
 }
 
 function ensureImage() {

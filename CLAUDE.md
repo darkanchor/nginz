@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Nginz is a framework for writing nginx modules in Zig. It wraps nginx 1.30.6 and requires Zig 0.17.0 exactly. The project produces a `nginz` binary (nginx wrapper) and individual module object files.
+Nginz is a framework for writing nginx modules in Zig. It wraps nginx 1.30.6 and requires Zig 0.17.x. The project produces a `nginz` binary (nginx wrapper) and individual module object files.
 
 ## Zig standard library restrictions
 
@@ -156,7 +156,7 @@ bun test tests/jsonschema/
 ```
 
 Test environment variables:
-- `ZIG=/path/to/zig-0.17.0/zig` - Build toolchain. Set this when the `zig` on `PATH` is not 0.17.0; the harness verifies the version and refuses to build with a mismatched toolchain.
+- `ZIG=/path/to/zig-0.17.0/zig` - Build toolchain. Set this when the `zig` on `PATH` is outside the 0.17.x series; the harness verifies the version and refuses to build with a mismatched toolchain.
 - `KEEP_LOGS=1` - Preserve runtime directory and nginx logs for debugging
 - `ZIG_OPTIMIZE=ReleaseSafe` - Build with optimizations (faster tests). The build preserves the requested mode for all Zig modules and C libraries.
 

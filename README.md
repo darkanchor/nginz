@@ -1,7 +1,7 @@
 ## Nginz
 
 nginz is a `nginx` module writer. It allows one to write nginx modules in `zig`. so far it 
-is based on official nginx release 1.30.6 and requires Zig 0.17.0 exactly. nginz is tested with linux only.
+is based on official nginx release 1.30.6 and requires Zig 0.17.x. nginz is tested with linux only.
 
 A companion project [nginz-njs](https://github.com/kaiwu/nginz-njs) provides the scripted
 Gleam/njs composition layer on top of the native primitives exposed here. It currently ships
@@ -21,12 +21,12 @@ $ zig build test
 $ bun test
 ```
 
-If the default `zig` is a different version, select the test toolchain with
+If the default `zig` is outside the 0.17.x series, select a compatible test toolchain with
 `ZIG=/path/to/zig-x86_64-linux-0.17.0/zig bun test`.
 
 ### Build strategy
 
-Use Debug for development and ReleaseSafe for optimized builds with Zig 0.17.0:
+Use Debug for development and ReleaseSafe for optimized builds with Zig 0.17.x:
 
 | Command | Use case | Notes |
 |---------|----------|-------|
