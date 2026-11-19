@@ -359,6 +359,9 @@ int main(void) {
     PRINT_OFFSETOF(ngx_http_v2_state_t, window_delta);
     PRINT_OFFSETOF(ngx_http_v2_state_t, header);
     PRINT_OFFSETOF(ngx_http_v2_state_t, handler);
+    PRINT_OFFSETOF(ngx_http_v2_connection_t, send_window);
+    PRINT_OFFSETOF(ngx_http_v2_connection_t, send_queued);
+    PRINT_OFFSETOF(ngx_http_v2_connection_t, recv_window);
     PRINT_OFFSETOF(ngx_http_v2_connection_t, state);
     PRINT_OFFSETOF(ngx_http_v2_connection_t, hpack);
 

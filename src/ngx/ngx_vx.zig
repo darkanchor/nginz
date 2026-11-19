@@ -122,6 +122,7 @@ pub const ngx_http_v2_connection_t = extern struct {
     refused_streams: ngx_uint_t = 0,
     priority_limit: ngx_uint_t = 0,
     send_window: usize = 0,
+    send_queued: usize = 0,
     recv_window: usize = 0,
     init_window: usize = 0,
     frame_size: usize = 0,

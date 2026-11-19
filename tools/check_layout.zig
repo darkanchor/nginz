@@ -258,6 +258,9 @@ const offsetof_table = [_]OffsetEntry{
     .{ .name = "ngx_http_v2_state_t", .field = "window_delta", .zig_offset = @offsetOf(vx.ngx_http_v2_state_t, "window_delta") },
     .{ .name = "ngx_http_v2_state_t", .field = "header", .zig_offset = @offsetOf(vx.ngx_http_v2_state_t, "header") },
     .{ .name = "ngx_http_v2_state_t", .field = "handler", .zig_offset = @offsetOf(vx.ngx_http_v2_state_t, "handler") },
+    .{ .name = "ngx_http_v2_connection_t", .field = "send_window", .zig_offset = @offsetOf(vx.ngx_http_v2_connection_t, "send_window") },
+    .{ .name = "ngx_http_v2_connection_t", .field = "send_queued", .zig_offset = @offsetOf(vx.ngx_http_v2_connection_t, "send_queued") },
+    .{ .name = "ngx_http_v2_connection_t", .field = "recv_window", .zig_offset = @offsetOf(vx.ngx_http_v2_connection_t, "recv_window") },
     .{ .name = "ngx_http_v2_connection_t", .field = "state", .zig_offset = @offsetOf(vx.ngx_http_v2_connection_t, "state") },
     .{ .name = "ngx_http_v2_connection_t", .field = "hpack", .zig_offset = @offsetOf(vx.ngx_http_v2_connection_t, "hpack") },
 
